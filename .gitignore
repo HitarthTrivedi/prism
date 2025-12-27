@@ -206,7 +206,7 @@ marimo/_static/
 marimo/_lsp/
 __marimo__/
 # Custom - Google Drive Credentials
-   client_secrets_2.json
+   client_secret_2.json
    
    credentials.json
    token.json
