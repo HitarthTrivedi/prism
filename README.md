@@ -44,13 +44,7 @@ source .venv/bin/activate
 pip install -r requirements.txt
 ```
 
-### 4. Set Up Environment Variables
 
-Create a `.env` file in the project root:
-
-```bash
-GROK_API_KEY=your_grok_api_key_here
-```
 
 **To get your Groq API key:**
 1. Visit [https://console.groq.com/](https://console.groq.com/)
