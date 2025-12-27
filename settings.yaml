@@ -1,5 +1,14 @@
+ settings.yaml.example
+# Google Drive Authentication Settings
+# 
+# INSTRUCTIONS:
+# 1. Copy this file and rename it to: settings.yaml
+# 2. You DON'T need to edit this file manually
+# 3. The client_id and client_secret will be loaded from client_secrets.json automatically
+# 4. Just make sure client_secrets.json is in the same folder
+
 client_config_backend: file
-client_config_file: client_secret_2.json
+client_config_file: client_secrets.json
 
 save_credentials: True
 save_credentials_backend: file
@@ -9,3 +18,5 @@ get_refresh_token: True
 
 oauth_scope:
   - https://www.googleapis.com/auth/drive
+  - https://www.googleapis.com/auth/drive.file
+  - https://www.googleapis.com/auth/drive.metadata.readonly
