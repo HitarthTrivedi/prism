@@ -9,6 +9,7 @@ import os
 import json
 import time
 import shutil
+import threading
 import requests
 import undetected_chromedriver as uc
 from pydrive2.auth import GoogleAuth
@@ -778,34 +779,34 @@ def run_pipeline(driver, routing_data: dict, agent_tabs: dict = None) -> tuple:
 # Main
 # ═══════════════════════════════════════════════════════════════════════════════
 
-def main():
-    print("\n" + "=" * 70)
-    print("🌈  PRISM — AI Agent Router System")
-    print("=" * 70)
+POLL_INTERVAL = 60  # seconds between Drive checks
 
-    # ── 1. Authenticate Google Drive ──────────────────────────────────────────
-    print("\n🔐  Authenticating with Google Drive…")
-    drive = auth_drive()
 
-    # ── 2. Read notes.txt from Drive ──────────────────────────────────────────
-    print("📂  Reading notes.txt from Google Drive…")
+def _check_and_run(drive) -> None:
+    """
+    Single poll tick: read notes.txt from Drive, run the full pipeline
+    only if the content has changed since the last tick.
+    Runs inside a background thread so it never blocks the timer loop.
+    """
+    print(f"\n🔄  [{time.strftime('%H:%M:%S')}]  Checking notes.txt on Drive…")
     try:
         user_notes = read_notes_from_drive(drive)
     except FileNotFoundError as e:
         print(e)
         return
+    except Exception as e:
+        print(f"❌  Drive read error: {e}")
+        return
+
+    # ── Change detection ─────────────────────────────────────────────────────
+    if not notes_changed(user_notes):
+        print(f"✅  [{time.strftime('%H:%M:%S')}]  No changes — next check in {POLL_INTERVAL}s.")
+        return
 
     print(f"\n📝  Notes:\n{'-' * 40}\n{user_notes}\n{'-' * 40}")
 
-    # ── 3. Change detection ───────────────────────────────────────────────────
-    if not notes_changed(user_notes):
-        print("\n✅  Notes unchanged since last run — skipping. (it's the same)")
-        return
-
-    # Extract only the NEW lines BEFORE saving (prev_notes.txt still has old content here)
+    # Extract only the NEW lines BEFORE saving
     notes_to_route = get_new_notes_only(user_notes)
-
-    # NOW overwrite prev_notes so next run compares against the full current notes
     save_prev_notes(user_notes)
     print("\n🔄  Notes have changed — proceeding.\n")
 
@@ -814,7 +815,7 @@ def main():
     else:
         print("📌  First run or full re-route — routing all notes.\n")
 
-    # ── 4. Groq routing ───────────────────────────────────────────────────────
+    # ── Groq routing ─────────────────────────────────────────────────────────
     print("🧠  Groq (LLaMA-3.3-70b) analyzing and routing…\n")
     try:
         routing_data = route_with_groq(notes_to_route)
@@ -828,25 +829,20 @@ def main():
 
     print("📊  Routing decisions:\n" + json.dumps(routing_data, indent=2))
 
-    # ── 5. Prepare persistent Chrome profile + launch browser ────────────────
+    # ── Launch browser + run pipeline ────────────────────────────────────────
     profile_dir = get_chrome_profile()
     print("\n🚀  Launching Chrome…")
     driver = launch_driver(profile_dir)
 
     try:
-        # ── 6. Pre-flight login check (opens one tab per agent) ────────────────
         agents_in_use = [a for a in PIPELINE_ORDER if a in routing_data]
         agent_tabs = check_and_ensure_logins(driver, agents_in_use)
-
-        # ── 7. Sequential pipeline (reuses those same tabs) ─────────────────────
         all_responses, agent_links = run_pipeline(driver, routing_data, agent_tabs)
 
-        # ── 8. Save responses locally ─────────────────────────────────────────
         with open(RESPONSES_FILE, "w", encoding="utf-8") as f:
             json.dump(all_responses, f, indent=2, ensure_ascii=False)
         print(f"\n💾  Responses saved → {RESPONSES_FILE}")
 
-        # ── 9. Build links file and upload to Drive ───────────────────────────
         links_content = "\n".join(
             f"{name}: {url}" for name, url in agent_links.items()
         )
@@ -856,7 +852,36 @@ def main():
 
     finally:
         print("\n🏁  Pipeline complete. Tabs left open for review.")
-        # Browser intentionally NOT closed — user reviews conversations
+
+
+def main():
+    print("\n" + "=" * 70)
+    print("🌈  PRISM — AI Agent Router System  (polling mode)")
+    print(f"    Checking Drive every {POLL_INTERVAL}s — Ctrl+C to stop.")
+    print("=" * 70)
+
+    # ── Authenticate once at startup ─────────────────────────────────────────
+    print("\n🔐  Authenticating with Google Drive…")
+    drive = auth_drive()
+    print("✅  Authenticated. Starting poll loop…\n")
+
+    def _poll_loop():
+        """Runs in a daemon thread; fires _check_and_run every POLL_INTERVAL seconds."""
+        while True:
+            worker = threading.Thread(target=_check_and_run, args=(drive,), daemon=True)
+            worker.start()
+            worker.join()          # wait for this tick to finish before sleeping
+            time.sleep(POLL_INTERVAL)
+
+    poller = threading.Thread(target=_poll_loop, daemon=True)
+    poller.start()
+
+    # Keep main thread alive; exit cleanly on Ctrl+C
+    try:
+        while True:
+            time.sleep(1)
+    except KeyboardInterrupt:
+        print("\n\n👋  Prism stopped. Goodbye!")
 
 
 if __name__ == "__main__":
