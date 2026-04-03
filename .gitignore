@@ -206,15 +206,19 @@ marimo/_static/
 marimo/_lsp/
 __marimo__/
 # Custom - Google Drive Credentials
-   client_secret_2.json
-   
-   credentials.json
-   token.json
-   
+client_secret_2.json
+credentials.json
+token.json
+
 # Custom - Environment
-   .env
-   settings.yaml
-   
-# Custom - Output files
-   ai_response.txt
-   ai_responses.json
+.env
+settings.yaml
+
+# Custom - Runtime / Output files
+ai_response.txt
+ai_responses.json
+ai_links.txt
+prev_notes.txt
+
+# Custom - Persistent Chrome automation profile (session data, not source code)
+chrome_automation/

@@ -1,0 +1,7 @@
+undetected-chromedriver==3.5.5
+PyDrive2==1.21.3
+selenium==4.41.0
+setuptools
+requests
+pyautogui
+python-dotenv
