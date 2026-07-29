@@ -198,6 +198,30 @@ def agent_pick_table(stage: str, current: str, suggested: str | None = None):
                   style="dim")
 
 
+def pipeline_plan(stages: list[tuple[str, str, str]], title: str = "pipeline"):
+    """Render an EXPLICIT stage list — (stage, agent, what it does) — the way
+    routing_plan renders the router's own choices.
+
+    routing_plan can only draw the fixed PIPELINE_ORDER categories, so a
+    purpose-built pipeline (/boq's measure → interpret → write, and the
+    task-shaped pipelines in FUTURE_PLAN Phase 6) had no way to show the user
+    which tools were about to run. Same table, arbitrary stages."""
+    if _RICH:
+        t = Table(title=f"🧠  {title}", border_style="teal",
+                  title_style="bold teal", expand=True)
+        t.add_column("#", justify="right", style="dim")
+        t.add_column("Stage", style="bold")
+        t.add_column("Agent")
+        t.add_column("What it does")
+        for i, (stage, agent, purpose) in enumerate(stages, 1):
+            t.add_row(str(i), stage, agent or "[dim]—[/dim]", purpose)
+        console.print(t)
+    else:
+        _plain(f"-- {title} --")
+        for i, (stage, agent, purpose) in enumerate(stages, 1):
+            _plain(f"{i}. {stage}: {agent} — {purpose}")
+
+
 def routing_plan(routing: dict, agents: dict):
     """Render the router's plan as a table before execution."""
     from . import agents as A

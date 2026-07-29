@@ -1,0 +1,788 @@
+"""
+Prism — Bill of Quantities from a CAD drawing (/boq)
+─────────────────────────────────────────────────────
+No AI ever measures the drawing. A DWG/DXF is real vector geometry — lines,
+polylines, arcs, blocks — and an LLM asked to eyeball a rasterized picture of
+it can only guess plausible-looking numbers, which is worthless (or worse,
+dangerous) for a document a client will price work against. So this module
+does the measuring itself, deterministically, with a CAD library that reads
+the actual entity coordinates: lengths from LINE/LWPOLYLINE/POLYLINE/ARC,
+areas from closed polylines and HATCH boundaries, counts from INSERT (block)
+references. The output is a plain quantities CSV — auditable, re-openable in
+Excel, and never silently trusted. An AI stage only ever sees THAT structured
+data afterward, to write it up as a professionally formatted BOQ document
+(item numbers, descriptions, grouping by trade) — formatting is exactly what
+it's good at; measuring is exactly what it isn't.
+
+.dwg is a proprietary binary format ezdxf cannot read directly. It must be
+converted to .dxf (an open, documented format) FIRST, on the user's own
+machine, with one of:
+
+  • GNU LibreDWG (free, scriptable, recommended):
+        macOS   →  brew install libredwg          (gives the `dwg2dxf` CLI)
+        Debian  →  sudo apt install libredwg-tools
+    Coverage of newer/exotic DWG features is not perfect — good enough for
+    ordinary 2D architectural drawings, which is the common case here.
+
+  • ODA File Converter (free, more complete, GUI-first but scriptable):
+        https://www.opendesign.com/guestfiles/oda_file_converter
+    Look for `ODAFileConverter` on PATH after installing.
+
+ensure_dxf() detects whichever is installed; if neither is, it raises a clear
+error naming both options rather than failing obscurely.
+
+KNOWN LIMITATIONS (disclosed, not hidden):
+  • Curved polyline segments (bulges) are measured exactly for LWPOLYLINE;
+    legacy POLYLINE segments are treated as straight (a documented
+    approximation — rare in modern exports).
+  • HATCH boundaries that are true splines/ellipses are measured via their
+    control/fit points, not exact curve integration — fine for the polygonal
+    boundaries architectural floor hatches almost always use.
+  • Numbers are only as good as the source drawing's layer/block discipline.
+    A drawing with everything dumped on layer "0" with no named blocks will
+    still parse, but the grouping will be useless — this tool cannot invent
+    structure the drawing never had.
+"""
+from __future__ import annotations
+import csv
+import math
+import os
+import shutil
+import subprocess
+import tempfile
+
+_CONVERTER_CANDIDATES = ["dwg2dxf", "ODAFileConverter", "ODAFileConverter.exe"]
+
+# DXF $INSUNITS header codes worth naming — the common ones. Anything else is
+# reported as "unspecified (code N)" rather than guessed.
+_UNIT_NAMES = {
+    0: "unspecified", 1: "inches", 2: "feet", 3: "miles",
+    4: "millimeters", 5: "centimeters", 6: "meters", 8: "US survey feet",
+}
+
+
+class BoqError(Exception):
+    pass
+
+
+# ── DWG → DXF ──────────────────────────────────────────────────────────────
+
+def find_dwg_converter() -> str | None:
+    for name in _CONVERTER_CANDIDATES:
+        found = shutil.which(name)
+        if found:
+            return found
+    return None
+
+
+def _read_dxf(path: str):
+    """Open a DXF, tolerating the kind of minor structural errors a
+    third-party writer (this app's own dwg2dxf fallback included) can leave
+    behind. Tries the strict reader first — it keeps every bit of metadata,
+    including $INSUNITS. Only if that fails does it fall back to ezdxf's
+    lenient recovery reader, which repairs what it can and reports what it
+    couldn't. Returns (doc, notes); raises BoqError if even recovery can't
+    make sense of the file. Confirmed necessary against a real client DWG
+    whose full-mode conversion produced one malformed numeric tag — enough
+    to make the strict reader reject the entire file outright."""
+    import ezdxf
+    try:
+        return ezdxf.readfile(path), []
+    except Exception:
+        pass
+    try:
+        import ezdxf.recover as recover
+        doc, auditor = recover.readfile(path)
+    except Exception as e:
+        raise BoqError(f"Couldn't read that DXF, even with error recovery: {e}")
+    notes = []
+    if auditor.errors:
+        notes.append(
+            f"The DXF needed error recovery ({len(auditor.errors)} structural "
+            "issue(s)) — some entities may be missing or altered. Treat these "
+            "quantities as a strong starting point, not a final figure.")
+    return doc, notes
+
+
+def _run_dwg2dxf(converter: str, dwg_path: str, out_path: str, minimal: bool):
+    cmd = [converter] + (["-m"] if minimal else []) + ["-y", dwg_path, "-o", out_path]
+    return subprocess.run(cmd, capture_output=True, text=True, timeout=180)
+
+
+def dwg_to_dxf(dwg_path: str, out_dir: str | None = None) -> tuple[str, list[str]]:
+    """Convert a .dwg to .dxf with whatever converter is installed locally.
+    Returns (dxf_path, notes) — notes flags anything the caller should know
+    before trusting the result (e.g. a fallback that drops unit metadata).
+    Raises BoqError with install instructions for both options if neither is
+    on PATH, or if conversion genuinely fails — never fails silently.
+
+    A converter reporting success is NOT taken on faith — the result is
+    actually opened with ezdxf before being accepted, because a real client
+    file surfaced a case where dwg2dxf exited 0 and wrote a file that still
+    turned out to have one malformed tag full-mode conversion can't avoid on
+    that source. If a full conversion can't actually be read, a minimal
+    (-m) reconversion is tried before giving up — see _read_dxf/-m's own
+    docstring for what each fallback costs."""
+    converter = find_dwg_converter()
+    if not converter:
+        raise BoqError(
+            "No DWG→DXF converter found on this machine. Install one:\n"
+            "  • brew install libredwg        (macOS, gives `dwg2dxf`)\n"
+            "  • sudo apt install libredwg-tools   (Debian/Ubuntu)\n"
+            "  • or ODA File Converter: "
+            "https://www.opendesign.com/guestfiles/oda_file_converter\n"
+            "Then re-run /boq — or convert it yourself and attach the .dxf directly."
+        )
+    out_dir = out_dir or tempfile.mkdtemp(prefix="prism_boq_")
+    name = os.path.splitext(os.path.basename(dwg_path))[0]
+    out_path = os.path.join(out_dir, f"{name}.dxf")
+    notes: list[str] = []
+
+    if os.path.basename(converter).lower().startswith("dwg2dxf"):
+        result = _run_dwg2dxf(converter, dwg_path, out_path, minimal=False)
+        readable = False
+        first_err = ""
+        if result.returncode == 0 and os.path.exists(out_path):
+            try:
+                _read_dxf(out_path)   # validate — don't just trust the exit code
+                readable = True
+            except BoqError as e:
+                first_err = str(e)
+        else:
+            first_err = (result.stderr or result.stdout or "").strip()[:300]
+
+        if not readable:
+            # A full conversion pulls table-style/material sections that can
+            # make libredwg abort outright, or emit a tag ezdxf can't parse,
+            # on some real modern DWGs (both confirmed against an actual
+            # client file). -m (minimal: $ACADVER/HANDSEED/ENTITIES only)
+            # skips those sections and often succeeds where full conversion
+            # can't — but it can also drop header metadata, including
+            # $INSUNITS, so the result's units may be unconfirmed. We only
+            # need entity geometry for a takeoff, so retry with it, but
+            # surface the tradeoff rather than hiding it.
+            result = _run_dwg2dxf(converter, dwg_path, out_path, minimal=True)
+            if result.returncode != 0 or not os.path.exists(out_path):
+                raise BoqError(
+                    f"DWG→DXF conversion failed even in minimal mode: "
+                    f"{(result.stderr or result.stdout or '').strip()[:400]}\n"
+                    f"(full-mode attempt also failed: {first_err})"
+                )
+            try:
+                _read_dxf(out_path)
+            except BoqError as e:
+                raise BoqError(
+                    f"Neither full nor minimal conversion produced a file "
+                    f"ezdxf could read. Full mode: {first_err}. Minimal mode: {e}"
+                )
+            notes.append(
+                "Full conversion couldn't be read, so a minimal fallback was "
+                "used — geometry came through, but the drawing's unit may "
+                "not have been recorded. VERIFY the actual unit (mm/m/ft) "
+                "against the source drawing before trusting any quantity below."
+            )
+    else:
+        # ODA File Converter's CLI takes (in_dir, out_dir, ver, type, recurse,
+        # audit, [filter]) — it converts a whole folder, not a single file.
+        in_dir = os.path.dirname(os.path.abspath(dwg_path))
+        cmd = [converter, in_dir, out_dir, "ACAD2018", "DXF", "0", "1",
+               os.path.basename(dwg_path)]
+        try:
+            result = subprocess.run(cmd, capture_output=True, text=True, timeout=180)
+        except Exception as e:
+            raise BoqError(f"DWG→DXF conversion failed to run: {e}")
+        if result.returncode != 0 and not os.path.exists(out_path):
+            raise BoqError(
+                f"DWG→DXF conversion failed (exit {result.returncode}): "
+                f"{(result.stderr or result.stdout or '').strip()[:400]}"
+            )
+
+    if not os.path.exists(out_path):
+        raise BoqError("Converter ran but produced no .dxf — check the source file opens in AutoCAD.")
+    return out_path, notes
+
+
+def ensure_dxf(path: str) -> tuple[str, list[str]]:
+    """Return (dxf_path, notes) — converting a .dwg first if that's what was
+    given. notes is always a list (empty for a plain .dxf, which needed no
+    conversion and so has no fallback caveats)."""
+    ext = os.path.splitext(path)[1].lower()
+    if ext == ".dxf":
+        return path, []
+    if ext == ".dwg":
+        return dwg_to_dxf(path)
+    raise BoqError(f"Not a CAD drawing Prism can measure: {path} (need .dwg or .dxf)")
+
+
+# ── geometry ─────────────────────────────────────────────────────────────
+
+def _dist(a, b) -> float:
+    return math.hypot(b[0] - a[0], b[1] - a[1])
+
+
+def _bulge_arc_length(a, b, bulge: float) -> float:
+    """Arc length of one LWPOLYLINE segment with a bulge (curved segment).
+    bulge = tan(included_angle / 4); this is the standard DXF bulge formula."""
+    if not bulge:
+        return _dist(a, b)
+    chord = _dist(a, b)
+    if chord == 0:
+        return 0.0
+    theta = 4 * math.atan(abs(bulge))
+    if theta <= 0:
+        return chord
+    half = theta / 2
+    sin_half = math.sin(half)
+    if sin_half == 0:
+        return chord
+    radius = chord / (2 * sin_half)
+    return radius * theta
+
+
+def _polygon_area(points: list[tuple[float, float]]) -> float:
+    """Shoelace formula. `points` need not repeat the first point at the end."""
+    n = len(points)
+    if n < 3:
+        return 0.0
+    total = 0.0
+    for i in range(n):
+        x1, y1 = points[i][0], points[i][1]
+        x2, y2 = points[(i + 1) % n][0], points[(i + 1) % n][1]
+        total += x1 * y2 - x2 * y1
+    return abs(total) / 2.0
+
+
+def _lwpolyline_length(e) -> float:
+    pts = [(p[0], p[1]) for p in e.get_points("xyb")]  # (x, y, bulge)
+    if len(pts) < 2:
+        return 0.0
+    bulges = [p[2] if len(p) > 2 else 0.0 for p in e.get_points("xyb")]
+    total = 0.0
+    n = len(pts)
+    segments = n if e.closed else n - 1
+    for i in range(segments):
+        a, b = pts[i], pts[(i + 1) % n]
+        total += _bulge_arc_length(a, b, bulges[i])
+    return total
+
+
+def _lwpolyline_area(e) -> float:
+    if not e.closed:
+        return 0.0
+    pts = [(p[0], p[1]) for p in e.get_points("xy")]
+    return _polygon_area(pts)
+
+
+def _legacy_polyline_length(e) -> float:
+    # Straight-segment approximation — see module docstring's known limitations.
+    pts = [(v.dxf.location.x, v.dxf.location.y) for v in e.vertices]
+    if len(pts) < 2:
+        return 0.0
+    n = len(pts)
+    segments = n if e.is_closed else n - 1
+    return sum(_dist(pts[i], pts[(i + 1) % n]) for i in range(segments))
+
+
+def _legacy_polyline_area(e) -> float:
+    if not e.is_closed:
+        return 0.0
+    pts = [(v.dxf.location.x, v.dxf.location.y) for v in e.vertices]
+    return _polygon_area(pts)
+
+
+def _arc_length(e) -> float:
+    radius = e.dxf.radius
+    start, end = e.dxf.start_angle % 360, e.dxf.end_angle % 360
+    span = end - start
+    if span <= 0:
+        span += 360
+    return radius * math.radians(span)
+
+
+def _hatch_area(e) -> float:
+    """Sum external boundary loop areas, subtract internal (hole) loops.
+    Non-polyline edges (arcs/splines/ellipses) are approximated via their
+    control/fit vertices — see module docstring."""
+    total = 0.0
+    for path in e.paths:
+        pts = []
+        if hasattr(path, "vertices") and path.vertices:
+            pts = [(v[0], v[1]) for v in path.vertices]
+        elif hasattr(path, "edges"):
+            for edge in path.edges:
+                if hasattr(edge, "start"):
+                    pts.append((edge.start[0], edge.start[1]))
+        if len(pts) < 3:
+            continue
+        area = _polygon_area(pts)
+        is_external = bool(getattr(path, "path_type_flags", 1) & 1)  # bit 0 = EXTERNAL
+        total += area if is_external else -area
+    return abs(total)
+
+
+# ── measurement ────────────────────────────────────────────────────────────
+
+def measure(dxf_path: str) -> dict:
+    """Walk every entity in every layout's modelspace-equivalent geometry and
+    return real, measured quantities — never estimated, never AI-guessed:
+
+        {"unit": "meters", "unit_code": 6,
+         "lengths_by_layer": {"WALLS": 142.7, ...},   # drawing units
+         "areas_by_layer":   {"ROOM-HATCH": 88.4, ...},
+         "block_counts":     {"DOOR-900": 12, "WINDOW-1200": 8, ...},
+         "layers": ["0", "WALLS", ...], "entity_count": 431}
+    """
+    doc, read_notes = _read_dxf(dxf_path)
+
+    unit_code = doc.header.get("$INSUNITS", 0)
+    unit = _UNIT_NAMES.get(unit_code, f"unspecified (code {unit_code})")
+
+    lengths: dict[str, float] = {}
+    areas: dict[str, float] = {}
+    blocks: dict[str, int] = {}
+    block_layers: dict[str, set] = {}
+    seen_layers: set[str] = set()
+    entity_count = 0
+
+    def add(d: dict, key: str, value: float):
+        if value:
+            d[key] = d.get(key, 0.0) + value
+
+    msp = doc.modelspace()
+    for e in msp:
+        entity_count += 1
+        t = e.dxftype()
+        layer = e.dxf.layer
+        seen_layers.add(layer)
+        try:
+            if t == "LINE":
+                add(lengths, layer, _dist(
+                    (e.dxf.start.x, e.dxf.start.y), (e.dxf.end.x, e.dxf.end.y)))
+            elif t == "LWPOLYLINE":
+                add(lengths, layer, _lwpolyline_length(e))
+                add(areas, layer, _lwpolyline_area(e))
+            elif t == "POLYLINE":
+                add(lengths, layer, _legacy_polyline_length(e))
+                add(areas, layer, _legacy_polyline_area(e))
+            elif t == "ARC":
+                add(lengths, layer, _arc_length(e))
+            elif t == "HATCH":
+                add(areas, layer, _hatch_area(e))
+            elif t == "INSERT":
+                name = e.dxf.name
+                if not name.startswith("*"):   # anonymous/system blocks
+                    blocks[name] = blocks.get(name, 0) + 1
+                    # The LAYER a block sits on is usually the draughtsman's
+                    # own plain-English name for it ("EP" on layer "Electric
+                    # Pole"), so the drawing carries its own legend — no
+                    # screenshot or hand-typed mapping needed, and it beats
+                    # both: in a real client file this proved the user's
+                    # hand-written legend wrong (they had HP = high tension
+                    # pole; HP actually sits on "Hand Pump", HT on "High
+                    # Tension Pole").
+                    block_layers.setdefault(name, set()).add(layer)
+        except Exception:
+            # One malformed entity (a stray null vertex, a degenerate arc)
+            # must not sink the whole takeoff — skip it, keep going.
+            continue
+
+    return {
+        "unit": unit, "unit_code": unit_code, "unit_confirmed": unit_code != 0,
+        "notes": read_notes,
+        "lengths_by_layer": dict(sorted(lengths.items())),
+        "areas_by_layer": dict(sorted(areas.items())),
+        "block_counts": dict(sorted(blocks.items())),
+        "block_layers": {k: sorted(v) for k, v in sorted(block_layers.items())},
+        # From the entities actually walked, NOT doc.layers.entries — a
+        # minimal-mode DWG→DXF conversion can leave the formal layer TABLE
+        # nearly empty (confirmed: 2 table entries vs. 64 real layer names
+        # in an actual client file) while every entity still correctly
+        # reports its own layer. The table is not a reliable source here.
+        "layers": sorted(seen_layers),
+        "entity_count": entity_count,
+    }
+
+
+def apply_known_unit(q: dict, unit_name: str) -> dict:
+    """The user knows the real unit even though the file didn't say so (or
+    conversion dropped it) — take their word for it instead of flagging
+    every quantity as unconfirmed. Mutates and returns q."""
+    q["unit"] = unit_name.strip().lower()
+    q["unit_confirmed"] = True
+    return q
+
+
+def filter_by_keywords(q: dict, keywords: list[str]) -> dict:
+    """Keep only layers/blocks whose name contains any of `keywords`
+    (case-insensitive substring match) — a real, deterministic scope filter,
+    not a hope that the formatting agent will ignore irrelevant trades on
+    its own. Confirmed necessary: without this, a mixed civil+CCTV drawing's
+    full measured dump left the formatting agent to guess which layers
+    belonged to the requested scope, and it guessed wrong (defaulted to
+    civil). Returns a new dict; the original is untouched."""
+    kws = [k.strip().lower() for k in keywords if k.strip()]
+    if not kws:
+        return q
+
+    def matches(name: str) -> bool:
+        low = name.lower()
+        return any(k in low for k in kws)
+
+    out = dict(q)
+    out["lengths_by_layer"] = {k: v for k, v in q["lengths_by_layer"].items() if matches(k)}
+    out["areas_by_layer"] = {k: v for k, v in q["areas_by_layer"].items() if matches(k)}
+    out["block_counts"] = {k: v for k, v in q["block_counts"].items() if matches(k)}
+    out["scope_keywords"] = kws
+    out["scope_total_layers"] = len(q["layers"])
+    return out
+
+
+# ── output: the raw, auditable quantities CSV ──────────────────────────────
+
+def write_quantities_csv(q: dict, path: str) -> None:
+    """The measured numbers, exactly as computed — before any AI touches
+    them. Openable in Excel, and the thing to sanity-check the eventual
+    formatted BOQ against."""
+    with open(path, "w", newline="", encoding="utf-8") as f:
+        w = csv.writer(f)
+        w.writerow(["category", "name", "quantity", "unit"])
+        for layer, length in q["lengths_by_layer"].items():
+            w.writerow(["length", layer, f"{length:.2f}", q["unit"]])
+        for layer, area in q["areas_by_layer"].items():
+            w.writerow(["area", layer, f"{area:.2f}", f"square {q['unit']}"])
+        for name, count in q["block_counts"].items():
+            w.writerow(["count", name, count, "nos"])
+
+
+def summary_text(q: dict) -> str:
+    """Plain-text quantities summary — small enough to embed directly in an
+    AI prompt (no file upload needed), and what the terminal prints too."""
+    lines = [f"Drawing units: {q['unit']}  ·  {q['entity_count']} entities  ·  "
+             f"{len(q['layers'])} layer(s)"]
+    if not q.get("unit_confirmed", q["unit_code"] != 0):
+        lines.append(
+            "⚠ UNIT NOT CONFIRMED — this drawing's $INSUNITS wasn't set or "
+            "wasn't preserved through conversion. Every number below is in "
+            "whatever raw drawing units were used (could be mm, m, or ft) — "
+            "confirm the real unit against the source drawing before this "
+            "goes anywhere near a client or a rate.")
+    if "scope_keywords" in q:
+        shown = len(q["lengths_by_layer"]) + len(q["areas_by_layer"]) + len(q["block_counts"])
+        # No literal '[...]' here — this text is also shown in a Rich-markup
+        # terminal panel, which parses square brackets as style tags and
+        # silently swallows whatever's inside them.
+        lines.append(
+            f'SCOPE FILTER applied: matching "{", ".join(q["scope_keywords"])}" — '
+            f"showing items from a subset of the drawing's {q['scope_total_layers']} "
+            "layer(s), NOT the whole file. Everything below is in scope; nothing "
+            "outside it should appear in the BOQ.")
+        if shown == 0:
+            lines.append(
+                "⚠ NOTHING MATCHED that scope filter — check the keywords against "
+                "the actual layer/block names in this drawing (see full layer list "
+                "below) before assuming the scope truly has zero quantity.")
+    for note in q.get("notes") or []:
+        lines.append(f"⚠ {note}")
+    lines.append("")
+    if q["lengths_by_layer"]:
+        lines.append("LENGTHS BY LAYER:")
+        lines += [f"  {layer}: {length:.2f} {q['unit']}"
+                  for layer, length in q["lengths_by_layer"].items()]
+        lines.append("")
+    if q["areas_by_layer"]:
+        lines.append("AREAS BY LAYER:")
+        lines += [f"  {layer}: {area:.2f} square {q['unit']}"
+                  for layer, area in q["areas_by_layer"].items()]
+        lines.append("")
+    if q["block_counts"]:
+        lines.append("BLOCK COUNTS (poles, fixtures, doors — whatever was drawn "
+                     "as a block). The layer each block sits on is the "
+                     "draughtsman's own name for it, so it doubles as the "
+                     "drawing's built-in legend:")
+        for name, count in q["block_counts"].items():
+            lyrs = (q.get("block_layers") or {}).get(name) or []
+            # Parentheses, not brackets — this string is also rendered in a
+            # Rich terminal panel, which eats "[...]" as a style tag.
+            hint = f"  (drawn on layer: {', '.join(lyrs)})" if lyrs else ""
+            lines.append(f"  {name}: {count}{hint}")
+    if not (q["lengths_by_layer"] or q["areas_by_layer"] or q["block_counts"]):
+        lines.append("No measurable LINE/POLYLINE/HATCH/INSERT geometry found — "
+                     "the drawing may use 3D solids or an unsupported entity type.")
+    # Always list every layer name, not only when a scope filter is on. A
+    # layer can exist with NO measurable geometry — "Electric Pole" and
+    # "Hand Pump" in a real client drawing hold only block inserts, which
+    # are counted above under their BLOCK name (EP, HP), never their layer.
+    # Without this list a reader can't tell "that trade isn't in the file"
+    # from "that trade is here but drawn as blocks", which is exactly the
+    # distinction the interpretation stage is asked to report on.
+    total = q.get("scope_total_layers", len(q["layers"]))
+    if q["layers"]:
+        lines.append("")
+        lines.append(f"(All {total} layer names in the source drawing, for "
+                     f"reference — some hold no measurable geometry: "
+                     f"{', '.join(q['layers'])})")
+    return "\n".join(lines)
+
+
+_TEMPLATE_EXTS = (".docx", ".doc", ".xlsx", ".xls", ".csv", ".ods", ".pdf")
+_IMAGE_EXTS = (".png", ".jpg", ".jpeg", ".webp", ".gif", ".bmp", ".tif", ".tiff")
+
+
+def classify_inputs(attachments: list[dict]):
+    """Sort what the user attached by the ROLE it plays in a BOQ run:
+    (cad, templates, images, notes). A screenshot of the drawing's legend
+    sheet is not a template and must not be described to the AI as one —
+    they carry completely different instructions."""
+    cad, templates, images, notes = [], [], [], []
+    for a in attachments:
+        ext = os.path.splitext(a.get("path", ""))[1].lower()
+        if ext in (".dwg", ".dxf"):
+            cad.append(a)
+        elif ext in _IMAGE_EXTS:
+            images.append(a)
+        elif ext in _TEMPLATE_EXTS:
+            templates.append(a)
+        else:
+            notes.append(a)
+    return cad, templates, images, notes
+
+
+def roles_text(cad, templates, images, notes) -> str:
+    """One line per attached file saying what it IS — so the reading agent
+    doesn't have to guess whether a .docx is a template or a spec."""
+    lines = []
+    for a in cad:
+        lines.append(f"  · {a['name']} — the CAD drawing itself (source of the measured numbers below)")
+    for a in images:
+        lines.append(f"  · {a['name']} — a screenshot/image of the drawing "
+                     "(read any legend, key, title block, notes or symbols visible in it)")
+    for a in templates:
+        lines.append(f"  · {a['name']} — an example BOQ showing the firm's usual style")
+    for a in notes:
+        lines.append(f"  · {a['name']} — background/requirements written by the user")
+    return "\n".join(lines)
+
+
+def standards_prompt(user_request: str, project_context: str = "") -> str:
+    """The RESEARCH stage: the design norms a quantity surveyor would look up
+    before estimating a trade that hasn't been drawn yet.
+
+    This is the one part of a BOQ run that genuinely needs live web search
+    and needs no CAD file at all — which makes it the natural first stage of
+    a real pipeline rather than piling everything onto the writer. Camera
+    spacing, max cable runs, containment conventions and the applicable
+    standards are exactly what turns a derived quantity from a guess into a
+    defensible assumption."""
+    where = f" Project context: {project_context}." if project_context.strip() else ""
+    return (
+        "You are the RESEARCH stage of a Bill-of-Quantities pipeline. Your "
+        "ONLY task is to set out the CURRENT STANDARD DESIGN NORMS a "
+        "quantity surveyor or services estimator would apply when sizing "
+        f"and estimating this work: {user_request}.{where}"
+        "\n\nDo NOT write a BOQ, do not invent site quantities, and do not "
+        "describe this specific site — you have not seen it. Give the "
+        "general engineering rules of thumb and standards that a later stage "
+        "will apply to real measured site dimensions."
+        "\n\nCover, with SPECIFIC NUMBERS wherever they exist:"
+        "\n  · typical spacing / coverage per device (e.g. metres between "
+        "perimeter cameras, effective IR range, lux and lens guidance)"
+        "\n  · cable types and their limits (e.g. max copper run before a "
+        "repeater/fibre is required, when armoured or outdoor-rated is "
+        "mandatory, indicative fibre core counts for a backbone)"
+        "\n  · containment and civil allowances (conduit sizing, trench "
+        "depth for buried duct, slack/service-loop percentage to add)"
+        "\n  · termination, power and redundancy conventions (PoE budget, "
+        "field switch/junction points per run, UPS backup expectations)"
+        "\n  · the applicable standards or codes by name/number where they "
+        "genuinely apply (Indian IS/NBC, TIA/ISO cabling, IEC), plus common "
+        "Indian market practice if it differs from the written standard"
+        "\n\nFormat it as a short, dense checklist of stated rules — each "
+        "line usable as a design assumption a later stage can cite verbatim. "
+        "Flag anything that is genuinely a judgement call rather than a norm."
+    )
+
+
+def interpretation_prompt(user_request: str, quantities_text: str,
+                          files_text: str, legend_hint: str = "") -> str:
+    """The FIRST stage of a /boq run: work out what the drawing's codes mean
+    and which of them the user actually wants, instead of making the user
+    type `scope:` and `legend:` by hand. Deliberately forbidden from writing
+    the BOQ or inventing quantities — it only interprets, and the stage
+    after it does the writing."""
+    hint = (f"\n\nThe user also supplied this partial legend — treat it as "
+            f"authoritative and extend it:\n{legend_hint}") if legend_hint.strip() else ""
+    return (
+        "You are the INTERPRETATION stage of a Bill-of-Quantities pipeline. "
+        "Your ONLY job is to work out what the drawing's layer/block codes "
+        "MEAN and WHICH of them the user's request actually covers. Do NOT "
+        "write the BOQ — the next AI does that. Do NOT invent, estimate or "
+        "recalculate any quantity: the numbers below were measured directly "
+        "from the drawing's geometry and are the only real ones that exist."
+        f"\n\nWHAT THE USER ASKED FOR:\n{user_request}"
+        f"\n\nFILES ATTACHED TO THIS MESSAGE:\n{files_text}{hint}"
+        "\n\nRead the attached image(s) carefully — a drawing's legend/key, "
+        "title block, scale and notes are usually printed on the sheet, and "
+        "that is normally where abbreviations like EP / HT / BOR are "
+        "explained."
+        "\n\nIf an example BOQ is attached, it is your PRIMARY guide to scope: "
+        "the trades and item types it bills for are what this firm actually "
+        "quotes, so treat those as the scope of this BOQ unless the user's "
+        "request above clearly says otherwise (the user's own words always "
+        "win). It also shows you the item granularity and description style "
+        "they expect."
+        "\n\nReply with EXACTLY these four sections and nothing else:"
+        "\n\n1. LEGEND — every layer/block code appearing in the measured "
+        "data below that you can identify, as `CODE = plain-English meaning`. "
+        "Say 'unidentified' for the ones you genuinely cannot work out; do "
+        "not guess a meaning that isn't supported by the drawing or files."
+        "\n\n2. IN SCOPE — the layer/block names (copied EXACTLY as spelled "
+        "in the measured data) that belong in the BOQ the user asked for, "
+        "each with a one-line reason. Leave out anything that is drafting "
+        "furniture rather than built work (grids, title blocks, dimensions, "
+        "text, revision marks, coordinates, level marks)."
+        "\n\n3. PROJECT FACTS — client/project name, location, drawing "
+        "scale, units, revision/date — only if you can actually see them in "
+        "the attached files. Write 'not stated' otherwise."
+        "\n\n4. GAPS — anything the user asked for that the measured data "
+        "does NOT contain (e.g. they asked for cabling but no cable/conduit "
+        "geometry exists in this drawing). Be explicit and specific: this "
+        "warning is more useful to the user than a padded BOQ."
+        f"\n\nMEASURED QUANTITIES (ground truth, every layer in the drawing):\n{quantities_text}"
+    )
+
+
+def formatting_prompt(quantities_text: str, project_context: str = "",
+                      has_template: bool = False, legend: str = "",
+                      scoped: bool = False, brief_text: str = "",
+                      allow_derived: bool = True, has_cad: bool = True,
+                      standards_text: str = "") -> str:
+    """`allow_derived` is the difference between a takeoff and an estimate.
+
+    A survey/civil drawing legitimately contains no CCTV, cabling or fibre
+    geometry — nobody has designed those yet. Forbidding un-measured line
+    items outright (the original rule here) meant the writer could only
+    refuse, which is useless when the whole job is "quote ELV works for this
+    site". So derivation IS allowed — camera counts from boundary length,
+    cable runs from road/perimeter lengths — but only with the design basis
+    stated per section and a warning that it is a design-stage estimate, not
+    a measured takeoff. Measured and derived must never be presented as the
+    same kind of number."""
+    context = f" Project context: {project_context}." if project_context.strip() else ""
+    if has_template:
+        structure = (
+            "A BOQ TEMPLATE is attached — use it as a reference for the "
+            "firm's general style: the kind of section/trade breakdown it "
+            "uses, its column set, its numbering and description tone, its "
+            "boilerplate (headers, notes, disclaimers). Take inspiration "
+            "from it, do not copy its literal rows/columns verbatim — adapt "
+            "the structure to what this drawing's measured data actually "
+            "contains. Use your judgement on the best section grouping and "
+            "presentation for this specific quantity set; the template is a "
+            "style guide, not a form to fill in cell-by-cell. Still: every "
+            "quantity you present must trace back to the measured data "
+            "below, and nothing measured should be silently dropped."
+        )
+    else:
+        structure = (
+            "Group items sensibly by trade/category (civil, doors & "
+            "windows, finishes, etc. — infer from the layer/block names "
+            "given). For each item include: item no., description, unit, "
+            "and quantity (copied exactly from below)."
+        )
+    scope_rule = (
+        " A SCOPE FILTER was already applied below — every item shown is in "
+        "scope. Do not add items from other trades, and do not comment on "
+        "trades that were filtered out."
+    ) if scoped else ""
+    # The brief is EMBEDDED, not referred to. Relying on the pipeline relay
+    # to put it "above" produced a run where the writer was told to follow a
+    # brief that was empty (a failed scrape) and another where it arrived
+    # garbled. If there's a brief, it's in this string or it doesn't exist.
+    brief_block = (
+        "\n\nINTERPRETATION BRIEF from the reading stage — use its legend for "
+        "descriptions and its scope list to decide what appears:\n"
+        f"{brief_text.strip()}"
+    ) if brief_text.strip() else ""
+    # Explicit, not "if you can". Left soft, the writer skips straight to
+    # formatting the numbers and never opens the drawing — which is the
+    # difference between a document that knows WHERE the gates and buildings
+    # are (so cameras and cable routes can be placed sensibly) and one that
+    # only reshuffles a table of totals.
+    cad_note = (
+        "\n\nSTEP 1 — ANALYSE THE DRAWING YOURSELF, BEFORE WRITING ANYTHING. "
+        "The original CAD file is attached to this message. Open and parse it "
+        "directly with your code-execution/analysis tool — convert or read it "
+        "with a CAD library (ezdxf and similar handle DXF; convert the DWG "
+        "first if needed) and enumerate for yourself: every layer name, every "
+        "block/INSERT name with its count and the layer it sits on, polyline "
+        "and line lengths, and closed-polyline/hatch areas. Then:\n"
+        "  (a) State briefly what the drawing actually IS (site survey, "
+        "services layout, floor plan…) and what it contains.\n"
+        "  (b) Cross-check your own figures against the MEASURED QUANTITIES "
+        "listed below, which were extracted programmatically from the same "
+        "file. They are the authoritative numbers for the BOQ — but if your "
+        "own reading disagrees materially, say so explicitly rather than "
+        "quietly picking one.\n"
+        "  (c) Use the drawing's GEOMETRY, not just its totals: where the "
+        "gates, boundary, roads, buildings and existing poles actually sit. "
+        "That spatial layout is what lets you place cameras sensibly, route "
+        "cable along real paths, and count termination points — do not derive "
+        "any of that from the summary table alone.\n"
+        "Do not skip this step and jump to formatting."
+    ) if has_cad else ""
+    if allow_derived:
+        derive_rule = (
+            " IMPORTANT — how to handle a trade the drawing does not contain: "
+            "a survey or civil drawing legitimately has NO camera, cable, "
+            "conduit or fibre geometry, because that system has not been "
+            "designed yet. Do NOT refuse the job on that basis, and do NOT "
+            "silently pretend those items were measured. Instead DERIVE them "
+            "as a competent ELV/services estimator would: work the quantities "
+            "out from the site's real measured geometry (boundary and road "
+            "lengths, gate and building counts, existing pole positions) "
+            "combined with explicit, stated design assumptions (camera "
+            "spacing, cable-run and slack allowances, termination points). "
+            "Rules for derived items: (a) open the document with a prominent "
+            "warning box stating this is a PROVISIONAL DESIGN-STAGE ESTIMATE "
+            "derived from civil geometry, not a measured take-off, and that "
+            "it must be validated by a site survey and detailed design before "
+            "tendering; (b) under each section heading, state the design "
+            "basis in one or two lines — the actual arithmetic, e.g. 'boundary "
+            "1091 m ÷ 40 m camera spacing = 28 nos'; (c) never present a "
+            "derived quantity as a measured one. Measured civil items, where "
+            "the user asked for them, stay exactly as measured."
+        )
+    else:
+        derive_rule = (
+            " Do NOT add line items that have no corresponding measurement "
+            "below — if the user asked for a trade the drawing does not "
+            "contain, say so plainly instead of inventing quantities."
+        )
+    standards_block = (
+        "\n\nDESIGN STANDARDS BRIEF from the research stage — when you derive "
+        "a quantity, apply THESE norms and cite the specific rule you used "
+        "(e.g. 'at 40 m spacing per the brief'). Prefer them over your own "
+        "recollection; if one is missing for something you need, say which "
+        "assumption you had to make instead:\n"
+        f"{standards_text.strip()}"
+    ) if standards_text.strip() else ""
+    legend_block = (
+        f"\n\nLAYER/BLOCK LEGEND (what these codes mean — use it to write real "
+        f"descriptions instead of repeating the raw code):\n{legend}"
+    ) if legend.strip() else ""
+    instructions = (
+        f"Your task is: produce a professional Bill of Quantities (BOQ) "
+        f"document.{context} The quantities listed at the end were measured "
+        "directly from the CAD drawing's geometry — treat them as ground "
+        f"truth and do not recalculate or contradict them.{cad_note}"
+        f"\n\nSTEP 2 — BUILD THE BOQ.{derive_rule}{scope_rule} {structure} "
+        "Leave Rate/Amount columns blank for the quantity surveyor to fill "
+        "in. Present it as clean tables. Note prominently at the top that "
+        "rates are not included and quantities should be independently "
+        "verified before tendering."
+    )
+    # Plain concatenation, not str.format() on the whole thing — a layer or
+    # block name from the drawing could itself contain '{'/'}' and must not
+    # be misread as a format field.
+    return (instructions + standards_block + brief_block + legend_block
+            + "\n\nMEASURED QUANTITIES:\n" + quantities_text)

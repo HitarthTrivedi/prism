@@ -13,6 +13,7 @@ address list never leaves this machine.
 """
 from __future__ import annotations
 import csv
+import io
 import re
 import ssl
 import time
@@ -121,6 +122,81 @@ def recipients_from_text(text: str):
     cleaned = re.sub(r"\s*(?:,|;|\band\b)?\s*(?:,|;|\band\b)\s*(?=$|[,;.])", "", cleaned)
     cleaned = re.sub(r"\s{2,}", " ", cleaned).strip(" ,;&")
     return recs, cleaned
+
+
+# ── discovered recipients (a research agent found them, not the user) ────────
+
+def discovery_prompts(goal: str) -> tuple[str, str]:
+    """(research prompt, structuring prompt) for finding recipients that match
+    a description — "the best-suited agencies in Vadodara", not one named
+    org. Two stages because a research agent free-writes prose; asking it to
+    also format strict CSV in the same breath tends to lose rows. Splitting
+    the jobs is exactly the 'let stages cycle back through agents' pattern —
+    the structuring stage often reuses whichever agent already ran."""
+    research = (
+        "Your ONLY task is: based on the brief above, find real, currently "
+        f"operating businesses that match this request: {goal}. Search the "
+        "web for actual candidates — do not invent any. For each one you are "
+        "reasonably confident is real, list: Name, Website, a public contact "
+        "email ONLY if you actually found one (write exactly 'unknown' if you "
+        "did not — never guess or construct one from a pattern), and a "
+        "one-line reason it fits. One candidate per line, in the form: "
+        "Name — Website — Email — Reason. List every genuine candidate you "
+        "can find; do not pad the list to hit a number."
+    )
+    structure = (
+        "Take the candidate list from the previous stage and convert it to a "
+        "strict CSV. Reply with NOTHING except the CSV — no commentary, no "
+        "markdown fences. First line exactly: name,website,email,reason. "
+        "Then one row per candidate that has a real email address — DROP any "
+        "candidate whose email is 'unknown', blank, or that you are not "
+        "confident is real. Quote any field that contains a comma. If no "
+        "candidate has a confirmed email, reply with just the header row."
+    )
+    return research, structure
+
+
+def parse_structured_csv_text(text: str) -> list[dict]:
+    """Pull [{'name','email','website','reason'}, …] out of the structuring
+    stage's reply. It's told to answer with ONLY a
+    'name,website,email,reason' CSV, but a scrape can still carry a stray
+    fence or a leaked comment around it — keep only well-formed rows that
+    contain an actual email address, so prose that slipped through can't
+    masquerade as a recipient."""
+    if not text:
+        return []
+    t = re.sub(r"^```[a-z]*\n|\n```$", "", text.strip())
+    out = []
+    for row in csv.reader(io.StringIO(t)):
+        cells = [c.strip() for c in row]
+        email = next((c for c in cells if _EMAIL_RE.fullmatch(c)), None)
+        if not email:
+            continue
+        rest = [c for c in cells if c != email]
+        out.append({
+            "email": email.lower(),
+            "name": rest[0] if rest else "",
+            "website": rest[1] if len(rest) > 1 else "",
+            "reason": rest[2] if len(rest) > 2 else "",
+        })
+    seen, dedup = set(), []
+    for r in out:
+        if r["email"] not in seen:
+            seen.add(r["email"])
+            dedup.append(r)
+    return dedup
+
+
+def write_recipients_csv(rows: list[dict], path: str) -> None:
+    """Persist discovered recipients to a real CSV on disk — a durable record
+    the user can open, edit or hand to someone else, and (since it's a plain
+    recipients CSV) re-attach to a future /email run via parse_recipients()."""
+    with open(path, "w", newline="", encoding="utf-8") as f:
+        w = csv.writer(f)
+        w.writerow(["name", "website", "email", "reason"])
+        for r in rows:
+            w.writerow([r.get("name", ""), r.get("website", ""),
+                       r.get("email", ""), r.get("reason", "")])
 
 
 # ── the draft (what the AI produced) ──────────────────────────────────────────

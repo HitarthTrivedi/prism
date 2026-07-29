@@ -1,3 +1,12 @@
 .venv/
 __pycache__/
 .claude/
+
+# Client / working data — never belongs in a public repo.
+# Real drawings and BOQs carry client names, addresses and pricing, and a
+# DWG can be tens of MB. Keep them local; /boq reads them from any path.
+*.dwg
+*.dxf
+*.docx
+*.xlsx
+*.pdf

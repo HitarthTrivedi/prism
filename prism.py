@@ -222,7 +222,16 @@ HELP = """
   [teal]/remote stop[/teal] shut the local bridge down
   [teal]/email setup[/teal]  configure your sending account (SMTP, one time)
   [teal]/email <goal>[/teal]  draft an email from attached files & send it — recipients
-                from an attached CSV and/or addresses written in the prompt
+                from an attached CSV, addresses written in the prompt, or (if
+                none given) a research agent finds who matches, e.g. "find the
+                best-suited agencies in Vadodara and email them" — you always
+                see who was found and get a customizable preview before send
+  [teal]/boq <path> <context>[/teal]  Bill of Quantities from a .dwg/.dxf drawing —
+                lengths/areas/counts are MEASURED from the real geometry (no
+                AI ever touches the drawing), saved as an auditable CSV, then
+                an agent formats them into a professional BOQ document —
+                /attach a template alongside the drawing to match its exact
+                columns/structure instead of a generic layout
   [teal]/exit[/teal]        quit
 
 Anything else you type is treated as a task and routed to your agents.
@@ -567,56 +576,81 @@ def cmd_remote(cfg, arg: str):
         ui.info("\nLeft remote mode.")
 
 
-def _discover_recipients(cfg, goal: str) -> list:
-    """No address given ('email sarvam about…') — find the right public
-    contact email via the research/brains agent, then let the USER pick.
-    Never guesses silently: discovery runs only after a yes, and the chosen
-    address still goes through the normal preview-and-confirm before sending."""
-    import re as _re
+def _discover_recipients(cfg, goal: str, source_files: list | None = None,
+                         query: str = "") -> list:
+    """No address given — could be one named org ('email sarvam about…') or
+    a whole category ('find the best-suited agencies in Vadodara and email
+    them…'). Either way: a research agent searches the web for who actually
+    matches, a second pass structures the findings into a strict CSV (its
+    own agent, or the same one again — cycling back is fine), and the result
+    is written to a real CSV on disk and shown to the user before anything
+    downstream drafts or sends a single email.
+
+    Never guesses silently: discovery only runs after a yes, the found list
+    is shown and confirmed on its own, and the eventual send still goes
+    through the normal preview/edit/confirm in cmd_email."""
+    import time
     from core.onboarding import _ask_confirm
     agents = C.active_agents(cfg)
     finder = next((s for s in ("research", "brains") if agents.get(s)), None)
     if not finder:
         return []
+    structurer = next((s for s in ("brains", "content")
+                       if agents.get(s) and s != finder), finder)
     _flush_stdin_noise()
     if not _ask_confirm(
-            f"No address given — have {agents[finder]} search for the right "
-            "public contact email first?", default=True):
+            f"No recipients given — have {agents[finder]} search the web for "
+            f"who actually matches this, so Prism can draft AND send them an "
+            f"email — \"{goal}\"?", default=True):
         return []
     try:
-        from core import automation
+        from core import automation, mailer
     except Exception as e:
         ui.err(f"Automation deps not available ({e}).")
         return []
-    routing = {finder: {"needed": True, "questions": [
-        "Your ONLY task is: find the official, public contact email address for "
-        f"the recipient described here: {goal}. Search the web. Reply with the "
-        "1-3 best addresses, one per line, each followed by a dash and what it "
-        "is for (e.g. partnerships, support, general). Prefer official domains "
-        "over aggregator sites. If none can be found, reply exactly NONE."
-    ]}}
+
+    research_q, structure_q = mailer.discovery_prompts(goal)
+    custom_stages = [
+        ("research", agents[finder], [research_q]),
+        ("structure", agents[structurer], [structure_q]),
+    ]
     try:
-        responses, _links = automation.run(routing, cfg, chatgpt_analysis=False)
+        responses, links = automation.run(
+            {"structure": {"expect": "email"}}, cfg,
+            attachments=source_files or [], query=query or goal,
+            custom_stages=custom_stages)
     except KeyboardInterrupt:
         raise
     except Exception as e:
         ui.err(f"discovery failed: {e}")
         return []
-    text = "\n".join(t for ts in responses.values() for t in ts)
-    found = list(dict.fromkeys(_re.findall(
-        r"[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}", text)))
-    found = [e for e in found if not e.lower().endswith("example.com")][:5]
+
+    csv_text = "\n".join(responses.get("structure") or [])
+    found = mailer.parse_structured_csv_text(csv_text)
     if not found:
-        ui.warn("No email address found — give one explicitly instead.")
+        ui.warn("No candidate came back with a confirmed email — give "
+                "recipients explicitly instead (a CSV, or addresses typed "
+                "right into the prompt).")
+        if links.get("research"):
+            ui.info(f"Raw research is here if you want to check it yourself: "
+                    f"{links['research']}")
         return []
-    ui.say("  Addresses found:")
-    for i, e in enumerate(found, 1):
-        ui.say(f"   {i}. {_esc(e)}")
-    picked = _prompt("send to which? (number, Enter to cancel) ").strip()
-    if not picked.isdigit() or not (1 <= int(picked) <= len(found)):
-        ui.info("cancelled.")
+
+    os.makedirs(C.RUNS_DIR, exist_ok=True)
+    path = os.path.join(C.RUNS_DIR, f"discovered_{int(time.time())}.csv")
+    mailer.write_recipients_csv(found, path)
+    ui.say(f"  Found {len(found)} candidate(s) with a confirmed email → saved to {path}")
+    for i, r in enumerate(found, 1):
+        site = f"  · {_esc(r['website'])}" if r["website"] else ""
+        ui.say(f"   {i}. {_esc(r['name'] or '(no name)')} — {_esc(r['email'])}{site}")
+
+    _flush_stdin_noise()
+    if not _ask_confirm(f"Draft an email and prepare to send it to all "
+                        f"{len(found)}?", default=True):
+        ui.info(f"Not sending. The list is saved — /attach {path} and run "
+                "/email again whenever you're ready.")
         return []
-    return [{"email": found[int(picked) - 1], "name": ""}]
+    return found
 
 
 def cmd_email(cfg, arg: str, attachments: list):
@@ -679,9 +713,12 @@ def cmd_email(cfg, arg: str, attachments: list):
     recipients = [r for r in recipients
                   if not (r["email"] in seen or seen.add(r["email"]))]
     if not recipients:
-        # "email sarvam about a partnership" — no address anywhere: offer to
-        # discover the right public contact email before giving up.
-        recipients = _discover_recipients(cfg, arg)
+        # No address anywhere — could be one named org ("email sarvam about a
+        # partnership") or a whole category ("find the best-suited agencies
+        # in Vadodara and email them"). Either way, offer to go find who
+        # actually matches before giving up.
+        recipients = _discover_recipients(cfg, arg, source_files,
+                                          query=f"write an email: {arg}")
     if not recipients:
         ui.err("No recipients. /attach a CSV with addresses, write one in the "
                "prompt (/email tell them about X — a@x.com), or say yes to "
@@ -735,20 +772,36 @@ def cmd_email(cfg, arg: str, attachments: list):
         return
     subject, body = draft
 
-    # ── preview, confirm, send ──────────────────────────────────────────────
-    preview = body if len(body) <= 700 else body[:700] + "…"
-    ui.panel(
-        f"[bold]Subject:[/bold] {subject}\n\n{preview}\n\n"
-        f"[bold]To:[/bold] {len(recipients)} recipient(s) — "
-        f"{', '.join(r['email'] for r in recipients[:5])}"
-        f"{', …' if len(recipients) > 5 else ''}\n"
-        f"[bold]Attachments:[/bold] "
-        f"{', '.join(f['name'] for f in source_files) or 'none'}\n"
-        f"[bold]From:[/bold] {cfg['email']['address']}",
-        title="✉️  Ready to send", style="teal",
-    )
-    _flush_stdin_noise()
-    if not _ask_confirm(f"Send this to all {len(recipients)} recipients now?", default=False):
+    # ── preview, customize, confirm, send ───────────────────────────────────
+    # Never leaves this loop except via an explicit "Send now" or "Cancel" —
+    # "Edit" comes straight back here so the peek always reflects the latest
+    # version before anything actually goes out.
+    from core.onboarding import _ask_select
+    while True:
+        preview = body if len(body) <= 700 else body[:700] + "…"
+        ui.panel(
+            f"[bold]Subject:[/bold] {subject}\n\n{preview}\n\n"
+            f"[bold]To:[/bold] {len(recipients)} recipient(s) — "
+            f"{', '.join(r['email'] for r in recipients[:5])}"
+            f"{', …' if len(recipients) > 5 else ''}\n"
+            f"[bold]Attachments:[/bold] "
+            f"{', '.join(f['name'] for f in source_files) or 'none'}\n"
+            f"[bold]From:[/bold] {cfg['email']['address']}",
+            title="✉️  Ready to send", style="teal",
+        )
+        _flush_stdin_noise()
+        choice = _ask_select(
+            f"Send this to all {len(recipients)} recipients now?",
+            ["Cancel — don't send", "Edit subject/body", "Send now"],
+            default="Cancel — don't send")
+        if choice == "Send now":
+            break
+        if choice == "Edit subject/body":
+            new_subject = _ask_text("Subject:", default=subject)
+            new_body = _ask_text("Body:", default=body, multiline=True)
+            subject = new_subject.strip() or subject
+            body = new_body.strip() or body
+            continue
         ui.info("Not sent. The draft is saved in this run's file (/runs).")
         C.save_run({"query": f"/email {arg}", "routing": routing, "responses": responses,
                     "links": links, "email": {"subject": subject, "sent": [],
@@ -765,6 +818,239 @@ def cmd_email(cfg, arg: str, attachments: list):
                        "links": links, "email": {"subject": subject, "sent": sent,
                                                  "failed": failed, "recipients": len(recipients)}})
     ui.ok(f"Run saved → {path}")
+
+
+def _parse_boq_directives(text: str):
+    """Pull optional scope:/unit:/legend: directives out of a /boq context
+    string — pipe-separated from each other and from the plain description,
+    e.g. 'scope:cctv,cable,fiber,ep,ht | unit:meters | legend:EP=electric
+    pole; HP=high tension pole | site development for a client township'.
+    `measured-only` (a bare word, no colon) forbids derived/design-stage
+    items, so a trade the drawing doesn't contain is reported as missing
+    instead of estimated.
+    Returns (clean_context, scope_keywords, unit_override, legend, allow_derived)."""
+    scope: list[str] = []
+    unit_override = ""
+    legend = ""
+    allow_derived = True
+    rest: list[str] = []
+    for part in text.split("|"):
+        p = part.strip()
+        low = p.lower()
+        if low.startswith("scope:"):
+            scope = [k.strip() for k in p[len("scope:"):].split(",") if k.strip()]
+        elif low.startswith("unit:"):
+            unit_override = p[len("unit:"):].strip()
+        elif low.startswith("legend:"):
+            legend = p[len("legend:"):].strip()
+        elif low in ("measured-only", "measured only", "no-derive"):
+            allow_derived = False
+        elif p:
+            rest.append(p)
+    return " ".join(rest).strip(), scope, unit_override, legend, allow_derived
+
+
+def cmd_boq(cfg, arg: str, attachments: list):
+    """/boq <path to .dwg/.dxf> [project context] — real quantity takeoff.
+
+    Lengths/areas/counts are measured directly from the drawing's geometry
+    (core.boq — no AI ever sees the drawing itself), saved to an auditable
+    CSV, and only THEN handed to an agent to write up as a professional BOQ —
+    matching an attached template's exact structure/columns if one is given
+    (anything /attach-ed alongside the drawing that isn't itself .dwg/.dxf).
+
+    Optional pipe-separated directives in the context text:
+      scope:cctv,cable,fiber   only include layers/blocks matching these —
+                               a hard, deterministic filter (not a hope the
+                               agent ignores unrelated trades on its own)
+      unit:meters              you already know the real unit; skip the
+                               "unit not confirmed" caveat entirely
+      legend:EP=electric pole; HP=high tension pole
+                               translate cryptic layer/block codes into real
+                               descriptions instead of leaving them as TBC
+    """
+    from core import boq
+
+    arg = arg.strip()
+    tokens = arg.split(" ", 1) if arg else []
+    cad_attachments, templates, images, note_files = boq.classify_inputs(attachments)
+
+    if tokens and os.path.exists(tokens[0]):
+        path, context = tokens[0], (tokens[1] if len(tokens) > 1 else "")
+    elif cad_attachments:
+        path, context = cad_attachments[0]["path"], arg
+    else:
+        ui.warn("Usage: /boq <path to .dwg or .dxf> <context>\n"
+                "       or /attach the drawing (+ a sample BOQ, a screenshot "
+                "of the sheet, any notes), then just say what you want:\n"
+                "       /boq make the BOQ from the content I've provided\n"
+                "Optional overrides: scope:kw1,kw2 | unit:meters | legend:CODE=meaning")
+        return
+    context, scope_keywords, unit_override, legend, allow_derived = \
+        _parse_boq_directives(context)
+    support_files = templates + images + note_files
+    if support_files:
+        for label, group in (("sample BOQ", templates), ("image/screenshot", images),
+                             ("notes", note_files)):
+            if group:
+                ui.info(f"📎  {label}: {', '.join(g['name'] for g in group)}")
+
+    ui.info(f"📐  measuring real geometry from {os.path.basename(path)} — "
+            "no AI touches the drawing itself, only the numbers this produces.")
+    try:
+        dxf_path, notes = boq.ensure_dxf(path)
+        q = boq.measure(dxf_path)
+    except boq.BoqError as e:
+        ui.err(str(e))
+        return
+    for note in notes:
+        ui.warn(note)
+
+    if unit_override:
+        boq.apply_known_unit(q, unit_override)
+        ui.info(f"📏  using your stated unit: {unit_override}")
+    if scope_keywords:
+        q = boq.filter_by_keywords(q, scope_keywords)
+        ui.info(f"🔎  scope filter applied: {', '.join(scope_keywords)}")
+
+    summary = boq.summary_text(q)
+    ui.panel(summary, title="📐  Measured quantities (real, not AI-guessed)", style="teal")
+
+    import time
+    os.makedirs(C.RUNS_DIR, exist_ok=True)
+    csv_path = os.path.join(C.RUNS_DIR, f"boq_quantities_{int(time.time())}.csv")
+    boq.write_quantities_csv(q, csv_path)
+    ui.ok(f"Raw quantities saved → {csv_path} (cross-check the formatted BOQ against this)")
+
+    if not (q["lengths_by_layer"] or q["areas_by_layer"] or q["block_counts"]):
+        ui.warn("Nothing measurable came out of this drawing (no LINE/POLYLINE/HATCH/"
+                "INSERT geometry) — a formatted BOQ would have nothing real to show, "
+                "so stopping here. It may use 3D solids or an unsupported entity type.")
+        return
+
+    agents = C.active_agents(cfg)
+    writer = next((s for s in ("content", "brains") if agents.get(s)), None)
+    if not writer:
+        ui.err("No content/brains agent configured — run /agents first.")
+        return
+
+    # ── build the pipeline ──────────────────────────────────────────────
+    # Each stage exists because it can do something the others cannot, and
+    # each is given only files it can actually read. Handing ChatGPT the
+    # .dwg was the original failure — it can't parse a 13MB binary CAD file,
+    # so it returned nothing and the writer followed a brief that never
+    # existed. Splitting the work also keeps any one prompt from becoming
+    # the bulky catch-all that degrades the result.
+    from core import files as F
+    cad_file = F.attach(path)
+    user_request = context or "Produce a Bill of Quantities from the attached drawing."
+
+    researcher = agents.get("research") or agents.get("brains")
+    interpreter = "ChatGPT" if images else None
+
+    plan: list[tuple[str, str, str]] = [
+        ("measure", "Prism (local)",
+         f"DONE — {os.path.basename(path)} parsed with ezdxf; real lengths, "
+         "areas & block counts, no AI involved"),
+    ]
+    if allow_derived and researcher:
+        plan.append(("standards", researcher,
+                     "look up current design norms for this trade (spacing, "
+                     "cable limits, containment, codes) — no files needed"))
+    if interpreter:
+        plan.append(("interpret", interpreter,
+                     "read the screenshot + sample BOQ for the legend, scope "
+                     "and house style (never the .dwg — it can't parse one)"))
+    plan.append(("write", agents[writer],
+                 "open the .dwg itself, then write the BOQ from the measured "
+                 "data + the briefs above, in the sample's style"))
+    ui.pipeline_plan(plan, title="BOQ pipeline")
+
+    if not _ask_yes_no("Run this pipeline?", default=True):
+        ui.info("Not written — the raw quantities CSV above is still yours to use.")
+        return
+
+    try:
+        from core import automation
+    except Exception as e:
+        ui.err(f"Automation deps not available ({e}). Install requirements.txt.")
+        return
+
+    links: dict = {}
+    standards_text, brief_text = "", ""
+
+    def _run_stage(label, agent, prompt, files, query):
+        """One stage = one automation.run. Separate calls (not one chained
+        run) because each stage needs a DIFFERENT file set, and the briefs
+        are threaded explicitly below rather than relying on the relay —
+        which is what produced an empty and then a garbled handoff."""
+        r, l = automation.run({}, cfg, attachments=files, chatgpt_analysis=False,
+                              custom_stages=[(label, agent, [prompt])], query=query)
+        links.update(l)
+        got = [t for t in (r.get(label) or []) if t.strip()]
+        return got[0] if got else ""
+
+    if allow_derived and researcher:
+        standards_text = _run_stage(
+            "standards", researcher,
+            boq.standards_prompt(user_request, project_context=context),
+            [],   # deliberately no files: this stage is pure web research
+            "design standards for a BOQ trade")
+        if standards_text:
+            head = standards_text[:900] + ("…" if len(standards_text) > 900 else "")
+            ui.panel(head, title=f"📐  {researcher}'s design-standards brief", style="teal")
+        else:
+            ui.warn(f"{researcher} returned nothing — {agents[writer]} will fall "
+                    "back on its own knowledge of the norms.")
+
+    if interpreter:
+        brief_text = _run_stage(
+            "interpret", interpreter,
+            boq.interpretation_prompt(user_request, summary,
+                                      boq.roles_text([], templates, images, note_files),
+                                      legend_hint=legend),
+            images + templates + note_files,   # NOT the .dwg
+            "read a drawing screenshot for BOQ legend and scope")
+        if brief_text:
+            head = brief_text[:900] + ("…" if len(brief_text) > 900 else "")
+            ui.panel(head, title=f"🔍  {interpreter}'s legend & scope brief", style="orange")
+        else:
+            ui.warn(f"{interpreter} returned nothing — {agents[writer]} will work "
+                    "from the measured data alone.")
+
+    format_q = boq.formatting_prompt(summary, project_context=context,
+                                     has_template=bool(templates),
+                                     legend=legend, scoped=bool(scope_keywords),
+                                     brief_text=brief_text,
+                                     standards_text=standards_text,
+                                     allow_derived=allow_derived, has_cad=True)
+    # The writer DOES get the raw CAD file — Claude can open a .dwg and read
+    # its layers directly, which is exactly why it belongs here and not on
+    # ChatGPT's stage.
+    responses, l2 = automation.run(
+        {}, cfg, attachments=[cad_file] + templates + note_files,
+        chatgpt_analysis=False,
+        custom_stages=[("format", agents[writer], [format_q])],
+        query=f"Bill of Quantities from a CAD drawing{(' — ' + context) if context else ''}")
+    links.update(l2)
+
+    if links.get("interpret"):
+        ui.info(f"{interpreter} tab: {links['interpret']}")
+
+    texts = responses.get("format") or []
+    if not texts:
+        ui.err("No response came back — the raw quantities CSV is still saved above.")
+        if links.get("format"):
+            ui.info(f"Link: {links['format']}")
+        return
+
+    preview = texts[0] if len(texts[0]) <= 2000 else texts[0][:2000] + "…"
+    ui.panel(preview, title="📄  Draft BOQ", style="teal")
+    if links.get("format"):
+        ui.info(f"Full response: {links['format']}")
+    saved = C.save_run({"query": f"/boq {arg}", "responses": responses, "links": links,
+                       "boq": {"quantities_csv": csv_path, "source": path}})
+    ui.ok(f"Run saved → {saved}")
 
 
 def _handle_firstrun(cfg, choice):
@@ -832,6 +1118,8 @@ def repl(cfg):
             cmd_remote(cfg, line[len("/remote"):].strip())
         elif line.startswith("/email"):
             cmd_email(cfg, line[len("/email"):].strip(), attachments)
+        elif line.startswith("/boq"):
+            cmd_boq(cfg, line[len("/boq"):].strip(), attachments)
         elif line.startswith("/dry"):
             run_query(cfg, line[4:].strip(), dry=True, attachments=attachments)
         elif line.startswith("/"):
@@ -870,6 +1158,41 @@ def _flush_stdin_noise() -> None:
     """Discard (don't merge) any stray buffered input right before a Y/n-style
     prompt, so a leftover paste fragment can never silently answer it."""
     _drain_pending_lines()
+
+
+def _ask_yes_no(msg: str, default: bool = True) -> bool:
+    """A Y/n prompt that will NOT accept leftover buffered text as an answer.
+
+    The plain-input fallback in onboarding._ask_confirm treats anything not
+    starting with 'y' as "no" — so a stray line still sitting in the tty
+    (the tail of a hard-wrapped paste, say) silently answers the question
+    before the user's real keypress is ever read, and the run is cancelled
+    with no explanation. Confirmed cause of "/boq said Y but printed 'Not
+    formatted'": the confirm consumed the second line of a pasted command.
+
+    Here anything that isn't clearly yes/no is REJECTED and re-asked, and
+    the ignored text is shown, so a mis-read can never masquerade as a
+    deliberate 'no'."""
+    from core.onboarding import _ask_confirm as _q_confirm, _Q
+    if _Q:
+        return _q_confirm(msg, default=default)   # real widget: no buffer risk
+    for _ in range(3):
+        _drain_pending_lines()                    # drop stale buffered input
+        try:
+            raw = input(f"{msg} [{'Y/n' if default else 'y/N'}] ").strip()
+        except EOFError:
+            return default
+        low = raw.lower()
+        if not low:
+            return default
+        if low in ("y", "yes"):
+            return True
+        if low in ("n", "no"):
+            return False
+        ui.warn(f'ignoring unexpected input ("{_esc(raw[:60])}") — please answer y or n')
+    ui.warn("no clear answer after 3 tries — assuming "
+            f"{'yes' if default else 'no'}")
+    return default
 
 
 def _prompt(text: str) -> str:

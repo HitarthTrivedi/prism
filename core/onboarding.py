@@ -32,10 +32,26 @@ except Exception:
 SKIP = "— skip this category —"
 
 
-def _ask_text(msg: str, default: str = "", secret: bool = False) -> str:
+def _ask_text(msg: str, default: str = "", secret: bool = False,
+              multiline: bool = False) -> str:
     if _Q:
         fn = questionary.password if secret else questionary.text
-        return (fn(msg, style=_QSTYLE, default=default if not secret else "").ask() or "").strip()
+        kwargs = {"style": _QSTYLE, "default": default if not secret else ""}
+        if multiline and not secret:
+            kwargs["multiline"] = True   # Esc then Enter to submit
+        return (fn(msg, **kwargs).ask() or "").strip()
+    if multiline:
+        print(f"{msg} (blank line to finish)")
+        lines: list[str] = []
+        while True:
+            try:
+                line = input()
+            except EOFError:
+                break
+            if line == "" and lines:
+                break
+            lines.append(line)
+        return "\n".join(lines).strip() or default
     return input(f"{msg} ").strip() or default
 
 

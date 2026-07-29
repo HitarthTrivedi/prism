@@ -20,6 +20,12 @@ selenium>=4.0.0
 pypdf
 python-docx
 
+# ── /boq: real quantity takeoff from a CAD drawing (optional) ────
+# Reads DXF geometry directly — no AI ever measures the drawing, so
+# the numbers are real, not guessed. A .dwg file still needs local
+# conversion to .dxf first; see core/boq.py's module docstring.
+ezdxf
+
 # ── Voice input (SPACE-to-speak at the prism › prompt) — OPT-IN ─
 # Commented out so the main installer never breaks: pyaudio needs
 # PortAudio on the system first (macOS: `brew install portaudio`,
