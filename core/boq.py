@@ -730,7 +730,32 @@ def formatting_prompt(quantities_text: str, project_context: str = "",
         "any of that from the summary table alone.\n"
         "Do not skip this step and jump to formatting."
     ) if has_cad else ""
-    if allow_derived:
+    if not has_cad:
+        # Spec mode: no drawing exists at all. Everything is derived from the
+        # stated requirement, so the rules are about being explicit and
+        # honest per line rather than about separating measured from derived.
+        derive_rule = (
+            " THERE IS NO DRAWING for this job — the requirement above is your "
+            "only definition of scope, so EVERY quantity you give is derived, "
+            "not measured. Work as an experienced estimator quoting from a "
+            "specification: break the deliverable into its real sub-assemblies "
+            "and components, and for each line state the quantity, the unit, "
+            "and the basis for it (a standard size, a rule of thumb, a stated "
+            "assumption, or a count that follows directly from the spec). "
+            "Rules: (a) open with a prominent warning box stating this is a "
+            "PROVISIONAL, SPECIFICATION-BASED ESTIMATE — no drawing was "
+            "available, quantities are derived from standard design practice "
+            "for this size/duty and must be verified against approved "
+            "drawings before ordering or tendering; (b) put the governing "
+            "specification you worked to (capacity, size, rating, duty) in a "
+            "short table near the top, so a reader can see exactly what was "
+            "assumed; (c) where a quantity genuinely cannot be pinned down "
+            "without a drawing, say so on that line rather than inventing a "
+            "precise-looking figure; (d) separate bought-out items from "
+            "fabricated/made items — the bought-outs are far more certain and "
+            "the reader should be able to tell them apart at a glance."
+        )
+    elif allow_derived:
         derive_rule = (
             " IMPORTANT — how to handle a trade the drawing does not contain: "
             "a survey or civil drawing legitimately has NO camera, cable, "
@@ -770,12 +795,16 @@ def formatting_prompt(quantities_text: str, project_context: str = "",
         f"\n\nLAYER/BLOCK LEGEND (what these codes mean — use it to write real "
         f"descriptions instead of repeating the raw code):\n{legend}"
     ) if legend.strip() else ""
+    ground_truth = (
+        " The quantities listed at the end were measured directly from the "
+        "CAD drawing's geometry — treat them as ground truth and do not "
+        "recalculate or contradict them."
+    ) if has_cad else ""
+    step2 = "\n\nSTEP 2 — BUILD THE BOQ." if has_cad else "\n\n"
     instructions = (
         f"Your task is: produce a professional Bill of Quantities (BOQ) "
-        f"document.{context} The quantities listed at the end were measured "
-        "directly from the CAD drawing's geometry — treat them as ground "
-        f"truth and do not recalculate or contradict them.{cad_note}"
-        f"\n\nSTEP 2 — BUILD THE BOQ.{derive_rule}{scope_rule} {structure} "
+        f"document.{context}{ground_truth}{cad_note}"
+        f"{step2}{derive_rule}{scope_rule} {structure} "
         "Leave Rate/Amount columns blank for the quantity surveyor to fill "
         "in. Present it as clean tables. Note prominently at the top that "
         "rates are not included and quantities should be independently "
@@ -784,5 +813,5 @@ def formatting_prompt(quantities_text: str, project_context: str = "",
     # Plain concatenation, not str.format() on the whole thing — a layer or
     # block name from the drawing could itself contain '{'/'}' and must not
     # be misread as a format field.
-    return (instructions + standards_block + brief_block + legend_block
-            + "\n\nMEASURED QUANTITIES:\n" + quantities_text)
+    tail = ("\n\nMEASURED QUANTITIES:\n" + quantities_text) if quantities_text.strip() else ""
+    return instructions + standards_block + brief_block + legend_block + tail

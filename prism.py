@@ -875,19 +875,31 @@ def cmd_boq(cfg, arg: str, attachments: list):
     tokens = arg.split(" ", 1) if arg else []
     cad_attachments, templates, images, note_files = boq.classify_inputs(attachments)
 
-    if tokens and os.path.exists(tokens[0]):
+    # A drawing is OPTIONAL. With one, quantities are measured and the run is
+    # a takeoff. Without one — a spec-only enquiry, "quote the materials to
+    # build a 36x24 jaw crusher" — there is nothing to measure, so the same
+    # pipeline runs in SPEC MODE and every quantity is derived from the
+    # stated requirement plus the design-standards brief, clearly labelled.
+    path = ""
+    if tokens and os.path.exists(tokens[0]) and \
+            tokens[0].lower().endswith((".dwg", ".dxf")):
         path, context = tokens[0], (tokens[1] if len(tokens) > 1 else "")
     elif cad_attachments:
         path, context = cad_attachments[0]["path"], arg
     else:
-        ui.warn("Usage: /boq <path to .dwg or .dxf> <context>\n"
-                "       or /attach the drawing (+ a sample BOQ, a screenshot "
-                "of the sheet, any notes), then just say what you want:\n"
-                "       /boq make the BOQ from the content I've provided\n"
-                "Optional overrides: scope:kw1,kw2 | unit:meters | legend:CODE=meaning")
-        return
+        context = arg
     context, scope_keywords, unit_override, legend, allow_derived = \
         _parse_boq_directives(context)
+
+    if not path and not context:
+        ui.warn("Say what the BOQ is for, or give a drawing.\n"
+                "  with a drawing:  /boq <path to .dwg/.dxf> <context>\n"
+                "                   (or /attach it, then /boq <context>)\n"
+                "  without one:     /boq materials to build one 36x24 single-toggle "
+                "jaw crusher, 100 TPH\n"
+                "Optional: scope:kw1,kw2 | unit:meters | legend:CODE=meaning | measured-only")
+        return
+
     support_files = templates + images + note_files
     if support_files:
         for label, group in (("sample BOQ", templates), ("image/screenshot", images),
@@ -895,38 +907,50 @@ def cmd_boq(cfg, arg: str, attachments: list):
             if group:
                 ui.info(f"📎  {label}: {', '.join(g['name'] for g in group)}")
 
-    ui.info(f"📐  measuring real geometry from {os.path.basename(path)} — "
-            "no AI touches the drawing itself, only the numbers this produces.")
-    try:
-        dxf_path, notes = boq.ensure_dxf(path)
-        q = boq.measure(dxf_path)
-    except boq.BoqError as e:
-        ui.err(str(e))
-        return
-    for note in notes:
-        ui.warn(note)
+    q, summary, csv_path = None, "", ""
+    if path:
+        ui.info(f"📐  measuring real geometry from {os.path.basename(path)} — "
+                "no AI touches the drawing itself, only the numbers this produces.")
+        try:
+            dxf_path, notes = boq.ensure_dxf(path)
+            q = boq.measure(dxf_path)
+        except boq.BoqError as e:
+            ui.err(str(e))
+            return
+        for note in notes:
+            ui.warn(note)
 
-    if unit_override:
-        boq.apply_known_unit(q, unit_override)
-        ui.info(f"📏  using your stated unit: {unit_override}")
-    if scope_keywords:
-        q = boq.filter_by_keywords(q, scope_keywords)
-        ui.info(f"🔎  scope filter applied: {', '.join(scope_keywords)}")
+        if unit_override:
+            boq.apply_known_unit(q, unit_override)
+            ui.info(f"📏  using your stated unit: {unit_override}")
+        if scope_keywords:
+            q = boq.filter_by_keywords(q, scope_keywords)
+            ui.info(f"🔎  scope filter applied: {', '.join(scope_keywords)}")
 
-    summary = boq.summary_text(q)
-    ui.panel(summary, title="📐  Measured quantities (real, not AI-guessed)", style="teal")
+        summary = boq.summary_text(q)
+        ui.panel(summary, title="📐  Measured quantities (real, not AI-guessed)", style="teal")
 
-    import time
-    os.makedirs(C.RUNS_DIR, exist_ok=True)
-    csv_path = os.path.join(C.RUNS_DIR, f"boq_quantities_{int(time.time())}.csv")
-    boq.write_quantities_csv(q, csv_path)
-    ui.ok(f"Raw quantities saved → {csv_path} (cross-check the formatted BOQ against this)")
+        import time
+        os.makedirs(C.RUNS_DIR, exist_ok=True)
+        csv_path = os.path.join(C.RUNS_DIR, f"boq_quantities_{int(time.time())}.csv")
+        boq.write_quantities_csv(q, csv_path)
+        ui.ok(f"Raw quantities saved → {csv_path} (cross-check the formatted BOQ against this)")
 
-    if not (q["lengths_by_layer"] or q["areas_by_layer"] or q["block_counts"]):
-        ui.warn("Nothing measurable came out of this drawing (no LINE/POLYLINE/HATCH/"
-                "INSERT geometry) — a formatted BOQ would have nothing real to show, "
-                "so stopping here. It may use 3D solids or an unsupported entity type.")
-        return
+        if not (q["lengths_by_layer"] or q["areas_by_layer"] or q["block_counts"]):
+            ui.warn("Nothing measurable came out of this drawing (no LINE/POLYLINE/HATCH/"
+                    "INSERT geometry) — a formatted BOQ would have nothing real to show, "
+                    "so stopping here. It may use 3D solids or an unsupported entity type.")
+            return
+    else:
+        # Spec mode. Say plainly that nothing is measured, so the output is
+        # never mistaken for a takeoff.
+        ui.warn("No drawing given — running in SPEC MODE. Every quantity will be "
+                "DERIVED from your stated requirement and standard design practice, "
+                "not measured. The document will say so.")
+        if not allow_derived:
+            ui.warn("`measured-only` ignored: with no drawing there is nothing to "
+                    "measure, so derivation is the only way to produce anything.")
+            allow_derived = True
 
     agents = C.active_agents(cfg)
     writer = next((s for s in ("content", "brains") if agents.get(s)), None)
@@ -942,32 +966,35 @@ def cmd_boq(cfg, arg: str, attachments: list):
     # existed. Splitting the work also keeps any one prompt from becoming
     # the bulky catch-all that degrades the result.
     from core import files as F
-    cad_file = F.attach(path)
+    cad_file = F.attach(path) if path else None
     user_request = context or "Produce a Bill of Quantities from the attached drawing."
 
     researcher = agents.get("research") or agents.get("brains")
     interpreter = "ChatGPT" if images else None
 
-    plan: list[tuple[str, str, str]] = [
-        ("measure", "Prism (local)",
-         f"DONE — {os.path.basename(path)} parsed with ezdxf; real lengths, "
-         "areas & block counts, no AI involved"),
-    ]
+    plan: list[tuple[str, str, str]] = []
+    if path:
+        plan.append(("measure", "Prism (local)",
+                     f"DONE — {os.path.basename(path)} parsed with ezdxf; real "
+                     "lengths, areas & block counts, no AI involved"))
     if allow_derived and researcher:
         plan.append(("standards", researcher,
-                     "look up current design norms for this trade (spacing, "
-                     "cable limits, containment, codes) — no files needed"))
+                     "look up the design norms and standard specs this quote "
+                     "must follow — no files needed"))
     if interpreter:
         plan.append(("interpret", interpreter,
                      "read the screenshot + sample BOQ for the legend, scope "
                      "and house style (never the .dwg — it can't parse one)"))
     plan.append(("write", agents[writer],
-                 "open the .dwg itself, then write the BOQ from the measured "
-                 "data + the briefs above, in the sample's style"))
-    ui.pipeline_plan(plan, title="BOQ pipeline")
+                 ("open the .dwg itself, then write the BOQ from the measured "
+                  "data + the briefs above, in the sample's style") if path else
+                 ("derive every quantity from your stated requirement + the "
+                  "standards brief, in the sample's style — labelled as an estimate")))
+    ui.pipeline_plan(plan, title="BOQ pipeline" if path else "BOQ pipeline (spec mode — nothing measured)")
 
     if not _ask_yes_no("Run this pipeline?", default=True):
-        ui.info("Not written — the raw quantities CSV above is still yours to use.")
+        ui.info("Not written." + (" The raw quantities CSV above is still yours to use."
+                                  if csv_path else ""))
         return
 
     try:
@@ -1023,15 +1050,17 @@ def cmd_boq(cfg, arg: str, attachments: list):
                                      legend=legend, scoped=bool(scope_keywords),
                                      brief_text=brief_text,
                                      standards_text=standards_text,
-                                     allow_derived=allow_derived, has_cad=True)
-    # The writer DOES get the raw CAD file — Claude can open a .dwg and read
-    # its layers directly, which is exactly why it belongs here and not on
-    # ChatGPT's stage.
+                                     allow_derived=allow_derived,
+                                     has_cad=bool(path))
+    # The writer DOES get the raw CAD file when there is one — Claude can open
+    # a .dwg and read its layers directly, which is exactly why it belongs
+    # here and not on ChatGPT's stage.
+    write_files = ([cad_file] if cad_file else []) + templates + note_files
     responses, l2 = automation.run(
-        {}, cfg, attachments=[cad_file] + templates + note_files,
-        chatgpt_analysis=False,
+        {}, cfg, attachments=write_files, chatgpt_analysis=False,
         custom_stages=[("format", agents[writer], [format_q])],
-        query=f"Bill of Quantities from a CAD drawing{(' — ' + context) if context else ''}")
+        query=(f"Bill of Quantities from a CAD drawing{(' — ' + context) if context else ''}"
+               if path else f"Bill of Quantities from a stated requirement — {context}"))
     links.update(l2)
 
     if links.get("interpret"):
