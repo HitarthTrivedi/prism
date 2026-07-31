@@ -39,14 +39,21 @@ CATEGORIES = {
         "emoji": "📚",
         "color": "research",
         "desc": "Peer-reviewed data, citations & symbolic mathematics",
-        "agents": ["Consensus", "WolframAlpha", "Semantic Scholar", "NotebookLM", "LAZYCOOK"],
+        # Perplexity leads here: live web search with sources is the research
+        # job most tasks actually need, and /boq's design-standards stage
+        # picks whatever is set for this category.
+        "agents": ["Perplexity", "Consensus", "WolframAlpha", "Semantic Scholar",
+                   "NotebookLM", "LAZYCOOK"],
     },
     "content": {
         "label": "Content, Post & Docs",
         "emoji": "✍️",
         "color": "content",
         "desc": "Marketing copy, SEO, long-form & no-hallucination scripts",
-        "agents": ["Jasper", "Copy.ai", "Kimi 2.6", "Writesonic", "Claude", "LAZYCOOK"],
+        # Perplexity earns a place for the "no-hallucination" half of this
+        # category — source-cited factual copy — not for creative marketing.
+        "agents": ["Jasper", "Copy.ai", "Kimi 2.6", "Writesonic", "Claude",
+                   "Perplexity", "LAZYCOOK"],
     },
     "visual": {
         "label": "Visual & Image",
@@ -120,7 +127,7 @@ AGENT_REGISTRY = {
     "Perplexity": _agent(
         "https://www.perplexity.ai",
         "real-time factual grounding, source verification, citations, current events",
-        "Freemium", "5–15s", 70,
+        "Freemium", "5–15s", 120,
         textarea_selector="div[contenteditable='true']#ask-input, textarea",
         response_selector=".prose, .break-words",
         submit_selector="button[aria-label='Submit']",
@@ -128,7 +135,7 @@ AGENT_REGISTRY = {
     "ChatGPT": _agent(
         "https://chatgpt.com",
         "general intelligence, multimodal reasoning, brainstorming & DALL·E 3 visuals",
-        "Freemium", "5–20s", 80,
+        "Freemium", "5–20s", 120,
         textarea_selector="#prompt-textarea",
         response_selector="[data-message-author-role='assistant']",
         submit_selector="button[data-testid='send-button']",
@@ -136,7 +143,7 @@ AGENT_REGISTRY = {
     "Claude": _agent(
         "https://claude.ai",
         "advanced coding, complex documentation, UI artifacts & long-form reasoning",
-        "Freemium", "10–30s", 150,
+        "Freemium", "10–30s", 300,
         textarea_selector="div[contenteditable='true']",
         response_selector=".font-claude-message, .prose, [data-is-streaming='false']",
         submit_selector="button[aria-label='Send Message']",
@@ -191,7 +198,7 @@ AGENT_REGISTRY = {
     "Kimi 2.6": _agent(
         "https://kimi.moonshot.cn",
         "massive context window for analysing 100+ page documents; multilingual",
-        "Free/Low", "15–40s", 90,
+        "Free/Low", "15–40s", 500,
         textarea_selector="div[contenteditable='true'], textarea",
         response_selector=".chat-message, .markdown",
     ),

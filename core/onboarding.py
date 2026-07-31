@@ -111,7 +111,8 @@ def collect_agents(defaults: dict | None = None) -> dict:
     defaults = defaults or {}
     ui.rule("Step 3 · Choose your specialists", "orange")
     ui.info("Pick ONE tool per category (or skip categories you won't use).")
-    ui.info("Tools like Claude / ChatGPT / LAZYCOOK / Kimi appear in several — that's intentional.\n")
+    ui.info("Tools like Claude / ChatGPT / Perplexity / LAZYCOOK / Kimi appear "
+            "in several — that's intentional.\n")
     ui.catalog_table()
 
     chosen: dict[str, str] = {}
