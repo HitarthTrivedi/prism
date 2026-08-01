@@ -606,6 +606,63 @@ def _run_notebooklm(driver, agent_cfg: dict, stage: str, prompt: str) -> list[st
                 f"still be usable manually from here."]
 
 
+def _run_local(kind: str, prior_text: str, attachments, cfg: dict, stage: str):
+    """Execute an agent that lives in Prism rather than in a browser.
+
+    Returns (output_path, message). On failure the path is empty and the
+    message explains what went wrong — a local stage must degrade the same
+    way a scraped one does, never take the run down with it.
+    """
+    if kind != "reel":
+        return "", f"Unknown local agent {kind!r}."
+    try:
+        from . import reel
+    except Exception as e:
+        return "", f"The reel renderer isn't available ({e})."
+    try:
+        reel.ffmpeg_path()
+    except Exception as e:
+        return "", str(e)
+
+    try:
+        spec = reel.parse_spec(prior_text)
+    except Exception as e:
+        # The writing stage produced prose instead of a scene spec. Say so
+        # plainly — the fix is a routing one, not something to paper over.
+        return "", (f"{e} The stage before this one has to return the JSON "
+                    "scene spec for the renderer to draw.")
+
+    # Brand colour comes from the client's own artwork when they attached
+    # any — measured, not described.
+    imgs = [a["path"] for a in (attachments or [])
+            if a.get("path", "").lower().endswith(
+                (".png", ".jpg", ".jpeg", ".webp", ".bmp"))]
+    if imgs and not spec.get("brand"):
+        brand = reel.sample_brand(imgs)
+        if brand:
+            spec["brand"] = brand
+
+    import json as _json
+    import time as _time
+    from . import config as C
+    os.makedirs(C.RUNS_DIR, exist_ok=True)
+    stamp = int(_time.time())
+    out = os.path.join(C.RUNS_DIR, f"reel_{stamp}.mp4")
+    _json.dump(spec, open(os.path.join(C.RUNS_DIR, f"reel_{stamp}.json"), "w"),
+               indent=2)
+    secs = sum(float(sc.get("seconds", 4)) for sc in spec["scenes"])
+    ui.info(f"   🎬  drawing {len(spec['scenes'])} scenes, {secs:.0f}s, 1080x1920 "
+            "— locally, no browser")
+    if spec.get("_dropped"):
+        ui.warn(f"   skipped {len(spec['_dropped'])} scene(s) this renderer "
+                f"can't draw: {', '.join(spec['_dropped'][:4])}")
+    try:
+        reel.render(spec, out)
+    except Exception as e:
+        return "", f"Render failed: {e}"
+    return out, f"reel rendered — {os.path.basename(out)}"
+
+
 def run(routing: dict, cfg: dict, attachments=None, on_event=None,
         query: str = "", chatgpt_analysis: bool = True,
         custom_stages: list[tuple[str, str, list[str]]] | None = None):
@@ -662,6 +719,32 @@ def run(routing: dict, cfg: dict, attachments=None, on_event=None,
         stages.insert(0, ("analysis", "ChatGPT", [q]))
         ui.info("📎  attachments present — ChatGPT will analyse the files first")
 
+    # A local renderer draws whatever the stage before it hands over, so that
+    # stage has to hand over a scene spec rather than prose. Rather than
+    # making the router understand renderers, the requirement is appended to
+    # the last writing stage here — the only place that knows both which
+    # agent got picked for video AND what runs before it.
+    local_reel_at = next((i for i, (_, an, _) in enumerate(stages)
+                          if (A.resolve_agent("", an) or {}).get("local") == "reel"),
+                         None)
+    if local_reel_at is not None:
+        feeder = next((i for i in range(local_reel_at - 1, -1, -1)
+                       if not (A.resolve_agent("", stages[i][1]) or {}).get("local")),
+                      None)
+        if feeder is None:
+            ui.warn("Prism Reel has no writing stage before it — turn on content "
+                    "or brains so something can write the script.")
+        else:
+            try:
+                from . import reel as _reel
+                st, an, qs = stages[feeder]
+                stages[feeder] = (st, an, qs[:-1] + [
+                    qs[-1] + "\n\n" + _reel.spec_instructions()])
+                ui.info(f"🎬  {stages[local_reel_at][1]} renders locally — "
+                        f"{an} will write the scene spec for it")
+            except Exception:
+                pass
+
     driver, fresh = _get_driver(cfg)
     all_responses: dict[str, list[str]] = {}
     all_links: dict[str, str] = {}
@@ -679,6 +762,25 @@ def run(routing: dict, cfg: dict, attachments=None, on_event=None,
 
         emit("stage_start", {"stage": stage, "agent": agent_name})
         ui.rule(f"{stage.upper()}  ·  {agent_name}", style=A.CATEGORIES.get(stage, {}).get("color", "pink"))
+
+        # A LOCAL agent runs inside Prism — no tab, no upload, no scrape. It
+        # consumes the previous stage's text and produces a real file here.
+        if agent_cfg.get("local"):
+            prior_text = "\n\n".join(
+                t for ts in all_responses.values() for t in ts if t.strip())
+            out, note = _run_local(agent_cfg["local"], prior_text, attachments,
+                                   cfg, stage)
+            if out:
+                all_responses[stage] = [note]
+                all_links[stage] = out
+                ui.ok(note)
+                ui.info(f"   📁  {out}")
+                emit("stage_done", {"stage": stage, "count": 1, "texts": [note],
+                                    "url": out, "timed_out": False})
+            else:
+                ui.err(note)
+                emit("stage_error", {"stage": stage, "error": note, "url": ""})
+            continue
 
         timed_out = False
         try:

@@ -68,8 +68,8 @@ CATEGORIES = {
         "emoji": "🎬",
         "color": "media",
         "desc": "Generated footage, reels from your own clips & AI avatars",
-        "agents": ["Google Flow", "Claude Design", "InVideo AI", "Runway",
-                   "Pika Labs", "HeyGen"],
+        "agents": ["Prism Reel", "Google Flow", "Claude Design", "InVideo AI",
+                   "Runway", "Pika Labs", "HeyGen"],
     },
     # Split out from video on purpose: a voice-over and a reel are different
     # jobs with different tools, and a run often needs BOTH — one stage each,
@@ -264,6 +264,17 @@ AGENT_REGISTRY = {
         "https://elevenlabs.io/app/speech-synthesis",
         "industry-leading emotive voice cloning and text-to-speech",
         "Freemium", "5–15s", 45,
+    ),
+    # Runs INSIDE Prism — no browser, no account, no upload. Marked local so
+    # automation.py renders it here instead of driving a Chrome tab.
+    "Prism Reel": _agent(
+        "local://reel",
+        "renders the finished vertical reel on this machine — always 9:16, "
+        "text always legible, brand colours measured from the client's own "
+        "artwork, no watermark, no credit limit, and the same script renders "
+        "identically every time",
+        "Included", "15–30s", 60,
+        local="reel",
     ),
     "Google Flow": _agent(
         "https://labs.google/fx/tools/flow",
