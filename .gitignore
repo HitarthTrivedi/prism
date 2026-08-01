@@ -10,3 +10,7 @@ __pycache__/
 *.docx
 *.xlsx
 *.pdf
+
+# Rendered output — regenerable from the scene spec, and large.
+demo/reel_out/
+*.mp4

@@ -31,6 +31,7 @@ _THEME = {
     "content": "#FF8A4B",
     "visual": "#4CD9B4",
     "media": "#B47BFF",
+    "audio": "#7BE0FF",
     "development": "#FFD24B",
     "presentation": "#8C9EFF",
     "ok": "bold #4CD9B4",

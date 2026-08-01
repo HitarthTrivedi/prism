@@ -168,7 +168,12 @@ _STAGE_HELP = {
     "content": "ONLY when the deliverable is a SUBSTANTIAL written piece (full article, essay, long-form "
                "copy, script, documentation). Short text, answers and briefs belong to brains, not here.",
     "visual": "generating images, art, character designs, logos, illustrations.",
-    "media": "generating video, animation, avatars, voiceover, music or audio.",
+    "media": "generating VIDEO only — footage, animation, reels, AI avatars. "
+             "Voice-over and music are a SEPARATE stage (audio), so a reel that "
+             "needs narration should turn BOTH on, not one.",
+    "audio": "generating AUDIO only — voice-over, narration, dubbing, music or an "
+             "audio explainer. Turn this on alongside media when a video needs a "
+             "voice, or alone when the deliverable is sound.",
     "development": "building/deploying a web app, website, UI, or software tool from a spec.",
     "presentation": "building an actual slide deck / PowerPoint / pitch presentation or narrative site.",
     "summary": "synthesising ALL earlier stage outputs into one clean final answer.",
@@ -189,7 +194,7 @@ def _stage_lines(agents: dict, premium: list | None = None) -> str:
                 continue
         spec = A.specialty_for(stage, name)
         star = "  ⭐ PREMIUM (the user pays for this tool)" if name in premium else ""
-        lines.append(f"- {stage.upper()} → {name}: {spec}{star}\n    USE FOR: {_STAGE_HELP[stage]}")
+        lines.append(f"- {stage.upper()} → {name}: {spec}{star}\n    USE FOR: {_STAGE_HELP.get(stage, "")}")
     return "\n".join(lines)
 
 

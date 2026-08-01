@@ -19,7 +19,8 @@ PIPELINE_ORDER = [
     "brains",         # strategy, reasoning, architecture
     "content",        # copy, docs, scripts
     "visual",         # images
-    "media",          # video / audio
+    "media",          # video
+    "audio",          # voice-over, music, narration
     "development",    # build & deploy apps, UIs, tools
     "presentation",   # slide decks & pitch presentations
     "summary",        # final synthesis (uses the 'brains' agent)
@@ -63,12 +64,22 @@ CATEGORIES = {
         "agents": ["Leonardo.ai", "Adobe Firefly", "Midjourney", "ChatGPT"],
     },
     "media": {
-        "label": "Video & Audio",
+        "label": "Video & Reels",
         "emoji": "🎬",
         "color": "media",
-        "desc": "Cinematic video, AI avatars, voice cloning & music",
-        "agents": ["Runway", "InVideo AI", "Pika Labs", "HeyGen", "ElevenLabs", "Suno",
-                   "Claude Design", "NotebookLM"],
+        "desc": "Generated footage, reels from your own clips & AI avatars",
+        "agents": ["Google Flow", "Claude Design", "InVideo AI", "Runway",
+                   "Pika Labs", "HeyGen"],
+    },
+    # Split out from video on purpose: a voice-over and a reel are different
+    # jobs with different tools, and a run often needs BOTH — one stage each,
+    # rather than forcing a single pick between ElevenLabs and Runway.
+    "audio": {
+        "label": "Voice & Audio",
+        "emoji": "🔊",
+        "color": "audio",
+        "desc": "Voice-over, narration, music & audio explainers",
+        "agents": ["ElevenLabs", "Suno", "NotebookLM"],
     },
     "development": {
         "label": "Web, App & Tools",
@@ -253,6 +264,14 @@ AGENT_REGISTRY = {
         "https://elevenlabs.io/app/speech-synthesis",
         "industry-leading emotive voice cloning and text-to-speech",
         "Freemium", "5–15s", 45,
+    ),
+    "Google Flow": _agent(
+        "https://labs.google/fx/tools/flow",
+        "Veo-powered video on a free daily credit allowance — the cheapest way "
+        "to make short reels. CANNOT render readable on-screen text, so any "
+        "caption, price or phone number must be added afterwards, never asked "
+        "for in the prompt",
+        "Free tier", "1–3 min", 300,
     ),
     "Suno": _agent(
         "https://suno.com/create",
