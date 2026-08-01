@@ -1,0 +1,16 @@
+employee_id,name,department,date,shift,in_time,out_time,status
+EMP-101,Rakesh Patel,SMT Line,2026-07-01,A,08:55,17:35,Present
+EMP-101,Rakesh Patel,SMT Line,2026-07-02,A,08:58,19:40,Present
+EMP-101,Rakesh Patel,SMT Line,2026-07-03,A,,,Absent
+EMP-102,Nilesh Shah,SMT Line,2026-07-01,A,09:05,17:30,Late
+EMP-102,Nilesh Shah,SMT Line,2026-07-02,A,08:50,17:30,Present
+EMP-102,Nilesh Shah,SMT Line,2026-07-03,A,08:45,20:10,Present
+EMP-103,Mehul Joshi,Assembly,2026-07-01,B,20:55,05:30,Present
+EMP-103,Mehul Joshi,Assembly,2026-07-02,B,21:10,05:30,Late
+EMP-103,Mehul Joshi,Assembly,2026-07-03,B,20:50,05:30,Present
+EMP-104,Kiran Desai,Quality,2026-07-01,A,08:45,17:30,Present
+EMP-104,Kiran Desai,Quality,2026-07-02,A,,,Leave
+EMP-104,Kiran Desai,Quality,2026-07-03,A,08:48,17:30,Present
+EMP-105,Sunil Rana,Stores,2026-07-01,A,09:20,17:30,Late
+EMP-105,Sunil Rana,Stores,2026-07-02,A,08:55,18:45,Present
+EMP-105,Sunil Rana,Stores,2026-07-03,A,08:52,17:30,Present

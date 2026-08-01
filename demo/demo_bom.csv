@@ -1,0 +1,15 @@
+part_number,description,qty_per_board,reference_designators,package
+LM358N,Dual op-amp,2,"U1,U2",DIP-8
+STM32F103C8T6,MCU ARM Cortex-M3 64K,1,U3,LQFP-48
+10K-0603,Resistor 10K 1% ,14,"R1-R14",0603
+100N-0603,Capacitor 100nF X7R 50V,22,"C1-C22",0603
+CAP-10UF-0805,Capacitor 10uF 16V,6,"C23-C28",0805
+LED-RED-0805,LED Red 20mA,4,"D1-D4",0805
+1N4007,Rectifier diode 1A 1000V,2,"D5,D6",DO-41
+CONN-RJ45-8P,RJ45 jack shielded,1,J1,THT
+XTAL-8MHZ,Crystal 8MHz 20pF,1,Y1,HC-49
+REG-7805,Linear regulator 5V 1A,1,U4,TO-220
+BUZZ-5V,Buzzer 5V magnetic,1,BZ1,THT
+RELAY-5V-SPDT,Relay SPDT 5V 10A,2,"K1,K2",THT
+FUSE-2A,Fuse 2A slow blow,1,F1,THT
+HDR-2X5-254,Header 2x5 2.54mm,1,J2,THT

@@ -1,0 +1,11 @@
+po_number,po_date,supplier,item_code,description,qty_ordered,qty_received,rate,expected_date,status
+PO-2026-041,2026-06-12,Sanghvi Electronics,STM32F103C8T6,MCU ARM Cortex M3,500,120,182.00,2026-07-10,Part received
+PO-2026-042,2026-06-18,Nirmal Components,CONN-RJ45-8P,RJ45 shielded jack,600,60,54.50,2026-07-05,Part received
+PO-2026-045,2026-06-28,Sanghvi Electronics,RELAY-5V-SPDT,Relay SPDT 5V 10A,1000,140,38.00,2026-07-20,Part received
+PO-2026-047,2026-07-02,Shakti Traders,CAP-10UF-0805,Capacitor 10uF 16V,4000,900,1.10,2026-07-18,Part received
+PO-2026-050,2026-07-08,Vikas Enterprise,XTAL-8MHZ,Crystal 8MHz 20pF,800,410,12.40,2026-07-25,Part received
+PO-2026-052,2026-07-11,Nirmal Components,BUZZ-5V,Buzzer 5V magnetic,600,0,19.00,2026-07-30,Pending
+PO-2026-054,2026-07-15,Shakti Traders,HDR-2X5-254,Header 2x5 2.54mm,700,0,7.80,2026-08-05,Pending
+PO-2026-055,2026-07-16,Sanghvi Electronics,LM358N,Dual op-amp DIP-8,2000,2000,9.60,2026-07-24,Closed
+PO-2026-058,2026-07-22,Vikas Enterprise,10K-0603,Resistor 10K 1%,50000,50000,0.18,2026-07-26,Closed
+PO-2026-060,2026-07-25,Patel Metals,HEATSINK-TO220,Heatsink TO-220 clip,500,450,6.20,2026-08-02,Part received

@@ -1,0 +1,10 @@
+bill_number,bill_date,party,type,amount,gst,total,due_date,payment_status,paid_date
+BILL-2026-0451,2026-07-05,Anand Automation,Receivable,412000,74160,486160,2026-08-04,Unpaid,
+BILL-2026-0455,2026-07-09,Kalpataru Systems,Receivable,268000,48240,316240,2026-08-08,Unpaid,
+BILL-2026-0462,2026-07-14,Anand Automation,Receivable,549000,98820,647820,2026-08-13,Unpaid,
+BILL-2026-0468,2026-07-18,Shreeji Instruments,Receivable,196000,35280,231280,2026-08-17,Paid,2026-07-30
+PUR-2026-0210,2026-06-12,Sanghvi Electronics,Payable,91000,16380,107380,2026-07-12,Overdue,
+PUR-2026-0214,2026-06-18,Nirmal Components,Payable,32700,5886,38586,2026-07-18,Overdue,
+PUR-2026-0221,2026-07-02,Shakti Traders,Payable,4400,792,5192,2026-08-01,Unpaid,
+PUR-2026-0225,2026-07-11,Vikas Enterprise,Payable,9920,1786,11706,2026-08-10,Unpaid,
+PUR-2026-0230,2026-07-16,Sanghvi Electronics,Payable,19200,3456,22656,2026-08-15,Paid,2026-07-28

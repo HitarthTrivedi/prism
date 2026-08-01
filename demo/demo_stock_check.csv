@@ -1,0 +1,19 @@
+part_number,description,qty_per_board,qty_in_stock,unit,supplier,rate_inr
+LM358N,Dual op-amp DIP-8,2,1400,nos,Sanghvi Electronics,9.60
+STM32F103C8T6,MCU ARM Cortex-M3 64K LQFP-48,1,120,nos,Sanghvi Electronics,182.00
+10K-0603,Resistor 10K 1% 0603,14,50000,nos,Vikas Enterprise,0.18
+100N-0603,Capacitor 100nF X7R 50V 0603,22,15000,nos,Vikas Enterprise,0.22
+CAP-10UF-0805,Capacitor 10uF 16V 0805,6,900,nos,Shakti Traders,1.10
+LED-RED-0805,LED Red 20mA 0805,4,3200,nos,Shakti Traders,0.95
+1N4007,Rectifier diode 1A 1000V DO-41,2,6000,nos,Nirmal Components,0.85
+CONN-RJ45-8P,RJ45 jack shielded THT,1,60,nos,Nirmal Components,54.50
+XTAL-8MHZ,Crystal 8MHz 20pF HC-49,1,410,nos,Vikas Enterprise,12.40
+REG-7805,Linear regulator 5V 1A TO-220,1,850,nos,Sanghvi Electronics,14.20
+BUZZ-5V,Buzzer 5V magnetic THT,1,0,nos,Nirmal Components,19.00
+RELAY-5V-SPDT,Relay SPDT 5V 10A THT,2,140,nos,Sanghvi Electronics,38.00
+FUSE-2A,Fuse 2A slow blow,1,2200,nos,Shakti Traders,3.40
+HDR-2X5-254,Header 2x5 2.54mm THT,1,0,nos,Shakti Traders,7.80
+CAP-470UF-25V,Electrolytic capacitor 470uF 25V,2,1100,nos,Shakti Traders,4.60
+SW-TACT-6MM,Tact switch 6mm THT,3,5400,nos,Nirmal Components,2.10
+HEATSINK-TO220,Heatsink TO-220 with clip,1,450,nos,Patel Metals,6.20
+STANDOFF-M3-10,Brass standoff M3 x 10mm,4,1800,nos,Patel Metals,3.90

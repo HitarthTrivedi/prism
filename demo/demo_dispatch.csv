@@ -1,0 +1,8 @@
+dispatch_id,dispatch_date,customer,order_ref,item,qty,transporter,lr_number,delivery_status,invoice_number
+DSP-2026-088,2026-07-05,Anand Automation,SO-3312,Control board Rev-C,150,VRL Logistics,VRL-88214,Delivered,INV-2026-0451
+DSP-2026-089,2026-07-09,Kalpataru Systems,SO-3318,Sensor interface board,80,Gati,GT-55190,Delivered,INV-2026-0455
+DSP-2026-091,2026-07-14,Anand Automation,SO-3325,Control board Rev-C,200,VRL Logistics,VRL-88460,In transit,INV-2026-0462
+DSP-2026-093,2026-07-18,Shreeji Instruments,SO-3330,Power supply module,60,TCI Express,TCI-11207,Delivered,INV-2026-0468
+DSP-2026-095,2026-07-23,Kalpataru Systems,SO-3341,Sensor interface board,120,Gati,GT-55840,In transit,INV-2026-0475
+DSP-2026-096,2026-07-26,Meridian Controls,SO-3346,Relay driver card,45,VRL Logistics,VRL-89012,Pending pickup,
+DSP-2026-098,2026-07-29,Anand Automation,SO-3350,Control board Rev-D,175,VRL Logistics,VRL-89233,Pending pickup,
