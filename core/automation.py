@@ -381,7 +381,12 @@ def _harvest_images(driver, agent_cfg, stage: str) -> list[dict]:
         with open(path, "wb") as f:
             f.write(raw)
         out.append({"path": path, "name": os.path.basename(path), "size": len(raw),
-                    "mime": mime, "kind": "image", "text": None, "truncated": False})
+                    "mime": mime, "kind": "image", "text": None,
+                    "truncated": False,
+                    # Marked so a later stage can tell a picture a model drew
+                    # from a file the client actually owns — they are not
+                    # interchangeable when one of them is a logo.
+                    "_generated": True})
         if len(out) >= 4:
             break
     return out
@@ -674,6 +679,11 @@ def _reask(driver, agent_cfg: dict, prompt: str, expect: str = "") -> list[str]:
         return []
 
 
+def _web_token() -> str:
+    from . import reel_web
+    return reel_web.ASSET_TOKEN
+
+
 def _run_studio(prior_text, attachments, cfg: dict):
     """Film the page the art-direction stage wrote.
 
@@ -717,9 +727,11 @@ def _run_studio(prior_text, attachments, cfg: dict):
     if attachments:
         try:
             from . import assets as _assets
+            made = {a["path"] for a in attachments if a.get("_generated")}
             spec["_assets"] = {
                 k: {kk: vv for kk, vv in v.items() if kk != "ink"}
-                for k, v in _assets.collect(attachments).items()}
+                for k, v in _assets.collect(attachments,
+                                            generated=made).items()}
         except Exception as e:
             ui.warn(f"   couldn't prepare the artwork ({e})")
 
@@ -886,6 +898,7 @@ def run(routing: dict, cfg: dict, attachments=None, on_event=None,
                       if (A.resolve_agent("", an) or {}).get("local") == "reel_web"),
                      None)
     design_feeder = None
+    script_stage = ""
     if studio_at is not None:
         writer = next((i for i in range(studio_at - 1, -1, -1)
                        if not (A.resolve_agent("", stages[i][1]) or {}).get("local")),
@@ -923,14 +936,31 @@ def run(routing: dict, cfg: dict, attachments=None, on_event=None,
                     except Exception as e:
                         ui.warn(f"couldn't prepare the artwork ({e}) — the "
                                 "reel will be type and colour only")
+            # Most jobs arrive with NOTHING attached — a company name and a
+            # sentence. So the reel's pictures are made here: the tool that
+            # can search the web and draw looks the company up and produces a
+            # few images, which are harvested off the page like any other
+            # generated asset. Skipped only if the user turned it off.
+            maker = agents.get("visual") or "ChatGPT"
+            if cfg.get("reel_imagery", True) and A.resolve_agent("visual", maker):
+                stages.insert(studio_at, ("artwork", maker, [
+                    _web.imagery_instructions(query, bool(asset_list))]))
+                studio_at += 1
+                ui.info(f"🖼️   {maker} will search the web and make up to "
+                        f"{_web.MAX_GENERATED} images for it")
+
             # The art director is the same tool as the writer unless a
             # stronger one is switched on: this pass is the harder of the two.
             director = agents.get("brains") or agents.get("content") or an
+            # The asset list cannot be known yet — the imagery stage has not
+            # run. A token stands in and is substituted the moment before this
+            # prompt is typed.
             stages.insert(studio_at, ("design", director,
-                                      [_web.design_instructions(brand, query,
-                                                                asset_list)]))
+                                      [_web.design_instructions(
+                                          brand, query, _web.ASSET_TOKEN)]))
             studio_at += 1
             design_feeder = studio_at - 1
+            script_stage = stages[writer][0]
             ui.info(f"🎬  {stages[studio_at][1]} films the page — {an} writes "
                     f"the script, {director} art-directs it")
 
@@ -1131,6 +1161,34 @@ def run(routing: dict, cfg: dict, attachments=None, on_event=None,
                 nb_prompt = _bmp_safe((context + "\n\n".join(questions) + handoff))
                 stage_responses = _run_notebooklm(driver, agent_cfg, stage, nb_prompt)
             else:
+                if stage_idx == design_feeder:
+                    # Two things this prompt could not know when the plan was
+                    # made. The assets, because the imagery stage had not run
+                    # yet — and the SCRIPT, because the relay only forwards
+                    # the stage immediately before, which is now the image
+                    # maker's chatter rather than the words of the reel.
+                    made = {f["path"] for f in pipeline_files}
+                    table = {}
+                    try:
+                        from . import assets as _assets
+                        table = _assets.collect(
+                            (attachments or []) + pipeline_files,
+                            generated=made)
+                    except Exception as e:
+                        ui.warn(f"   couldn't prepare the artwork ({e})")
+                    listing = (_assets.manifest(table) if table else "")
+                    if table:
+                        ui.info(f"   🖼️   {len(table)} asset(s) for the design: "
+                                + ", ".join(table))
+                    script = "\n\n".join(
+                        t for t in (all_responses.get(script_stage) or [])
+                        if t.strip())
+                    head = (f"THE SCRIPT — final, use these words, this order "
+                            f"and these timings:\n\n{script}\n\n"
+                            if script else "")
+                    questions = [head + q.replace(_web_token(), listing)
+                                 for q in questions]
+
                 for idx, prompt in enumerate(questions, 1):
                     try:
                         ui.info(f"   → prompt {idx}/{len(questions)}: {prompt[:80]}…")
@@ -1330,8 +1388,14 @@ def run(routing: dict, cfg: dict, attachments=None, on_event=None,
 
             # Image-making stages: pull the generated images off the page so
             # later stages can actually use them (text handoffs can't).
-            if stage in ("visual", "media") and stage_idx + 1 < len(stages):
+            if stage in ("visual", "media", "artwork") and stage_idx + 1 < len(stages):
                 made = _harvest_images(driver, agent_cfg, stage)
+                if stage == "artwork":
+                    # A reel wants a few strong images, not a contact sheet —
+                    # and every extra one is another asset the art director
+                    # has to find a place for.
+                    from . import reel_web as _rw
+                    made = made[:_rw.MAX_GENERATED]
                 if made:
                     pipeline_files = (pipeline_files + made)[-6:]
                     ui.info(f"   🖼️   harvested {len(made)} generated image(s) "

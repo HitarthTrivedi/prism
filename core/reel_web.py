@@ -478,6 +478,64 @@ def script_instructions() -> str:
     )
 
 
+# The design prompt is built before the imagery stage has run, so the asset
+# list cannot be known yet. This stands in its place and is substituted the
+# moment before the prompt is typed.
+ASSET_TOKEN = "{{ASSETS}}"
+
+MAX_GENERATED = 3
+
+
+def imagery_instructions(request: str, has_own_artwork: bool = False,
+                         research: str = "") -> str:
+    """The stage that MAKES the pictures when the client supplied none.
+
+    Most jobs arrive with nothing attached — a company name and a sentence.
+    Research has already found out who they are by this point, so the tool
+    that can both search and draw is asked for a small, specific set of
+    images rather than a mood board.
+    """
+    return (
+        "You are producing the ARTWORK for a short vertical brand reel. Do "
+        f"this in two steps.\n\n"
+        "STEP 1 — SEARCH. Look the company up on the web before drawing "
+        "anything: what they actually sell, what their existing branding "
+        "looks like, their colours, the physical things their work involves. "
+        "Do not guess from the name.\n\n"
+        f"STEP 2 — GENERATE AT MOST {MAX_GENERATED} IMAGES. Not four, not a "
+        "sheet of variations — at most three separate images, each one thing:\n"
+        + ("  · NO logo. The client's real mark was supplied and is already "
+           "in hand; anything you draw would be a lookalike and would be "
+           "thrown away.\n"
+           if has_own_artwork else
+           "  · one wordmark or emblem for the company, in the spirit of what "
+           "your search found — their colours, their industry. Plain "
+           "lettering on its own is better than a clumsy icon.\n")
+        + "  · one or two images of the SUBJECT of their business — the "
+        "actual equipment, produce, or material. A seed company wants seed "
+        "and crop; an IT firm wants racks, cabling, cameras; a workshop "
+        "wants its machines.\n\n"
+        "EVERY IMAGE MUST:\n"
+        "  · be on a PLAIN, FLAT background — a single solid colour, no "
+        "gradient, no scene, no shadow spilling onto it. Say 'on a plain "
+        "white background' in the image prompt. The background is cut off "
+        "automatically afterwards, and that only works if it is flat.\n"
+        "  · contain NO text, no captions, no watermark, no letters other "
+        "than a wordmark if you were asked for one. Words are drawn by the "
+        "renderer in real type; generated lettering comes out misspelt.\n"
+        "  · contain no people and no faces.\n"
+        "  · be square or portrait, and one subject per image, centred, with "
+        "room around it.\n\n"
+        f"WHAT THE REEL IS ABOUT:\n{request}\n\n"
+        + (f"WHAT RESEARCH ALREADY FOUND:\n{research[:1500]}\n\n"
+           if research.strip() else "")
+        + "When the images are done, reply with one short line per image "
+        "saying what it is — nothing else. The images themselves are "
+        "collected from this page automatically; do not describe how they "
+        "should be used."
+    )
+
+
 def design_instructions(brand: dict | None = None, request: str = "",
                         assets: str = "") -> str:
     """The art-direction pass. This is the one that makes two clients' reels

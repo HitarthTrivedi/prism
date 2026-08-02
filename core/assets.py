@@ -149,7 +149,8 @@ def _ink_ratio(path: str) -> float:
     return on / max(1, w * h)
 
 
-def collect(images: list, out_dir: str | None = None) -> dict:
+def collect(images: list, out_dir: str | None = None,
+            generated: set | None = None) -> dict:
     """Build the asset table the design stage is allowed to reference.
 
     Names are derived from the files in a fixed order, so the same inputs
@@ -174,8 +175,17 @@ def collect(images: list, out_dir: str | None = None) -> dict:
     if not paths:
         return {}
 
+    # Order is meaning here, so dedupe without sorting: the imagery stage is
+    # asked for the mark FIRST and the subject art after it, and the page is
+    # harvested top to bottom. Sorting by filename threw that away.
+    seen, ordered = set(), []
+    for p in paths:
+        if p not in seen:
+            seen.add(p)
+            ordered.append(p)
+
     prepared = []
-    for p in sorted(set(paths)):
+    for p in ordered:
         cut = cutout(p, out_dir)
         use = cut or p
         try:
@@ -186,17 +196,30 @@ def collect(images: list, out_dir: str | None = None) -> dict:
             continue
         prepared.append({"path": use, "w": w, "h": h, "alpha": bool(cut),
                          "ink": _ink_ratio(use) if cut else 1.0,
-                         "source": p})
+                         "source": p, "made": p in (generated or ())})
 
     if not prepared:
         return {}
 
-    # The sparsest cut-out is the logo: a mark on a card leaves mostly
-    # transparency behind, a photograph leaves none.
     table, rest = {}, list(prepared)
-    marks = [a for a in rest if a["alpha"] and a["ink"] < 0.55]
-    if marks:
-        logo = min(marks, key=lambda a: a["ink"])
+
+    # A mark the CLIENT supplied always wins the logo slot — theirs is the
+    # real one. Among their files it is the sparsest cut-out: a mark leaves
+    # mostly transparency behind, a photograph leaves none.
+    own_marks = [a for a in rest if not a["made"] and a["alpha"] and a["ink"] < 0.55]
+    logo = min(own_marks, key=lambda a: a["ink"]) if own_marks else None
+
+    # Failing that, the FIRST generated image is the mark — not the sparsest.
+    # Density does not identify a logo among generated art: a line drawing of
+    # a sprout is sparser than a wordmark, and picking by sparsity put the
+    # sprout in the logo slot. The imagery stage is told to produce the mark
+    # first, and the page is harvested in order, so order is the answer.
+    if logo is None:
+        made = [a for a in rest if a["made"]]
+        if made:
+            logo = made[0]
+
+    if logo is not None:
         rest.remove(logo)
         table["logo"] = {**logo, "kind": "logo"}
     for i, a in enumerate(rest, 1):
@@ -211,8 +234,12 @@ def manifest(table: dict) -> str:
         return ""
     lines = []
     for name, a in table.items():
-        what = ("the client's own mark, background removed" if a["kind"] == "logo"
-                else "supplied artwork")
+        if a.get("made"):
+            what = ("a mark generated for this reel" if a["kind"] == "logo"
+                    else "imagery generated for this reel")
+        else:
+            what = ("the client's own mark, taken from their artwork"
+                    if a["kind"] == "logo" else "artwork the client supplied")
         cut = "transparent PNG" if a["alpha"] else "opaque, has its own background"
         lines.append(f'  asset:{name} — {a["w"]}x{a["h"]}, {cut} — {what}')
     return "\n".join(lines)
