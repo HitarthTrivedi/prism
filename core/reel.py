@@ -365,10 +365,177 @@ def _icon_fiber(d, x, y, s, col, w):
     d.line([x + s * .68, y + s * .5, x + s * .92, y + s * .5], fill=col, width=w)
 
 
+# ── beyond IT ───────────────────────────────────────────────────────────────
+# The eight above are computer-room equipment, and for a while they were all
+# there was — so a seed company's reel showed a database, a server rack and a
+# support headset, and a writing stage had to invent a "conceptual mapping"
+# (storage = seed bank, support = farmer) to use them at all. These cover the
+# businesses that are not IT.
+
+def _qbez(p0, p1, p2, n=18):
+    """Points along a quadratic Bézier. Pillow draws arcs and polygons but has
+    no curve primitive, and organic shapes — a leaf, a petal — are curves."""
+    return [(p0[0] * (1 - t) ** 2 + 2 * p1[0] * (1 - t) * t + p2[0] * t * t,
+             p0[1] * (1 - t) ** 2 + 2 * p1[1] * (1 - t) * t + p2[1] * t * t)
+            for t in (i / n for i in range(n + 1))]
+
+
+def _leaf_at(d, base, tip, bulge, col, w, midrib=True):
+    """One leaf blade: two curves meeting at base and tip."""
+    bx, by = base
+    tx, ty = tip
+    mx, my = (bx + tx) / 2, (by + ty) / 2
+    nx, ny = -(ty - by), (tx - bx)          # normal to the midrib
+    length = math.hypot(nx, ny) or 1
+    nx, ny = nx / length * bulge, ny / length * bulge
+    d.line(_qbez(base, (mx + nx, my + ny), tip), fill=col, width=w, joint="curve")
+    d.line(_qbez(base, (mx - nx, my - ny), tip), fill=col, width=w, joint="curve")
+    if midrib:
+        d.line([base, tip], fill=col, width=max(1, w - 1))
+
+
+def _icon_leaf(d, x, y, s, col, w):
+    _leaf_at(d, (x + s * .16, y + s * .88), (x + s * .86, y + s * .14),
+             s * .26, col, w)
+
+
+def _icon_sprout(d, x, y, s, col, w):
+    d.line([(x + s * .5, y + s * .94), (x + s * .5, y + s * .44)],
+           fill=col, width=w)
+    _leaf_at(d, (x + s * .5, y + s * .58), (x + s * .96, y + s * .22),
+             s * .15, col, max(1, w - 1), midrib=False)
+    _leaf_at(d, (x + s * .5, y + s * .7), (x + s * .06, y + s * .36),
+             s * .15, col, max(1, w - 1), midrib=False)
+    d.line([(x + s * .3, y + s * .94), (x + s * .7, y + s * .94)],
+           fill=col, width=w)
+
+
+def _icon_grain(d, x, y, s, col, w):
+    """An ear of wheat: a stalk with grains angled up off it."""
+    d.line([(x + s * .5, y + s * .96), (x + s * .5, y + s * .2)],
+           fill=col, width=w)
+    for i in range(4):
+        gy = y + s * (0.26 + i * 0.16)
+        _leaf_at(d, (x + s * .5, gy + s * .1), (x + s * .84, gy - s * .06),
+                 s * .05, col, max(1, w - 1), midrib=False)
+        _leaf_at(d, (x + s * .5, gy + s * .1), (x + s * .16, gy - s * .06),
+                 s * .05, col, max(1, w - 1), midrib=False)
+
+
+def _icon_drop(d, x, y, s, col, w):
+    d.polygon([(x + s * .5, y + s * .1), (x + s * .8, y + s * .52),
+               (x + s * .5, y + s * .9), (x + s * .2, y + s * .52)],
+              outline=col, width=w)
+    d.arc([x + s * .2, y + s * .38, x + s * .8, y + s * .9], 0, 180, fill=col, width=w)
+
+
+def _icon_lab(d, x, y, s, col, w):
+    d.line([x + s * .36, y + s * .12, x + s * .36, y + s * .44], fill=col, width=w)
+    d.line([x + s * .64, y + s * .12, x + s * .64, y + s * .44], fill=col, width=w)
+    d.line([x + s * .28, y + s * .12, x + s * .72, y + s * .12], fill=col, width=w)
+    d.polygon([(x + s * .36, y + s * .44), (x + s * .14, y + s * .88),
+               (x + s * .86, y + s * .88), (x + s * .64, y + s * .44)],
+              outline=col, width=w)
+    d.line([x + s * .26, y + s * .68, x + s * .74, y + s * .68], fill=col, width=w)
+
+
+def _icon_factory(d, x, y, s, col, w):
+    d.polygon([(x + s * .1, y + s * .88), (x + s * .1, y + s * .46),
+               (x + s * .4, y + s * .62), (x + s * .4, y + s * .46),
+               (x + s * .7, y + s * .62), (x + s * .7, y + s * .2),
+               (x + s * .9, y + s * .2), (x + s * .9, y + s * .88)],
+              outline=col, width=w)
+    d.line([x + s * .28, y + s * .74, x + s * .28, y + s * .82], fill=col, width=w)
+    d.line([x + s * .55, y + s * .74, x + s * .55, y + s * .82], fill=col, width=w)
+
+
+def _icon_truck(d, x, y, s, col, w):
+    d.rounded_rectangle([x + s * .06, y + s * .3, x + s * .58, y + s * .68],
+                        radius=s * .04, outline=col, width=w)
+    d.polygon([(x + s * .58, y + s * .42), (x + s * .78, y + s * .42),
+               (x + s * .94, y + s * .56), (x + s * .94, y + s * .68),
+               (x + s * .58, y + s * .68)], outline=col, width=w)
+    d.ellipse([x + s * .16, y + s * .66, x + s * .34, y + s * .84], outline=col, width=w)
+    d.ellipse([x + s * .66, y + s * .66, x + s * .84, y + s * .84], outline=col, width=w)
+
+
+def _icon_shop(d, x, y, s, col, w):
+    d.polygon([(x + s * .08, y + s * .34), (x + s * .2, y + s * .14),
+               (x + s * .8, y + s * .14), (x + s * .92, y + s * .34)],
+              outline=col, width=w)
+    d.rounded_rectangle([x + s * .14, y + s * .34, x + s * .86, y + s * .88],
+                        radius=s * .04, outline=col, width=w)
+    d.rounded_rectangle([x + s * .38, y + s * .56, x + s * .62, y + s * .88],
+                        radius=s * .03, outline=col, width=w)
+
+
+def _icon_package(d, x, y, s, col, w):
+    d.polygon([(x + s * .5, y + s * .1), (x + s * .9, y + s * .32),
+               (x + s * .9, y + s * .74), (x + s * .5, y + s * .94),
+               (x + s * .1, y + s * .74), (x + s * .1, y + s * .32)],
+              outline=col, width=w)
+    d.line([x + s * .1, y + s * .32, x + s * .5, y + s * .52], fill=col, width=w)
+    d.line([x + s * .9, y + s * .32, x + s * .5, y + s * .52], fill=col, width=w)
+    d.line([x + s * .5, y + s * .52, x + s * .5, y + s * .94], fill=col, width=w)
+
+
+def _icon_growth(d, x, y, s, col, w):
+    d.line([x + s * .1, y + s * .88, x + s * .9, y + s * .88], fill=col, width=w)
+    for i, h in enumerate((0.3, 0.46, 0.64)):
+        bx = x + s * (0.18 + i * 0.26)
+        d.rounded_rectangle([bx, y + s * (0.88 - h), bx + s * .16, y + s * .88],
+                            radius=s * .03, outline=col, width=w)
+    d.line([x + s * .2, y + s * .42, x + s * .86, y + s * .14], fill=col, width=w)
+    d.line([x + s * .86, y + s * .14, x + s * .64, y + s * .16], fill=col, width=w)
+    d.line([x + s * .86, y + s * .14, x + s * .84, y + s * .36], fill=col, width=w)
+
+
+def _icon_award(d, x, y, s, col, w):
+    d.ellipse([x + s * .26, y + s * .1, x + s * .74, y + s * .58], outline=col, width=w)
+    d.line([x + s * .36, y + s * .54, x + s * .28, y + s * .92], fill=col, width=w)
+    d.line([x + s * .28, y + s * .92, x + s * .5, y + s * .78], fill=col, width=w)
+    d.line([x + s * .64, y + s * .54, x + s * .72, y + s * .92], fill=col, width=w)
+    d.line([x + s * .72, y + s * .92, x + s * .5, y + s * .78], fill=col, width=w)
+
+
+def _icon_pin(d, x, y, s, col, w):
+    d.arc([x + s * .2, y + s * .1, x + s * .8, y + s * .7], 180, 360, fill=col, width=w)
+    d.line([x + s * .2, y + s * .4, x + s * .5, y + s * .92], fill=col, width=w)
+    d.line([x + s * .8, y + s * .4, x + s * .5, y + s * .92], fill=col, width=w)
+    d.ellipse([x + s * .4, y + s * .3, x + s * .6, y + s * .5], outline=col, width=w)
+
+
+def _icon_clock(d, x, y, s, col, w):
+    d.ellipse([x + s * .1, y + s * .1, x + s * .9, y + s * .9], outline=col, width=w)
+    d.line([x + s * .5, y + s * .3, x + s * .5, y + s * .52], fill=col, width=w)
+    d.line([x + s * .5, y + s * .52, x + s * .68, y + s * .62], fill=col, width=w)
+
+
+def _icon_tools(d, x, y, s, col, w):
+    """A cog. A spanner was tried first and read as a key at 72px — at icon
+    size the silhouette has to be unmistakable, not accurate."""
+    cx, cy, r = x + s * .5, y + s * .5, s * .3
+    for i in range(8):
+        a = math.radians(i * 45)
+        d.line([(cx + math.cos(a) * r * .95, cy + math.sin(a) * r * .95),
+                (cx + math.cos(a) * r * 1.45, cy + math.sin(a) * r * 1.45)],
+               fill=col, width=int(w * 1.9))
+    d.ellipse([cx - r, cy - r, cx + r, cy + r], outline=col, width=w)
+    d.ellipse([cx - r * .38, cy - r * .38, cx + r * .38, cy + r * .38],
+              outline=col, width=w)
+
+
 ICONS = {
+    # computing / infrastructure
     "server": _icon_server, "storage": _icon_storage, "network": _icon_network,
     "security": _icon_security, "support": _icon_support, "cctv": _icon_cctv,
     "desktop": _icon_desktop, "fiber": _icon_fiber,
+    # anything else
+    "leaf": _icon_leaf, "sprout": _icon_sprout, "grain": _icon_grain,
+    "drop": _icon_drop, "lab": _icon_lab, "factory": _icon_factory,
+    "truck": _icon_truck, "shop": _icon_shop, "package": _icon_package,
+    "growth": _icon_growth, "award": _icon_award, "pin": _icon_pin,
+    "clock": _icon_clock, "tools": _icon_tools,
 }
 
 
@@ -390,32 +557,38 @@ def lower_third(draw, brand, y, heading, caption, frame, start):
     hf = _fit(draw, heading, "bold", T_HEADLINE, x1 - x0 - 130, 52)
     cf = _font("regular", T_SUPPORT)
     pad = 36
+    tx = x0 + 26 + 8 + 28
+    # Every offset below is MEASURED, never a constant. The heading is fitted,
+    # so its height varies by scene — a hard-coded 74px gap was right for the
+    # 58px heading this box used to have and overlapped the caption the moment
+    # the heading grew.
+    head_h = int(hf.size * 1.18)
+    cap_w = x1 - tx - pad
+    line_h = int(cf.size * 1.28)
     cap_h = 0
     if caption:
-        tmp = caption.split()
-        lines, cur = [], ""
-        for wd in tmp:
+        words, lines, cur = caption.split(), [], ""
+        for wd in words:
             t = (cur + " " + wd).strip()
-            if draw.textlength(t, font=cf) <= (x1 - x0 - pad * 2 - 30):
+            if draw.textlength(t, font=cf) <= cap_w:
                 cur = t
             else:
                 lines.append(cur); cur = wd
         if cur:
             lines.append(cur)
-        cap_h = len(lines) * 44
-    box_h = pad * 2 + 70 + (cap_h + 12 if caption else 0)
+        cap_h = len(lines) * line_h
+    box_h = pad * 2 + head_h + (cap_h + 14 if caption else 0)
     top = y + dy
     bg = blend((255, 255, 255), brand.bg, a)
     draw.rounded_rectangle([x0, top, x1, top + box_h], radius=18, fill=bg)
     bar = blend(brand.accent, bg, a)
     draw.rounded_rectangle([x0 + 26, top + pad, x0 + 34, top + box_h - pad],
                            radius=4, fill=bar)
-    tx = x0 + 26 + 8 + 28
     draw.text((tx, top + pad - 4), heading, font=hf,
               fill=blend(brand.ink, bg, a))
     if caption:
-        text(draw, (tx, top + pad + 74), caption, cf,
-             blend(brand.grey, bg, a), max_width=x1 - tx - pad, line_gap=8)
+        text(draw, (tx, top + pad + head_h + 14), caption, cf,
+             blend(brand.grey, bg, a), max_width=cap_w, line_gap=line_h - cf.size)
 
 
 # ── scenes ──────────────────────────────────────────────────────────────────
@@ -982,9 +1155,14 @@ def spec_instructions() -> str:
         "· Only these keys exist. Anything else you invent is discarded "
         "silently, so put the words where they are read.\n"
         "· icons (pillar, hub, brand only) must come from this list — "
-        + ", ".join(sorted(ICONS)) + ". They are equipment icons; if none of "
-        "them honestly fits your business, use 'statement', 'figure', 'trend' "
-        "or 'list' instead of forcing an unrelated picture.\n"
+        + ", ".join(sorted(ICONS)) + ". Pick by the client's ACTUAL trade: a "
+        "seed company uses lab, factory, truck, sprout, grain, drop; a shop "
+        "uses shop, package, truck, award; an IT firm uses server, network, "
+        "cctv, fiber. Never borrow an icon for what it vaguely suggests — a "
+        "'storage' cylinder does not mean a seed bank and a 'support' headset "
+        "does not mean a farmer; both just look like the wrong industry. If "
+        "nothing on the list honestly fits, use 'statement', 'figure', 'trend' "
+        "or 'list', which need no icon at all.\n"
         "· Never write a scene containing people; this renderer draws "
         "typography, data and equipment only.\n\n"
         "BEFORE YOU REPLY, CHECK YOUR OWN JSON:\n"
