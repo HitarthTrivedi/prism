@@ -593,18 +593,22 @@ def research_addendum() -> str:
     '#1B3A5C' can, and a model looking at the page can read one off it.
     """
     return (
-        "\n\nALSO REPORT THE BRAND'S COLOURS. While you are on the company's "
-        "own website, note the two colours it is actually built from — the "
-        "header, the buttons, the headings — and give them as hex codes. End "
-        "your answer with exactly these two lines, on their own, nothing "
-        "after them:\n"
+        "\n\nONE EXTRA THING, SEPARATE FROM THE TASK ABOVE — THE BRAND'S "
+        "COLOURS.\n"
+        "Open the company's OWN official website (not a directory listing, "
+        "not a news article, not a social profile) and look at it. Note the "
+        "two colours the site is actually built from: the one the eye goes to "
+        "— buttons, links, the logo, the highlights — and the darker tone "
+        "behind headers or headings.\n"
+        "Whatever else your answer contains, end it with exactly these two "
+        "lines, on their own, with nothing after them:\n"
         "BRAND_ACCENT: #RRGGBB\n"
         "BRAND_DEEP: #RRGGBB\n"
-        "The accent is the colour the eye goes to (buttons, links, the logo); "
-        "the deep one is the darker tone used for headers or type. Read them "
-        "off the site — do not describe a colour in words and do not invent "
-        "one. If you genuinely cannot see the site, write NONE after both "
-        "labels rather than guessing."
+        "Hex codes only. 'A deep corporate blue' is unusable — it has to be "
+        "the six characters. Read them off the site rather than recalling or "
+        "estimating them. If you cannot reach the official site, write NONE "
+        "after both labels; a guessed colour is worse than none, because it "
+        "will be used as if it were theirs."
     )
 
 
@@ -615,9 +619,15 @@ def read_brand(texts) -> dict:
                                  else [texts]) if t)
     out = {}
     for key, field in (("accent", "BRAND_ACCENT"), ("deep", "BRAND_DEEP")):
-        m = re.search(field + r"\s*:\s*#?([0-9A-Fa-f]{6})\b", blob)
-        if m:
-            out[key] = "#" + m.group(1).upper()
+        # Six digits, or the three-digit shorthand a model sometimes writes.
+        m = re.search(field + r"\s*:?\s*\**\s*#?([0-9A-Fa-f]{6}|[0-9A-Fa-f]{3})\b",
+                      blob)
+        if not m:
+            continue
+        hexed = m.group(1)
+        if len(hexed) == 3:
+            hexed = "".join(c * 2 for c in hexed)
+        out[key] = "#" + hexed.upper()
     # A pair that is really one colour twice is worse than one colour: it
     # tells the design there is a dark tone to work with when there isn't.
     if out.get("accent") and out.get("accent") == out.get("deep"):

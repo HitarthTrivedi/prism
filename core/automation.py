@@ -423,9 +423,18 @@ def _harvest_images(driver, agent_cfg, stage: str) -> list[dict]:
     import base64
     from selenium.webdriver.common.by import By
 
+    # Inside the reply first — that is where a generated image usually sits and
+    # the ordering there is the order it was asked for. But ChatGPT's image UI
+    # opens a canvas pane BESIDE the conversation, putting the pictures outside
+    # the message element entirely, so fall back to the whole page rather than
+    # reporting that a stage produced nothing while three images are on screen.
     sel = agent_cfg.get("response_selector", "")
+    imgs = []
     try:
-        imgs = driver.find_elements(By.CSS_SELECTOR, f"{sel} img" if sel else "img")
+        if sel:
+            imgs = driver.find_elements(By.CSS_SELECTOR, f"{sel} img")
+        if not imgs:
+            imgs = driver.find_elements(By.CSS_SELECTOR, "img")
     except Exception:
         return []
 
@@ -594,15 +603,16 @@ def _wait_for_images(driver, agent_cfg, want: int, cap: int = 240) -> int:
     produced nothing.
     """
     sel = agent_cfg.get("response_selector", "")
+    # The WHOLE page, not just the reply element. ChatGPT's image UI opens a
+    # canvas pane beside the conversation, so the pictures live outside
+    # [data-message-author-role='assistant'] — the harvester was looking in
+    # the one place they are not, and reported that none had appeared while
+    # three sat on screen.
     js = """
-        const sel = arguments[0];
-        const scope = sel ? document.querySelectorAll(sel) : [document.body];
         let n = 0;
-        for (const el of scope) {
-          for (const img of el.querySelectorAll('img')) {
-            if ((img.naturalWidth || 0) >= 256 && (img.naturalHeight || 0) >= 256)
-              n++;
-          }
+        for (const img of document.querySelectorAll('img')) {
+          if ((img.naturalWidth || 0) >= 256 && (img.naturalHeight || 0) >= 256)
+            n++;
         }
         return n;
     """
@@ -1047,6 +1057,7 @@ def run(routing: dict, cfg: dict, attachments=None, on_event=None,
     script_stage = ""
     research_stage = ""
     studio_brand: dict = {}
+    design_assets: dict = {}
     # Stages whose reply is READ BY A PROGRAM, not handed to another chat.
     # The pipeline's normal rules demand a prose "HANDOFF FOR <next agent>"
     # section as the last thing in the answer, which flatly contradicts "reply
@@ -1097,12 +1108,15 @@ def run(routing: dict, cfg: dict, attachments=None, on_event=None,
             # while it is there costs nothing, where having Prism open the
             # site again to sample it would cost a whole extra page load.
             if not brand:
-                for i, (st, an, qs) in enumerate(stages):
+                # `ragent`, not `an`: reusing the writer's name here rebound it
+                # and the plan banner then credited the script to whichever
+                # tool happened to do the research.
+                for i, (st, ragent, qs) in enumerate(stages):
                     if st == "research" and i < studio_at:
-                        stages[i] = (st, an,
+                        stages[i] = (st, ragent,
                                      qs[:-1] + [qs[-1] + _web.research_addendum()])
                         research_stage = st
-                        ui.info(f"🎨  {an} will read the brand colours off "
+                        ui.info(f"🎨  {ragent} will read the brand colours off "
                                 "their website")
                         break
 
@@ -1380,6 +1394,7 @@ def run(routing: dict, cfg: dict, attachments=None, on_event=None,
                             generated=made)
                     except Exception as e:
                         ui.warn(f"   couldn't prepare the artwork ({e})")
+                    design_assets = table
                     listing = (_assets.manifest(table) if table else "")
                     if table:
                         ui.info(f"   🖼️   {len(table)} asset(s) for the design: "
@@ -1512,6 +1527,12 @@ def run(routing: dict, cfg: dict, attachments=None, on_event=None,
                     for attempt in range(2):
                         try:
                             cand = _web.parse_spec(texts[-1])
+                            # The design is judged against the SAME artwork it
+                            # was offered. Without this the checker sees a spec
+                            # with no assets at all, calls every correct
+                            # reference a hole, and talks the art director out
+                            # of the one picture it had.
+                            cand["_assets"] = design_assets
                         except Exception as e:
                             faults = [str(e)]
                             cand = None
