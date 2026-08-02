@@ -554,8 +554,75 @@ def script_instructions() -> str:
 # list cannot be known yet. This stands in its place and is substituted the
 # moment before the prompt is typed.
 ASSET_TOKEN = "{{ASSETS}}"
+# Same reason: when no logo is attached the palette comes from the research
+# stage, which has not run when the design prompt is built.
+BRAND_TOKEN = "{{BRAND}}"
 
 MAX_GENERATED = 3
+
+
+def brand_block(brand: dict | None) -> str:
+    """How the client's colours are put to the art director."""
+    brand = brand or {}
+    if not brand:
+        return ("\n\nNo brand colours could be established for this client, "
+                "so the palette is yours — choose one that suits their trade "
+                "and stay disciplined with it.")
+    accent = brand.get("accent", "")
+    return (
+        "\n\nTHE CLIENT'S COLOURS — measured, not guessed: "
+        + ", ".join(f"{k} {v}" for k, v in brand.items()) +
+        ".\nThese are already set as CSS variables (--accent, --deep, --ink, "
+        "--bg) and they are the ONE part of this design that is not yours to "
+        "choose. Whatever palette you build, the accent colour must be "
+        f"theirs: use var(--accent){f' ({accent})' if accent else ''} for the "
+        "element the eye goes to first in each scene — the kicker, the rule, "
+        "the figure, the active state. A reel in a colour the client does not "
+        "own is not their reel, however good it looks, and the design is "
+        "checked for this before it is filmed.")
+
+
+def research_addendum() -> str:
+    """Bolted onto whatever the research stage was already asked.
+
+    The research agent is already on the client's website — asking it for the
+    palette while it is there costs nothing, where having Prism open the site
+    again to measure it would cost a whole extra page load per run.
+
+    The format is rigid on purpose. 'a deep corporate blue' cannot be used;
+    '#1B3A5C' can, and a model looking at the page can read one off it.
+    """
+    return (
+        "\n\nALSO REPORT THE BRAND'S COLOURS. While you are on the company's "
+        "own website, note the two colours it is actually built from — the "
+        "header, the buttons, the headings — and give them as hex codes. End "
+        "your answer with exactly these two lines, on their own, nothing "
+        "after them:\n"
+        "BRAND_ACCENT: #RRGGBB\n"
+        "BRAND_DEEP: #RRGGBB\n"
+        "The accent is the colour the eye goes to (buttons, links, the logo); "
+        "the deep one is the darker tone used for headers or type. Read them "
+        "off the site — do not describe a colour in words and do not invent "
+        "one. If you genuinely cannot see the site, write NONE after both "
+        "labels rather than guessing."
+    )
+
+
+def read_brand(texts) -> dict:
+    """Pull BRAND_ACCENT / BRAND_DEEP out of the research answer."""
+    import re
+    blob = "\n".join(t for t in (texts if isinstance(texts, (list, tuple))
+                                 else [texts]) if t)
+    out = {}
+    for key, field in (("accent", "BRAND_ACCENT"), ("deep", "BRAND_DEEP")):
+        m = re.search(field + r"\s*:\s*#?([0-9A-Fa-f]{6})\b", blob)
+        if m:
+            out[key] = "#" + m.group(1).upper()
+    # A pair that is really one colour twice is worse than one colour: it
+    # tells the design there is a dark tone to work with when there isn't.
+    if out.get("accent") and out.get("accent") == out.get("deep"):
+        del out["deep"]
+    return out
 
 
 def imagery_instructions(request: str, has_own_artwork: bool = False,
@@ -619,22 +686,9 @@ def design_instructions(brand: dict | None = None, request: str = "",
                         assets: str = "") -> str:
     """The art-direction pass. This is the one that makes two clients' reels
     different films rather than one template with new words."""
-    brand = brand or {}
-    swatch = ""
-    if brand:
-        accent = brand.get("accent", "")
-        swatch = (
-            "\n\nTHE CLIENT'S COLOURS — measured from their own artwork, not "
-            "guessed: " + ", ".join(f"{k} {v}" for k, v in brand.items()) +
-            ".\nThese are already set as CSS variables (--accent, --deep, "
-            "--ink, --bg) and they are the ONE part of this design that is "
-            "not yours to choose. Whatever palette you build, the accent "
-            f"colour must be theirs: use var(--accent){f' ({accent})' if accent else ''} "
-            "for the element the eye goes to first in each scene — the "
-            "kicker, the rule, the figure, the active state. A reel in a "
-            "colour the client does not own is not their reel, however good "
-            "it looks, and the design is checked for this before it is "
-            "filmed.")
+    # None means "not known yet" — the research stage supplies it at run time
+    # and the token is substituted the moment before this prompt is typed.
+    swatch = BRAND_TOKEN if brand is None else brand_block(brand)
     return (
         "OUTPUT FORMAT — THIS OVERRIDES EVERY OTHER FORMATTING INSTRUCTION, "
         "INCLUDING ANY RULE ASKING FOR A HANDOFF OR A SUMMARY. Reply with "

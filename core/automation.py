@@ -823,7 +823,7 @@ def _web_token() -> str:
     return reel_web.ASSET_TOKEN
 
 
-def _run_studio(prior_text, attachments, cfg: dict):
+def _run_studio(prior_text, attachments, cfg: dict, brand: dict | None = None):
     """Film the page the art-direction stage wrote.
 
     The design is not trusted, it is measured: the page is laid out in the
@@ -854,11 +854,17 @@ def _run_studio(prior_text, attachments, cfg: dict):
     imgs = [a["path"] for a in (attachments or [])
             if a.get("path", "").lower().endswith(
                 (".png", ".jpg", ".jpeg", ".webp", ".bmp"))]
-    if imgs and not spec.get("brand"):
+    # Whatever the design was actually shown: measured off an attachment, or
+    # read off the client's website by the research stage. The design's own
+    # 'brand' key is not trusted over either — it is the one thing it does not
+    # get to choose.
+    if brand:
+        spec["brand"] = dict(brand)
+    elif imgs and not spec.get("brand"):
         from . import reel as _pillow
-        brand = _pillow.sample_brand(imgs)
-        if brand:
-            spec["brand"] = brand
+        sampled = _pillow.sample_brand(imgs)
+        if sampled:
+            spec["brand"] = sampled
 
     # Rebuilt, not passed along: collect() names assets from the files in a
     # fixed order, so the table the design stage was shown and the table the
@@ -898,7 +904,8 @@ def _run_studio(prior_text, attachments, cfg: dict):
     return out, f"reel filmed — {os.path.basename(out)}"
 
 
-def _run_local(kind: str, prior_text, attachments, cfg: dict, stage: str):
+def _run_local(kind: str, prior_text, attachments, cfg: dict, stage: str,
+               brand: dict | None = None):
     """Execute an agent that lives in Prism rather than in a browser.
 
     prior_text is either a single string or the earlier stages' outputs,
@@ -910,7 +917,7 @@ def _run_local(kind: str, prior_text, attachments, cfg: dict, stage: str):
     way a scraped one does, never take the run down with it.
     """
     if kind == "reel_web":
-        return _run_studio(prior_text, attachments, cfg)
+        return _run_studio(prior_text, attachments, cfg, brand)
     if kind != "reel":
         return "", f"Unknown local agent {kind!r}."
     try:
@@ -1038,6 +1045,8 @@ def run(routing: dict, cfg: dict, attachments=None, on_event=None,
                      None)
     design_feeder = None
     script_stage = ""
+    research_stage = ""
+    studio_brand: dict = {}
     # Stages whose reply is READ BY A PROGRAM, not handed to another chat.
     # The pipeline's normal rules demand a prose "HANDOFF FOR <next agent>"
     # section as the last thing in the answer, which flatly contradicts "reply
@@ -1082,6 +1091,21 @@ def run(routing: dict, cfg: dict, attachments=None, on_event=None,
                     except Exception as e:
                         ui.warn(f"couldn't prepare the artwork ({e}) — the "
                                 "reel will be type and colour only")
+            # No logo attached means no measured palette, and a reel in a
+            # colour the client does not own is not their reel. The research
+            # stage is already on their website — asking for the hex codes
+            # while it is there costs nothing, where having Prism open the
+            # site again to sample it would cost a whole extra page load.
+            if not brand:
+                for i, (st, an, qs) in enumerate(stages):
+                    if st == "research" and i < studio_at:
+                        stages[i] = (st, an,
+                                     qs[:-1] + [qs[-1] + _web.research_addendum()])
+                        research_stage = st
+                        ui.info(f"🎨  {an} will read the brand colours off "
+                                "their website")
+                        break
+
             # Most jobs arrive with NOTHING attached — a company name and a
             # sentence. So the reel's pictures are made here: the tool that
             # can search the web and draw looks the company up and produces a
@@ -1109,9 +1133,11 @@ def run(routing: dict, cfg: dict, attachments=None, on_event=None,
             # The asset list cannot be known yet — the imagery stage has not
             # run. A token stands in and is substituted the moment before this
             # prompt is typed.
+            studio_brand = dict(brand or {})
             stages.insert(studio_at, ("design", director,
                                       [_web.design_instructions(
-                                          brand, query, _web.ASSET_TOKEN)]))
+                                          brand or None, query,
+                                          _web.ASSET_TOKEN)]))
             studio_at += 1
             design_feeder = studio_at - 1
             script_stage = stages[writer][0]
@@ -1187,7 +1213,7 @@ def run(routing: dict, cfg: dict, attachments=None, on_event=None,
             # model drew.
             out, note = _run_local(agent_cfg["local"], prior_text,
                                    (attachments or []) + pipeline_files,
-                                   cfg, stage)
+                                   cfg, stage, brand=studio_brand)
             if out:
                 all_responses[stage] = [note]
                 all_links[stage] = out
@@ -1358,6 +1384,20 @@ def run(routing: dict, cfg: dict, attachments=None, on_event=None,
                     if table:
                         ui.info(f"   🖼️   {len(table)} asset(s) for the design: "
                                 + ", ".join(table))
+                    if not studio_brand and research_stage:
+                        studio_brand = _web.read_brand(
+                            all_responses.get(research_stage) or [])
+                        if studio_brand:
+                            ui.ok("   🎨  brand colours from their website — "
+                                  + ", ".join(f"{k} {v}" for k, v
+                                              in studio_brand.items()))
+                        else:
+                            ui.info("   no brand colours came back — the "
+                                    "design will choose its own")
+                    questions = [q.replace(_web.BRAND_TOKEN,
+                                           _web.brand_block(studio_brand))
+                                 for q in questions]
+
                     script = "\n\n".join(
                         t for t in (all_responses.get(script_stage) or [])
                         if t.strip())
