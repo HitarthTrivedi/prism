@@ -169,6 +169,73 @@ def _clear_profile_locks():
             pass
 
 
+# Preferences is a settings file. Anything past this is not settings.
+_PREFS_SANE = 8_000_000
+_PREFS_HOPELESS = 150_000_000
+# Keys that grow without bound under automation and hold nothing worth
+# keeping. DevTools state is appended to on every CDP session — which is
+# every Prism run — and nothing ever prunes it.
+_PREFS_JUNK = ("devtools", "media")
+
+
+def _prune_preferences() -> None:
+    """Stop Prism poisoning its own browser profile.
+
+    Chrome parses Preferences at startup and CHECK-fails on a big enough one:
+    the browser dies about a second after launch with a SIGTRAP in
+    CrBrowserMain and a crash report that says nothing about why. Seen in the
+    wild at 2.2 GB, of which 2.06 GB was the 'devtools' key alone, grown a
+    little at a time over months of automated runs.
+
+    Deliberately does NOT parse a hopeless file — a 2 GB JSON costs several
+    gigabytes of RAM to load, and this runs on the way to launching a browser.
+    Past that size the file is quarantined instead; Chrome writes a fresh one,
+    and logins are unaffected because they live in Cookies and Login Data,
+    not here.
+    """
+    import json
+    path = os.path.join(PROFILE_DIR, "Default", "Preferences")
+    try:
+        size = os.path.getsize(path)
+    except OSError:
+        return
+    if size < _PREFS_SANE:
+        return
+
+    if size > _PREFS_HOPELESS:
+        spare = f"{path}.oversized-{int(time.time())}"
+        try:
+            os.replace(path, spare)
+            ui.warn(f"Chrome's settings file had grown to {size/1e6:.0f} MB — "
+                    "big enough to crash the browser on launch. Set aside; "
+                    "your logins are untouched.")
+        except OSError:
+            pass
+        return
+
+    try:
+        with open(path) as f:
+            prefs = json.load(f)
+    except Exception:
+        return
+    freed = 0
+    for key in _PREFS_JUNK:
+        if key in prefs:
+            freed += len(json.dumps(prefs[key]))
+            del prefs[key]
+    if not freed:
+        return
+    try:
+        tmp = path + ".pruned"
+        with open(tmp, "w") as f:
+            json.dump(prefs, f, separators=(",", ":"))
+        os.replace(tmp, path)
+        ui.info(f"   🧹  trimmed {freed/1e6:.0f} MB of accumulated DevTools "
+                "state from Chrome's settings")
+    except OSError:
+        pass
+
+
 def _setup_chrome_driver(version_main=None, reseed: bool = False):
     """Launch undetected-chromedriver against Prism's own persistent profile,
     seeded from the user's real Chrome the first time so their logins carry
@@ -180,30 +247,60 @@ def _setup_chrome_driver(version_main=None, reseed: bool = False):
         ui.info("   🍪  reusing Prism's browser profile (logins persist "
                 "between runs)")
     _clear_profile_locks()
+    _prune_preferences()
     tmp = PROFILE_DIR
 
     opts = uc.ChromeOptions()
     opts.add_argument("--profile-directory=Default")
     opts.add_argument("--disable-blink-features=AutomationControlled")
 
-    # Drop any cached wrong-architecture chromedriver (x86 on Apple Silicon).
+    # Match the driver to Chrome. A pin exists to work around DETECTION
+    # failing, not to override what is actually installed — and Chrome
+    # auto-updates, so a pin set months ago goes stale silently. Driving
+    # Chrome 150 with a 149 driver does not fail politely: Chrome trips an
+    # internal check and dies about a second after launch, with a crash
+    # report and nothing in Prism's output to explain it.
+    detected = detect_chrome_version()
+    if version_main and detected and version_main != detected:
+        ui.warn(f"your pinned Chrome version is v{version_main} but v{detected} "
+                f"is installed — using v{detected}. Run /chrome to update or "
+                "clear the pin.")
+        version_main = detected
+    elif version_main is None:
+        version_main = detected
+    if version_main:
+        ui.info(f"   🌐  targeting Chrome v{version_main}")
+
+    # Drop a cached chromedriver that cannot drive this Chrome: the wrong
+    # architecture, or a version behind the browser. undetected-chromedriver
+    # reuses whatever it patched last time, which is exactly how a stale one
+    # survives a Chrome update.
     uc_cache = os.path.expanduser("~/Library/Application Support/undetected_chromedriver")
     if os.path.exists(uc_cache):
         for f in [x for x in os.listdir(uc_cache) if "chromedriver" in x.lower()]:
             fp = os.path.join(uc_cache, f)
+            drop = None
             try:
                 r = subprocess.run(["file", fp], capture_output=True, text=True)
                 if "x86" in r.stdout and "arm" not in r.stdout.lower():
-                    os.remove(fp)
+                    drop = "built for the wrong architecture"
             except Exception:
                 pass
-
-    # Match the driver to Chrome: use the user's pinned version if provided,
-    # otherwise auto-detect the installed one.
-    if version_main is None:
-        version_main = detect_chrome_version()
-    if version_main:
-        ui.info(f"   🌐  targeting Chrome v{version_main}")
+            if drop is None and version_main:
+                try:
+                    r = subprocess.run([fp, "--version"], capture_output=True,
+                                       text=True, timeout=10)
+                    have = int(r.stdout.strip().split()[1].split(".")[0])
+                    if have != version_main:
+                        drop = f"built for Chrome v{have}, not v{version_main}"
+                except Exception:
+                    pass
+            if drop:
+                try:
+                    os.remove(fp)
+                    ui.info(f"   ♻️   replacing the cached driver — {drop}")
+                except OSError:
+                    pass
 
     return uc.Chrome(options=opts, user_data_dir=tmp, version_main=version_main)
 
