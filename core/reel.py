@@ -501,11 +501,219 @@ def scene_endcard(d, b, s, f):
                font=_font("regular", 30), fill=blend(b.grey, b.bg, a3), anchor="ma")
 
 
+def _fit(d, s: str, weight: str, size: int, max_width: int, floor: int = 22):
+    """Largest size at or below `size` that fits `max_width`. Type that runs
+    off the frame is the one thing a renderer must never do."""
+    while size > floor and d.textlength(s, font=_font(weight, size)) > max_width:
+        size -= 3
+    return _font(weight, size)
+
+
+def _series(s: dict) -> list[tuple[str, float]]:
+    """The numeric points of a trend scene, junk entries dropped."""
+    out = []
+    for p in s.get("points") or []:
+        if not isinstance(p, dict):
+            continue
+        try:
+            out.append((str(p.get("label", "")), float(p["value"])))
+        except (KeyError, TypeError, ValueError):
+            continue
+    return out
+
+
+def scene_trend(d, b, s, f):
+    """A real chart drawn from real numbers.
+
+    This exists because the alternative is what actually happened: with no
+    chart scene, a writing stage handed over a caption reading "Animated
+    trend: ₹61,000 Cr → ₹88,000 Cr …" and the renderer drew that sentence —
+    a description of a chart instead of a chart. Numbers are exactly what
+    code should own, so the spec carries the series and this draws it.
+    """
+    blueprint_grid(d, b, 0.5, offset=int(f * 0.2))
+    heading = s.get("heading", "")
+    pts = _series(s)
+    x0, x1 = SAFE_X + 30, W - SAFE_X - 30
+    top, bottom = 720, 1240
+
+    a = fade_in(f, 2)
+    if a > 0 and heading:
+        d.text((SAFE_X, 520 + rise(f, 2)), heading,
+               font=_fit(d, heading, "bold", 72, W - SAFE_X * 2, 44),
+               fill=blend(b.ink, b.bg, a))
+    if s.get("subheading"):
+        a2 = fade_in(f, 10)
+        if a2 > 0:
+            d.text((SAFE_X, 610 + rise(f, 10)), s["subheading"],
+                   font=_font("regular", 34), fill=blend(b.grey, b.bg, a2))
+
+    if len(pts) >= 2:
+        vals = [v for _, v in pts]
+        hi, lo = max(vals), min(vals)
+        # Floor the axis below the smallest value so a gentle rise still reads
+        # as a rise — but never below zero, which would overstate the climb.
+        base = max(0.0, lo - (hi - lo) * 0.45) if hi > lo else 0.0
+        span = (hi - base) or 1.0
+        n = len(pts)
+        step = (x1 - x0) / (n - 1)
+        xy = [(x0 + i * step, bottom - (v - base) / span * (bottom - top))
+              for i, (_, v) in enumerate(pts)]
+
+        d.line([(x0, bottom), (x1, bottom)], fill=b.line, width=3)
+
+        prog = ease((f - 8) / 54)
+        walked = prog * (n - 1)
+        drawn = [xy[0]]
+        for i in range(1, n):
+            if walked >= i:
+                drawn.append(xy[i])
+            elif walked > i - 1:
+                t = walked - (i - 1)
+                px, py = xy[i - 1]
+                qx, qy = xy[i]
+                drawn.append((lerp(px, qx, t), lerp(py, qy, t)))
+                break
+            else:
+                break
+        if len(drawn) > 1:
+            d.polygon(drawn + [(drawn[-1][0], bottom), (x0, bottom)],
+                      fill=blend(b.accent, b.bg, 0.13))
+            d.line(drawn, fill=b.accent, width=9, joint="curve")
+
+        prefix, suffix = s.get("value_prefix", ""), s.get("value_suffix", "")
+        labels = [f"{prefix}{v:,.0f}{suffix}".replace(",", ",") for _, v in pts]
+        # Every point labelled if the gaps allow it; otherwise the ends and the
+        # peak, which is the whole story anyway.
+        vf = _font("bold", 34)
+        while (max(d.textlength(t, font=vf) for t in labels) > step - 18
+               and vf.size > 24):
+            vf = _font("bold", vf.size - 2)
+        sparse = max(d.textlength(t, font=vf) for t in labels) > step - 18
+        keep = {0, n - 1, vals.index(hi)} if sparse else set(range(n))
+
+        for i, ((label, _), (px, py)) in enumerate(zip(pts, xy)):
+            if walked < i:
+                continue
+            # Fade from when the line REACHES the point, not from how much
+            # line is left: the final point's progress stops the instant it
+            # arrives, so tying opacity to it left the last — and most
+            # important — value permanently half-faded.
+            aa = fade_in(f, 8 + i * 54 / (n - 1), 12)
+            last = i == n - 1
+            r = 15 if last else 10
+            d.ellipse([px - r, py - r, px + r, py + r],
+                      fill=blend(b.accent if last else b.deep, b.bg, aa))
+            if i in keep:
+                lf = _font("bold", vf.size + (8 if last else 0))
+                lw = d.textlength(labels[i], font=lf)
+                # Keep the label inside the frame AND off the line: it sits in
+                # a chip of background so a rising series can't be read
+                # through its own value.
+                tx = min(max(px, SAFE_X + lw / 2), W - SAFE_X - lw / 2)
+                # Clearance is set by the steepest the line can be between two
+                # points, so the chip clears it on both sides rather than
+                # nicking it where the series climbs.
+                ty = py - 70
+                d.rounded_rectangle(
+                    [tx - lw / 2 - 10, ty - lf.size - 4, tx + lw / 2 + 10, ty + 8],
+                    radius=10, fill=b.bg)
+                d.text((tx, ty), labels[i], font=lf,
+                       fill=blend(b.ink if not last else b.deep, b.bg, aa),
+                       anchor="ms")
+            if label:
+                d.text((px, bottom + 22), label, font=_font("regular", 30),
+                       fill=blend(b.grey, b.bg, aa), anchor="ma")
+
+    note = s.get("note")
+    if note:
+        an = fade_in(f, 62)
+        if an > 0:
+            text(d, (SAFE_X, 1380), note, _font("regular", 26),
+                 blend(b.grey, b.bg, an), max_width=W - SAFE_X * 2, line_gap=6)
+
+
+def scene_figure(d, b, s, f):
+    """One number, what it means, and the small print underneath.
+
+    The footnote is the point of this scene. A spec once carried an asterisked
+    figure — "₹10–50 Cr (FY2023–24)*" — whose disclaimer lived in a key no
+    scene rendered, so the asterisk pointed at nothing. Anything a figure is
+    legally required to carry has to have somewhere to land.
+    """
+    blueprint_grid(d, b, 0.45, offset=int(f * 0.25))
+    value = str(s.get("value", ""))
+    a = fade_in(f, 6)
+    if a > 0 and value:
+        d.text((W // 2, 760 + rise(f, 6, 50)), value,
+               font=_fit(d, value, "bold", 168, W - SAFE_X * 2, 64),
+               fill=blend(b.deep, b.bg, a), anchor="ma")
+
+    label = s.get("label")
+    if label:
+        a2 = fade_in(f, 22)
+        if a2 > 0:
+            text(d, (W // 2, 990 + rise(f, 22, 30)), label,
+                 _font("regular", 46), blend(b.ink, b.bg, a2), anchor="ma",
+                 max_width=W - SAFE_X * 2 - 80, line_gap=12)
+
+    note = s.get("note")
+    if note:
+        a3 = fade_in(f, 40)
+        if a3 > 0:
+            d.line([(W // 2 - 120, 1180), (W // 2 + 120, 1180)],
+                   fill=blend(b.line, b.bg, a3), width=3)
+            text(d, (W // 2, 1220), note, _font("regular", 28),
+                 blend(b.grey, b.bg, a3), anchor="ma",
+                 max_width=W - SAFE_X * 2 - 60, line_gap=8)
+
+
+def scene_list(d, b, s, f):
+    """A plain typographic list — the people thanked, the things included.
+
+    No icons on purpose. A list of who a company owes its year to should not
+    have to find a picture for "farmers"; the previous way out was borrowing
+    an unrelated icon, which read as a mistake.
+    """
+    blueprint_grid(d, b, 0.5, offset=int(f * 0.3))
+    heading = s.get("heading", "")
+    a = fade_in(f, 2)
+    if a > 0 and heading:
+        text(d, (SAFE_X, 470 + rise(f, 2)), heading,
+             _fit(d, heading, "bold", 78, W - SAFE_X * 2, 46),
+             blend(b.ink, b.bg, a), max_width=W - SAFE_X * 2, line_gap=6)
+
+    items = [str(i) for i in (s.get("items") or [])][:6]
+    y = 760
+    for i, item in enumerate(items):
+        aa = fade_in(f, 18 + i * 10)
+        if aa <= 0:
+            continue
+        dy = rise(f, 18 + i * 10, 30)
+        d.rounded_rectangle([SAFE_X, y + i * 118 + dy + 18,
+                             SAFE_X + 10, y + i * 118 + dy + 74],
+                            radius=5, fill=blend(b.accent, b.bg, aa))
+        d.text((SAFE_X + 44, y + i * 118 + dy), item,
+               font=_fit(d, item, "regular", 62, W - SAFE_X * 2 - 60, 38),
+               fill=blend(b.ink, b.bg, aa))
+
+    tail = s.get("tail")
+    if tail:
+        at = fade_in(f, 18 + len(items) * 10 + 12)
+        if at > 0:
+            text(d, (SAFE_X, y + len(items) * 118 + 60), tail,
+                 _font("regular", 40), blend(b.grey, b.bg, at),
+                 max_width=W - SAFE_X * 2, line_gap=10)
+
+
 SCENES = {
     "statement": scene_statement,
     "brand": scene_brand,
     "pillar": scene_pillar,
     "hub": scene_hub,
+    "trend": scene_trend,
+    "figure": scene_figure,
+    "list": scene_list,
     "endcard": scene_endcard,
 }
 
@@ -594,30 +802,49 @@ def spec_instructions() -> str:
         "handoff section, no markdown fences. Do NOT describe the JSON you "
         "would write; write it. The first character of your reply must be "
         "'{' and the last must be '}'. Shape:\n"
-        '{\n'
-        '  "fps": 30,\n'
-        '  "brand": {"accent": "#68C04F", "deep": "#4B8A5D"},\n'
-        '  "scenes": [\n'
-        '    {"type":"statement","seconds":4,"lines":["Apps ship.","Systems scale."],'
-        '"tail":"None of it runs on its own."},\n'
-        '    {"type":"brand","seconds":5,"name":"Raj Infotech","tagline":"Complete IT Solution",'
-        '"stack":[{"icon":"server","label":"Computing"}]},\n'
-        '    {"type":"pillar","seconds":4,"heading":"Network Infrastructure",'
-        '"caption":"Structured cabling, fibre and switching.",'
-        '"icons":["network","fiber","server"],"accent_index":1},\n'
-        '    {"type":"hub","seconds":5,"heading":"One partner. One architecture.",'
-        '"caption":"Single-window IT infrastructure.",'
-        '"nodes":[{"icon":"server","label":"Computing"}]},\n'
-        '    {"type":"endcard","seconds":4,"name":"Raj Infotech",'
-        '"tagline_lines":["The Foundation Beneath","Everything Digital"],'
-        '"contact":"www.example.com"}\n'
-        '  ]\n'
-        '}\n\n'
-        "Rules: icons must come from this list — " + ", ".join(sorted(ICONS)) + ". "
-        "'statement' takes at most 3 short lines. 'pillar' takes exactly 3 icons. "
-        "'hub' takes exactly 4 nodes. Keep headings under 34 characters and "
-        "captions under 90. Never write a scene containing people; this renderer "
-        "draws equipment and typography only."
+        '{"fps": 30, "scenes": [ … ]}\n\n'
+        "SCENE TYPES — pick only the ones the story needs, in any order, and "
+        "repeat any of them. There is no required running order.\n"
+        '  statement  {"type":"statement","seconds":4,'
+        '"lines":["Up to 3 short lines"],"tail":"one quieter line"}\n'
+        '  figure     {"type":"figure","seconds":5,"value":"₹10–50 Cr",'
+        '"label":"Estimated turnover, FY2023–24",'
+        '"note":"Based on publicly available filings."}\n'
+        '  trend      {"type":"trend","seconds":6,"heading":"India seed market",'
+        '"subheading":"optional second line","value_prefix":"₹",'
+        '"value_suffix":" Cr","points":[{"label":"2021","value":61000},'
+        '{"label":"2024","value":81000}],"note":"optional small print"}\n'
+        '  list       {"type":"list","seconds":5,"heading":"Grown with",'
+        '"items":["Farmers","Dealers","Employees"],"tail":"optional closing line"}\n'
+        '  pillar     {"type":"pillar","seconds":4,"heading":"under 34 chars",'
+        '"caption":"under 90 chars","icons":["exactly","three","icons"],'
+        '"accent_index":1}\n'
+        '  hub        {"type":"hub","seconds":5,"heading":"…","caption":"…",'
+        '"nodes":[{"icon":"server","label":"…"}]}   (exactly 4 nodes)\n'
+        '  brand      {"type":"brand","seconds":5,"name":"Company Name",'
+        '"tagline":"…","stack":[{"icon":"server","label":"…"}]}\n'
+        '  endcard    {"type":"endcard","seconds":4,"name":"Company Name",'
+        '"tagline_lines":["two short","lines"],"contact":"www.example.com"}\n\n'
+        "RULES\n"
+        "· NUMBERS BELONG IN A SCENE THAT DRAWS THEM. A series of figures goes "
+        "in 'trend' as real numeric points; a single headline figure goes in "
+        "'figure'. Never write a number series into a caption or a label — the "
+        "renderer will print your sentence instead of charting it.\n"
+        "· NEVER DESCRIBE MOTION, STYLE OR LAYOUT. Do not write 'animated', "
+        "'fade in', 'clean data card', 'logo reveal' or any visual direction. "
+        "The renderer already animates every scene; such words get drawn as "
+        "literal text.\n"
+        "· Any disclaimer, source or asterisk footnote goes in the scene's "
+        "'note' — that is the only field small print renders from. An asterisk "
+        "with no 'note' points at nothing.\n"
+        "· Only these keys exist. Anything else you invent is discarded "
+        "silently, so put the words where they are read.\n"
+        "· icons (pillar, hub, brand only) must come from this list — "
+        + ", ".join(sorted(ICONS)) + ". They are equipment icons; if none of "
+        "them honestly fits your business, use 'statement', 'figure', 'trend' "
+        "or 'list' instead of forcing an unrelated picture.\n"
+        "· Never write a scene containing people; this renderer draws "
+        "typography, data and equipment only."
     )
 
 
