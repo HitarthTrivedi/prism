@@ -950,6 +950,23 @@ def spec_instructions() -> str:
         '"tagline":"…","stack":[{"icon":"server","label":"…"}]}\n'
         '  endcard    {"type":"endcard","seconds":4,"name":"Company Name",'
         '"tagline_lines":["two short","lines"],"contact":"www.example.com"}\n\n'
+        "WHEN TO USE WHICH — pick by what you are saying, not by habit:\n"
+        "  · an idea, a claim, an opening hook           → statement\n"
+        "  · ONE number that is the point of the scene   → figure\n"
+        "  · two or more numbers that move over time     → trend\n"
+        "  · people, places or things being named        → list\n"
+        "  · three pieces of equipment or capability     → pillar\n"
+        "  · four things converging on one offer         → hub\n"
+        "  · the company introducing itself              → brand\n"
+        "  · the last scene, always                      → endcard\n\n"
+        "PACING — a viewer reads three words in under two seconds:\n"
+        "  statement 3–6s · figure 4–6.5s · trend 5–8s · list 4–7s\n"
+        "  pillar 3–6s · hub 4–7s · brand 4–6s · endcard 3–5s\n"
+        "  4 to 7 scenes, 20–35 seconds in total. A reel is not a film.\n\n"
+        "COPY LIMITS — these are what keeps type large enough to read:\n"
+        "  heading under 34 characters · caption under 90 · statement at most "
+        "3 lines · list at most 4 items · pillar exactly 3 icons · hub exactly "
+        "4 nodes\n\n"
         "RULES\n"
         "· NUMBERS BELONG IN A SCENE THAT DRAWS THEM. A series of figures goes "
         "in 'trend' as real numeric points; a single headline figure goes in "
@@ -969,7 +986,16 @@ def spec_instructions() -> str:
         "them honestly fits your business, use 'statement', 'figure', 'trend' "
         "or 'list' instead of forcing an unrelated picture.\n"
         "· Never write a scene containing people; this renderer draws "
-        "typography, data and equipment only."
+        "typography, data and equipment only.\n\n"
+        "BEFORE YOU REPLY, CHECK YOUR OWN JSON:\n"
+        "  1. Is every number that appears more than once inside a 'trend' as "
+        "numeric points, rather than written into a sentence?\n"
+        "  2. Does any string describe motion, styling or a shot? Delete it.\n"
+        "  3. Does every '*' have a 'note' in the same scene?\n"
+        "  4. Is the last scene an 'endcard'?\n"
+        "  5. Do the seconds add up to between 20 and 35?\n"
+        "  6. Is the first character '{' and the last '}', with nothing else "
+        "in your reply?"
     )
 
 
@@ -1028,6 +1054,139 @@ def sample_brand(image_paths: list[str]) -> dict:
     if "accent" in out:
         r, g, b = hex_rgb(out["accent"])
         out["deep"] = "#%02X%02X%02X" % (int(r * .72), int(g * .72), int(b * .72))
+    return out
+
+
+# How long each scene type can hold the screen. A viewer reads three words in
+# under two seconds and a five-point chart in about six; anything longer is
+# dead air on a feed. Timing is a rendering decision, so these are enforced
+# rather than requested — one spec arrived with a 12-second logo card.
+SCENE_SECONDS = {
+    "statement": (3.0, 6.0), "figure": (4.0, 6.5), "trend": (5.0, 8.0),
+    "list": (4.0, 7.0), "pillar": (3.0, 6.0), "hub": (4.0, 7.0),
+    "brand": (4.0, 6.0), "endcard": (3.0, 5.0),
+}
+REEL_SECONDS = (18.0, 40.0)
+
+# Words that describe a video instead of being one. Every one of these has
+# turned up in a real spec, drawn literally on screen: "Animated trend: …",
+# "clean data card", "logo reveal with gentle leaf-inspired motion".
+# Phrases rather than bare words wherever the bare word is somebody's real
+# business. "camera", "footage", "zoom" and "transition" are all ordinary copy
+# for the CCTV and IT firms this tool was built for — flagging those would
+# correct a client's own words back at them.
+_MOTION_WORDS = (
+    "animate", "animation", "fade in", "fade-in", "b-roll", "broll",
+    "montage", "voiceover", "voice-over", "logo reveal", "data card",
+    "lower third", "slow motion", "drone shot", "soundtrack",
+    "background music", "cut to", "on-screen text", "visual note",
+    "camera pans", "camera angle", "on camera", "stock footage",
+    "zoom in", "zoom out", "slow zoom", "transition to", "cinematic shot",
+    "typography-led", "kinetic typography", "scene with", "visual treatment",
+    "colour palette", "color palette", "premium motion", "subtle texture",
+    "text overlay", "title card", "end card with", "brand colours applied",
+)
+
+_TEXT_KEYS = ("heading", "subheading", "caption", "label", "tail", "name",
+              "tagline", "contact", "note", "value")
+
+
+def _scene_text(sc: dict):
+    """Every human-readable string in a scene, with the key it came from."""
+    for k in _TEXT_KEYS:
+        v = sc.get(k)
+        if isinstance(v, str) and v.strip():
+            yield k, v
+    for k in ("lines", "items", "tagline_lines"):
+        for v in sc.get(k) or []:
+            if isinstance(v, str) and v.strip():
+                yield k, v
+    for k in ("stack", "nodes"):
+        for item in sc.get(k) or []:
+            if isinstance(item, dict) and isinstance(item.get("label"), str):
+                yield k, item["label"]
+
+
+def lint_spec(spec: dict) -> list[str]:
+    """What is wrong with this spec, in words the writer can act on.
+
+    Not a schema check — parse_spec already guarantees the shape. This catches
+    the mistakes that render as something embarrassing: a data series typed
+    into a caption, an asterisk with no footnote, a scene describing the
+    animation it wishes it had. Each complaint is phrased as an instruction so
+    it can be handed straight back to the agent that wrote it.
+    """
+    import re
+    out = []
+    scenes = spec.get("scenes") or []
+    if len(scenes) < 3:
+        out.append(f"The reel has only {len(scenes)} scene(s) — write 4 to 7.")
+    elif len(scenes) > 8:
+        out.append(f"{len(scenes)} scenes is too many — cut it to 7 at most.")
+
+    total = sum(float(sc.get("_seconds_asked", sc.get("seconds", 4)) or 4)
+                for sc in scenes)
+    if total < REEL_SECONDS[0]:
+        out.append(f"The reel is only {total:.0f}s long — aim for 20 to 35s.")
+    elif total > REEL_SECONDS[1]:
+        out.append(f"The reel runs {total:.0f}s — too long for a feed. "
+                   "Cut it to 35s at most by dropping scenes, not by "
+                   "shortening every one.")
+
+    if scenes and scenes[-1].get("type") != "endcard":
+        out.append("The last scene should be an 'endcard' so the reel ends on "
+                   "the company name, not mid-thought.")
+
+    for i, sc in enumerate(scenes, 1):
+        kind = sc.get("type", "")
+        where = f"Scene {i} ({kind})"
+        for key, val in _scene_text(sc):
+            low = val.lower()
+            for word in _MOTION_WORDS:
+                if word in low:
+                    out.append(f"{where}: '{key}' contains \"{word}\" — that is "
+                               "a description of a video, and it will be drawn "
+                               "as text. Delete it; the renderer handles motion.")
+                    break
+            # Two or more big numbers in one string is a series, and a series
+            # belongs in a chart.
+            if key != "value" and len(re.findall(r"\d[\d,]{2,}", val)) >= 2:
+                out.append(f"{where}: '{key}' has a series of numbers in it. "
+                           "Move them into a 'trend' scene as real numeric "
+                           "points — the renderer charts those.")
+            if "*" in val and not sc.get("note"):
+                out.append(f"{where}: '{key}' has an asterisk but the scene has "
+                           "no 'note', so the footnote it points at never "
+                           "appears. Add the 'note'.")
+
+        lo, hi = SCENE_SECONDS.get(kind, (3.0, 8.0))
+        # The asked-for value, not the clamped one — the writer has to see
+        # the range it missed, or it will keep missing it.
+        try:
+            secs = float(sc.get("_seconds_asked", sc.get("seconds", 4)))
+        except (TypeError, ValueError):
+            secs = 4.0
+        if not lo <= secs <= hi:
+            out.append(f"{where}: {secs:g}s is outside the {lo:g}–{hi:g}s this "
+                       "scene type holds attention for.")
+
+        if len(sc.get("heading", "")) > 34:
+            out.append(f"{where}: the heading is {len(sc['heading'])} characters "
+                       "— keep it under 34 so it stays large on a phone.")
+        if len(sc.get("caption", "")) > 90:
+            out.append(f"{where}: the caption is {len(sc['caption'])} characters "
+                       "— keep it under 90.")
+        if kind == "statement" and len(sc.get("lines") or []) > 3:
+            out.append(f"{where}: more than 3 lines. Split it into two scenes.")
+        if kind == "pillar" and len(sc.get("icons") or []) != 3:
+            out.append(f"{where}: 'pillar' needs exactly 3 icons.")
+        if kind == "hub" and len(sc.get("nodes") or []) != 4:
+            out.append(f"{where}: 'hub' needs exactly 4 nodes.")
+        if kind == "trend" and len(_series(sc)) < 2:
+            out.append(f"{where}: a 'trend' needs at least 2 numeric points "
+                       'like {"label":"2024","value":81000}.')
+        if kind == "list" and len(sc.get("items") or []) > 6:
+            out.append(f"{where}: more than 6 items — a viewer reads 4.")
     return out
 
 
@@ -1141,6 +1300,17 @@ def parse_spec(text: str) -> dict:
             dropped.append(str(sc.get("type") if isinstance(sc, dict) else sc)[:24])
     if not clean:
         raise ReelError("None of the scenes are types this renderer knows.")
+    # Pacing is a rendering decision, like layout and colour — so it is
+    # corrected here rather than left to whatever the writer typed. lint_spec
+    # still reports the original value so the writer learns the range.
+    for sc in clean:
+        lo, hi = SCENE_SECONDS.get(sc.get("type", ""), (3.0, 8.0))
+        try:
+            asked = float(sc.get("seconds", 4))
+        except (TypeError, ValueError):
+            asked = lo
+        sc["_seconds_asked"] = asked
+        sc["seconds"] = max(lo, min(hi, asked))
     spec["scenes"] = clean
     spec["_dropped"] = dropped
     return spec

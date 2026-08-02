@@ -1087,6 +1087,40 @@ def run(routing: dict, cfg: dict, attachments=None, on_event=None,
                         # our own echo. Chat DOM order is chronological, so
                         # the newest capture is the reply.
                         stage_responses = [spec_texts[-1]]
+                        # It parses — but does it render as something worth
+                        # posting? The faults that matter (a series typed into
+                        # a caption, an asterisk with no footnote, a scene
+                        # describing a shot) are all legal JSON, so the only
+                        # way to catch them is to look, and the only way to fix
+                        # them is to say precisely what is wrong.
+                        faults = _reel.lint_spec(
+                            _reel.parse_spec(stage_responses[0]))
+                        if faults:
+                            ui.warn(f"the scene spec has {len(faults)} problem(s) "
+                                    "— sending them back to be fixed")
+                            for fault in faults[:6]:
+                                ui.info(f"   · {fault}")
+                            again = _reask(
+                                driver, agent_cfg,
+                                "Your JSON renders, but these are wrong:\n\n"
+                                + "\n".join(f"{n}. {x}" for n, x
+                                            in enumerate(faults[:10], 1))
+                                + "\n\nSend the corrected scene spec: ONLY the "
+                                  "JSON object, first character '{', last '}'.",
+                                expect='"scenes"')
+                            better = [t for t in again if _reel.has_spec(t)]
+                            if better:
+                                left = _reel.lint_spec(_reel.parse_spec(better[-1]))
+                                # Keep the second attempt only if it is
+                                # genuinely cleaner — a "fix" that trades six
+                                # faults for seven is not a fix.
+                                if len(left) < len(faults):
+                                    stage_responses = [better[-1]]
+                                    ui.ok(f"   fixed — {len(faults)} problem(s) "
+                                          f"down to {len(left)}")
+                                else:
+                                    ui.info("   the second attempt was no "
+                                            "better — keeping the first")
                     else:
                         ui.warn(f"{agent_name} wrote about the reel instead of "
                                 "writing the spec — asking again for JSON only")
