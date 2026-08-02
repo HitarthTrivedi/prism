@@ -68,8 +68,8 @@ CATEGORIES = {
         "emoji": "🎬",
         "color": "media",
         "desc": "Generated footage, reels from your own clips & AI avatars",
-        "agents": ["Prism Reel", "Google Flow", "Claude Design", "InVideo AI",
-                   "Runway", "Pika Labs", "HeyGen"],
+        "agents": ["Prism Studio", "Prism Reel", "Google Flow", "Claude Design",
+                   "InVideo AI", "Runway", "Pika Labs", "HeyGen"],
     },
     # Split out from video on purpose: a voice-over and a reel are different
     # jobs with different tools, and a run often needs BOTH — one stage each,
@@ -267,12 +267,20 @@ AGENT_REGISTRY = {
     ),
     # Runs INSIDE Prism — no browser, no account, no upload. Marked local so
     # automation.py renders it here instead of driving a Chrome tab.
+    "Prism Studio": _agent(
+        "local://reel_web",
+        "the reel is DESIGNED, not templated: one pass writes the script, a "
+        "second art-directs it — its own background, typography, palette and "
+        "motion as real CSS — and Prism films the page frame by frame. Two "
+        "clients never get the same-looking film. No watermark, no credits",
+        "Included", "40–90s", 60,
+        local="reel_web",
+    ),
     "Prism Reel": _agent(
         "local://reel",
-        "renders the finished vertical reel on this machine — always 9:16, "
-        "text always legible, brand colours measured from the client's own "
-        "artwork, no watermark, no credit limit, and the same script renders "
-        "identically every time",
+        "the fixed house style, drawn in code: always 9:16, text always "
+        "legible, brand colours measured from the client's artwork. Faster "
+        "and never surprising, but every reel shares one look",
         "Included", "15–30s", 60,
         local="reel",
     ),

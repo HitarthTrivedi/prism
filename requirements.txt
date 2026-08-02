@@ -36,3 +36,6 @@ ezdxf
 #
 # The standalone whisper.py reference app additionally needs:
 #   pip install numpy aiohttp
+
+# Prism Studio films an HTML page frame by frame — this is the browser engine.
+playwright>=1.44

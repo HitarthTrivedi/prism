@@ -1123,15 +1123,38 @@ def cmd_reel(cfg, arg: str, attachments: list):
     if not writer:
         ui.err("No content/brains agent configured — run /agents first.")
         return
+    director = agents.get("brains") or agents[writer]
 
-    ui.pipeline_plan([
-        ("brand", "Prism (local)",
-         "DONE — colours measured from the attached artwork, no AI involved"),
-        ("script", agents[writer],
-         "write the words and the running order — nothing else"),
-        ("render", "Prism (local)",
-         "draw every frame and encode with FFmpeg — 1080x1920, no watermark"),
-    ], title="Reel pipeline")
+    # Two renderers, and the difference matters enough to say out loud: the
+    # designed one gives every client a different-looking film, the template
+    # one is faster and always identical. Designed is the default when the
+    # browser engine is installed.
+    from core import reel_web
+    studio_ok, studio_why = reel_web.available()
+
+    if studio_ok:
+        ui.pipeline_plan([
+            ("brand", "Prism (local)",
+             "DONE — colours measured from the attached artwork, no AI involved"),
+            ("script", agents[writer],
+             "write the words and the running order — no design, no layout"),
+            ("design", director,
+             "art-direct it: background, type, palette and motion, as real CSS"),
+            ("film", "Prism Studio (local)",
+             "lay the page out at 1080x1920, check every line is inside the "
+             "frame and big enough, then film it frame by frame"),
+        ], title="Reel pipeline — designed")
+    else:
+        ui.warn(f"Designed reels need the browser engine — {studio_why}")
+        ui.info("Falling back to the fixed house style for now.")
+        ui.pipeline_plan([
+            ("brand", "Prism (local)",
+             "DONE — colours measured from the attached artwork, no AI involved"),
+            ("script", agents[writer],
+             "write the words and the running order — nothing else"),
+            ("render", "Prism (local)",
+             "draw every frame and encode with FFmpeg — 1080x1920, no watermark"),
+        ], title="Reel pipeline — house style")
 
     if not _ask_yes_no("Run this?", default=True):
         ui.info("Cancelled.")
@@ -1141,6 +1164,10 @@ def cmd_reel(cfg, arg: str, attachments: list):
         from core import automation
     except Exception as e:
         ui.err(f"Automation deps not available ({e}).")
+        return
+
+    if studio_ok:
+        _reel_designed(cfg, request, brand, images, agents[writer], director)
         return
 
     prompt = reel.build_prompt(request, brand, bool(images))
@@ -1192,6 +1219,86 @@ def cmd_reel(cfg, arg: str, attachments: list):
     ui.info(f"   scene spec saved → {spec_path}  (edit it and re-render, no AI needed)")
     C.save_run({"query": f"/reel {request}", "responses": responses, "links": links,
                 "reel": {"mp4": out, "spec": spec_path, "brand": brand}})
+
+
+def _reel_designed(cfg, request, brand, images, writer_agent, director_agent):
+    """/reel through Prism Studio: script, then art direction, then filmed.
+
+    Two passes on purpose. One reply asked for both the words and the look
+    reliably produces a design that describes itself — "clean data card",
+    "logo reveal" — rather than one that exists.
+    """
+    import json as _json
+    import time
+    from core import automation, reel_web
+
+    responses, links = automation.run(
+        {}, cfg, attachments=images, chatgpt_analysis=False,
+        custom_stages=[
+            ("script", writer_agent,
+             [f"Write the script for a short vertical brand reel.\n\n"
+              f"WHAT THE CLIENT ASKED FOR:\n{request}\n\n"
+              + reel_web.script_instructions()]),
+            ("design", director_agent,
+             [reel_web.design_instructions(brand, request)]),
+        ],
+        query=f"design a reel — {request}")
+
+    texts = [t for t in (responses.get("design") or []) if t.strip()]
+    if not texts:
+        ui.err("The art-direction stage returned nothing.")
+        if links.get("design"):
+            ui.info(f"Its tab: {links['design']}")
+        return
+    try:
+        spec = reel_web.parse_spec(texts[-1])
+    except reel_web.ReelError as e:
+        ui.err(str(e))
+        if links.get("design"):
+            ui.info(f"Read what it said: {links['design']}")
+        return
+    if brand:
+        spec["brand"] = brand
+
+    # Measured, not trusted: the page is laid out and every line checked
+    # before a minute is spent filming it.
+    ui.info("   📐  laying the design out at 1080x1920…")
+    try:
+        faults = reel_web.inspect(spec)
+    except Exception as e:
+        ui.warn(f"   couldn't check the layout ({e}) — filming anyway")
+        faults = []
+    for fault in faults[:6]:
+        ui.warn(f"   layout: {fault}")
+
+    os.makedirs(C.RUNS_DIR, exist_ok=True)
+    stamp = int(time.time())
+    out = os.path.join(C.RUNS_DIR, f"reel_{stamp}.mp4")
+    spec_path = os.path.join(C.RUNS_DIR, f"reel_{stamp}.json")
+    _json.dump(spec, open(spec_path, "w"), indent=2)
+
+    name = (spec.get("design") or {}).get("name", "")
+    if name:
+        ui.ok(f"🎨  {name}")
+    secs = sum(float(sc.get("seconds", 4) or 4) for sc in spec["scenes"])
+    ui.info(f"🎬  filming {len(spec['scenes'])} scenes, ~{secs:.0f}s — this "
+            "takes longer than the house style because every frame is a real "
+            "browser paint.")
+    try:
+        reel_web.render(spec, out, check=False,
+                        on_progress=lambda d, t: ui.info(f"   {d}/{t} frames")
+                        if d % (t // 4 or 1) < 30 else None)
+    except reel_web.ReelError as e:
+        ui.err(str(e))
+        return
+
+    ui.ok(f"Reel ready → {out}")
+    ui.info(f"   design saved → {spec_path}  (edit the CSS and re-render, "
+            "no AI needed)")
+    C.save_run({"query": f"/reel {request}", "responses": responses,
+                "links": links,
+                "reel": {"mp4": out, "spec": spec_path, "brand": brand,
+                         "designed": True}})
 
 
 def reel_available() -> tuple[bool, str]:

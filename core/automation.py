@@ -674,6 +674,67 @@ def _reask(driver, agent_cfg: dict, prompt: str, expect: str = "") -> list[str]:
         return []
 
 
+def _run_studio(prior_text, attachments, cfg: dict):
+    """Film the page the art-direction stage wrote.
+
+    The design is not trusted, it is measured: the page is laid out in the
+    browser and every piece of text checked for being inside the frame and
+    big enough to read, before a single frame is encoded. A design that fails
+    is reported with the exact strings that are wrong.
+    """
+    try:
+        from . import reel_web as web
+    except Exception as e:
+        return "", f"The web renderer isn't available ({e})."
+    ok, why = web.available()
+    if not ok:
+        return "", why
+
+    sources = [prior_text] if isinstance(prior_text, str) else list(prior_text)
+    spec, why_bad = None, None
+    for text in sources:
+        try:
+            spec = web.parse_spec(text)
+            break
+        except Exception as e:
+            why_bad = why_bad or e
+    if spec is None:
+        return "", (f"{why_bad or 'Nothing was written for the renderer.'} "
+                    "The art-direction stage has to return the design JSON.")
+
+    imgs = [a["path"] for a in (attachments or [])
+            if a.get("path", "").lower().endswith(
+                (".png", ".jpg", ".jpeg", ".webp", ".bmp"))]
+    if imgs and not spec.get("brand"):
+        from . import reel as _pillow
+        brand = _pillow.sample_brand(imgs)
+        if brand:
+            spec["brand"] = brand
+
+    import json as _json
+    import time as _time
+    from . import config as C
+    os.makedirs(C.RUNS_DIR, exist_ok=True)
+    stamp = int(_time.time())
+    out = os.path.join(C.RUNS_DIR, f"reel_{stamp}.mp4")
+    _json.dump(spec, open(os.path.join(C.RUNS_DIR, f"reel_{stamp}.json"), "w"),
+               indent=2)
+
+    name = (spec.get("design") or {}).get("name", "")
+    if name:
+        ui.info(f"   🎨  design: {name}")
+    secs = sum(float(sc.get("seconds", 4) or 4) for sc in spec["scenes"])
+    ui.info(f"   🎬  filming {len(spec['scenes'])} scenes, ~{secs:.0f}s, "
+            "1080x1920 — in a browser, locally")
+    try:
+        web.render(spec, out)
+    except Exception as e:
+        return "", f"Render failed: {e}"
+    for fault in (spec.get("_faults") or [])[:5]:
+        ui.warn(f"   layout: {fault}")
+    return out, f"reel filmed — {os.path.basename(out)}"
+
+
 def _run_local(kind: str, prior_text, attachments, cfg: dict, stage: str):
     """Execute an agent that lives in Prism rather than in a browser.
 
@@ -685,6 +746,8 @@ def _run_local(kind: str, prior_text, attachments, cfg: dict, stage: str):
     message explains what went wrong — a local stage must degrade the same
     way a scraped one does, never take the run down with it.
     """
+    if kind == "reel_web":
+        return _run_studio(prior_text, attachments, cfg)
     if kind != "reel":
         return "", f"Unknown local agent {kind!r}."
     try:
@@ -803,6 +866,49 @@ def run(routing: dict, cfg: dict, attachments=None, on_event=None,
     # making the router understand renderers, the requirement is appended to
     # the last writing stage here — the only place that knows both which
     # agent got picked for video AND what runs before it.
+    # Prism Studio designs the reel instead of filling in a template, so it
+    # needs TWO writing passes before it: one for the words, one for the art
+    # direction. Splitting them is the point — a single reply that has to do
+    # both produces a design that describes itself instead of one that exists.
+    studio_at = next((i for i, (_, an, _) in enumerate(stages)
+                      if (A.resolve_agent("", an) or {}).get("local") == "reel_web"),
+                     None)
+    design_feeder = None
+    if studio_at is not None:
+        writer = next((i for i in range(studio_at - 1, -1, -1)
+                       if not (A.resolve_agent("", stages[i][1]) or {}).get("local")),
+                      None)
+        if writer is None:
+            ui.warn("Prism Studio has no writing stage before it — turn on "
+                    "content or brains so something can write the reel.")
+        else:
+            from . import reel_web as _web
+            from . import reel as _pillow
+            st, an, qs = stages[writer]
+            stages[writer] = (st, an, qs[:-1] + [
+                qs[-1] + "\n\n" + _web.script_instructions()])
+            brand = {}
+            if attachments:
+                imgs = [a["path"] for a in attachments
+                        if a.get("path", "").lower().endswith(
+                            (".png", ".jpg", ".jpeg", ".webp", ".bmp"))]
+                if imgs:
+                    brand = _pillow.sample_brand(imgs) or {}
+                    if brand:
+                        ui.info(f"🎨  brand colours read from the artwork — "
+                                f"accent {brand.get('accent')}, "
+                                f"deep {brand.get('deep')}")
+            # The art director is the same tool as the writer unless a
+            # stronger one is switched on: this pass is the harder of the two.
+            director = agents.get("brains") or agents.get("content") or an
+            stages.insert(studio_at, ("design", director,
+                                      [_web.design_instructions(brand,
+                                                                query)]))
+            studio_at += 1
+            design_feeder = studio_at - 1
+            ui.info(f"🎬  {stages[studio_at][1]} films the page — {an} writes "
+                    f"the script, {director} art-directs it")
+
     local_reel_at = next((i for i, (_, an, _) in enumerate(stages)
                           if (A.resolve_agent("", an) or {}).get("local") == "reel"),
                          None)
@@ -1045,7 +1151,9 @@ def run(routing: dict, cfg: dict, attachments=None, on_event=None,
                 # so (e.g. /email needs "SUBJECT:"), and a mid-answer pause
                 # can no longer end the wait early.
                 expect = (routing.get(stage) or {}).get("expect", "")
-                if stage_idx == spec_feeder:
+                if stage_idx == design_feeder:
+                    expect = '"css"'
+                elif stage_idx == spec_feeder:
                     # A spec streams in over several seconds and pauses mid-way;
                     # without a marker a pause reads as "finished" and we scrape
                     # the preamble before the JSON has been written.
@@ -1072,6 +1180,51 @@ def run(routing: dict, cfg: dict, attachments=None, on_event=None,
                     stage_responses = [max(texts, key=len)]
                 else:
                     stage_responses = texts[-len(questions):]
+
+                # The art director's page is laid out in a real browser before
+                # anything is filmed. Text off the frame or too small to read
+                # is not a matter of opinion, so it goes straight back with
+                # the offending strings quoted.
+                if stage_idx == design_feeder and texts:
+                    from . import reel_web as _web
+                    for attempt in range(2):
+                        try:
+                            cand = _web.parse_spec(texts[-1])
+                        except Exception as e:
+                            faults = [str(e)]
+                            cand = None
+                        else:
+                            stage_responses = [texts[-1]]
+                            try:
+                                faults = _web.inspect(cand)
+                            except Exception as e:
+                                ui.warn(f"   couldn't lay the design out ({e})")
+                                faults = []
+                        if not faults:
+                            if cand is not None:
+                                ui.ok("   design lays out clean at 1080x1920")
+                            break
+                        if attempt:
+                            ui.err("   still not laying out — filming it "
+                                   "anyway, check the result")
+                            break
+                        ui.warn(f"the design has {len(faults)} layout "
+                                "problem(s) — sending them back")
+                        for f in faults[:5]:
+                            ui.info(f"   · {f}")
+                        again = _reask(
+                            driver, agent_cfg,
+                            "Your design was laid out at 1080x1920 and these "
+                            "are wrong:\n\n"
+                            + "\n".join(f"{n}. {x}" for n, x
+                                        in enumerate(faults[:10], 1))
+                            + "\n\nFix the CSS and send the corrected design: "
+                              "ONLY the JSON object, first character '{', "
+                              "last '}'.",
+                            expect='"css"')
+                        if not again:
+                            break
+                        texts = again
 
                 # This stage feeds a renderer, so "it answered" isn't enough —
                 # it has to have answered in JSON. Prefer a capture that
