@@ -31,33 +31,78 @@ import subprocess
 W, H, FPS = 1080, 1920, 30
 SAFE_X, SAFE_Y = 90, 130
 
+# Ordered by preference. The rupee sign is the deciding factor, not looks:
+# Arial ships no ₹ glyph on macOS or older Windows, so every price in an
+# Indian reel came out as a .notdef box. Helvetica and San Francisco carry it.
 _FONT_CANDIDATES = {
     "bold": [
-        "/System/Library/Fonts/Supplemental/Arial Bold.ttf",
+        "/System/Library/Fonts/Supplemental/Helvetica.ttc",
+        "/System/Library/Fonts/HelveticaNeue.ttc",
+        "/System/Library/Fonts/SFNS.ttf",
         "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf",
+        "/usr/share/fonts/truetype/noto/NotoSans-Bold.ttf",
+        "C:/Windows/Fonts/segoeuib.ttf",
         "C:/Windows/Fonts/arialbd.ttf",
+        "/System/Library/Fonts/Supplemental/Arial Bold.ttf",
     ],
     "regular": [
-        "/System/Library/Fonts/Supplemental/Arial.ttf",
+        "/System/Library/Fonts/Supplemental/Helvetica.ttc",
+        "/System/Library/Fonts/HelveticaNeue.ttc",
+        "/System/Library/Fonts/SFNS.ttf",
         "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf",
+        "/usr/share/fonts/truetype/noto/NotoSans-Regular.ttf",
+        "C:/Windows/Fonts/segoeui.ttf",
         "C:/Windows/Fonts/arial.ttf",
+        "/System/Library/Fonts/Supplemental/Arial.ttf",
     ],
 }
+# Characters the reel must be able to draw. ₹ is not optional for an Indian
+# product, and a font that can't draw it is the wrong font however good it
+# looks — a box where the price should be is worse than a different typeface.
+_REQUIRED_GLYPHS = "₹"
+_FONT_CACHE: dict = {}
 
 
 class ReelError(Exception):
     pass
 
 
+def _has_glyphs(font, chars: str) -> bool:
+    """True when the font draws real glyphs for `chars`.
+
+    Detected by rendering against a private-use codepoint nothing defines: if
+    a character comes out byte-identical to that, it is the .notdef box.
+    Deliberately dependency-free — fontTools isn't guaranteed in a packaged
+    build, and this runs a handful of times per render.
+    """
+    try:
+        notdef = bytes(font.getmask("\ue000"))
+        return all(bytes(font.getmask(c)) != notdef for c in chars)
+    except Exception:
+        return True   # can't tell — don't reject a font over it
+
+
 def _font(weight: str, size: int):
     from PIL import ImageFont
+    key = (weight, size)
+    if key in _FONT_CACHE:
+        return _FONT_CACHE[key]
+    fallback = None
     for path in _FONT_CANDIDATES[weight]:
-        if os.path.exists(path):
-            try:
-                return ImageFont.truetype(path, size)
-            except Exception:
-                continue
-    return ImageFont.load_default()
+        if not os.path.exists(path):
+            continue
+        try:
+            # .ttc collections: index 1 is the bold face in Helvetica's.
+            index = 1 if (path.endswith(".ttc") and weight == "bold") else 0
+            f = ImageFont.truetype(path, size, index=index)
+        except Exception:
+            continue
+        if _has_glyphs(f, _REQUIRED_GLYPHS):
+            _FONT_CACHE[key] = f
+            return f
+        fallback = fallback or f
+    _FONT_CACHE[key] = fallback or ImageFont.load_default()
+    return _FONT_CACHE[key]
 
 
 def ffmpeg_path() -> str:
