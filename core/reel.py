@@ -31,6 +31,11 @@ import subprocess
 W, H, FPS = 1080, 1920, 30
 SAFE_X, SAFE_Y = 90, 130
 
+# Minimum type sizes for a 1080-wide frame. A phone is watched at arm's
+# length for under a second per scene, so anything below these reads as
+# decoration whatever it says — when in doubt the rule is larger, not smaller.
+T_HEADLINE, T_SUPPORT, T_LABEL = 84, 44, 32
+
 # Ordered by preference. The rupee sign is the deciding factor, not looks:
 # Arial ships no ₹ glyph on macOS or older Windows, so every price in an
 # Indian reel came out as a .notdef box. Helvetica and San Francisco carry it.
@@ -118,11 +123,60 @@ def ffmpeg_path() -> str:
 
 # ── easing & helpers ────────────────────────────────────────────────────────
 
+def cubic_bezier(x1: float, y1: float, x2: float, y2: float):
+    """A CSS `cubic-bezier(x1,y1,x2,y2)` curve as a plain function.
+
+    Same four control points a designer or a web animation would give you, so
+    a timing spec can be used as-is instead of being eyeballed. Solved with
+    Newton-Raphson and a bisection fallback, which is how browsers do it.
+    """
+    def bez(a, b, t):
+        return 3 * a * (1 - t) ** 2 * t + 3 * b * (1 - t) * t * t + t ** 3
+
+    def slope(a, b, t):
+        return (3 * a * (1 - 4 * t + 3 * t * t)
+                + 3 * b * (2 * t - 3 * t * t) + 3 * t * t)
+
+    def curve(t: float) -> float:
+        t = max(0.0, min(1.0, t))
+        if t in (0.0, 1.0) or (x1 == y1 and x2 == y2):
+            return t
+        u = t
+        for _ in range(8):                       # Newton-Raphson
+            err = bez(x1, x2, u) - t
+            if abs(err) < 1e-6:
+                return bez(y1, y2, u)
+            dv = slope(x1, x2, u)
+            if abs(dv) < 1e-6:
+                break
+            u -= err / dv
+        lo, hi, u = 0.0, 1.0, t                  # bisection fallback
+        for _ in range(20):
+            v = bez(x1, x2, u)
+            if abs(v - t) < 1e-6:
+                break
+            if v > t:
+                hi = u
+            else:
+                lo = u
+            u = (lo + hi) / 2
+        return bez(y1, y2, u)
+    return curve
+
+
+# The curves themselves, not the library that ships them. An entrance starts
+# fast and decelerates into place; an exit starts slow and accelerates away —
+# things arrive with momentum and leave with gravity.
+EASE_ENTER = cubic_bezier(0.16, 1.0, 0.3, 1.0)     # crisp, no overshoot
+EASE_INOUT = cubic_bezier(0.45, 0.0, 0.55, 1.0)    # editorial, symmetric
+EASE_POP = cubic_bezier(0.34, 1.56, 0.64, 1.0)     # settles past the target
+EASE_EXIT = cubic_bezier(0.55, 0.0, 1.0, 0.45)     # accelerates away
+
+
 def ease(t: float) -> float:
-    """Same curve as the Remotion prototype (a strong ease-out) so motion
-    feels deliberate rather than linear/robotic."""
-    t = max(0.0, min(1.0, t))
-    return 1 - pow(1 - t, 3)
+    """The default entrance curve. Everything that fades or rises into place
+    uses this, so the whole reel shares one sense of timing."""
+    return EASE_ENTER(t)
 
 
 def lerp(a: float, b: float, t: float) -> float:
@@ -333,7 +387,8 @@ def lower_third(draw, brand, y, heading, caption, frame, start):
         return
     dy = rise(frame, start, 60)
     x0, x1 = SAFE_X, W - SAFE_X
-    hf, cf = _font("bold", 58), _font("regular", 34)
+    hf = _fit(draw, heading, "bold", T_HEADLINE, x1 - x0 - 130, 52)
+    cf = _font("regular", T_SUPPORT)
     pad = 36
     cap_h = 0
     if caption:
@@ -385,7 +440,7 @@ def scene_statement(d, b, s, f):
         a = fade_in(f, len(lines) * 12 + 10)
         if a > 0:
             d.text((SAFE_X, y + len(lines) * 118 + 40 + rise(f, len(lines) * 12 + 10)),
-                   tail, font=_font("regular", 40), fill=blend(b.grey, b.bg, a))
+                   tail, font=_font("regular", T_SUPPORT), fill=blend(b.grey, b.bg, a))
 
 
 def scene_brand(d, b, s, f):
@@ -399,7 +454,7 @@ def scene_brand(d, b, s, f):
         dy = rise(f, 24)
         d.text((W // 2, 790 + dy), s.get("name", ""), font=_font("bold", 92),
                fill=blend(b.ink, b.bg, a), anchor="ma")
-        d.text((W // 2, 900 + dy), s.get("tagline", ""), font=_font("regular", 36),
+        d.text((W // 2, 900 + dy), s.get("tagline", ""), font=_font("regular", T_SUPPORT),
                fill=blend(b.grey, b.bg, a), anchor="ma")
     for i, item in enumerate(s.get("stack", [])):
         aa = fade_in(f, 46 + i * 9)
@@ -498,7 +553,7 @@ def scene_endcard(d, b, s, f):
     a3 = fade_in(f, 56)
     if a3 > 0 and s.get("contact"):
         d.text((W // 2, 1230 + rise(f, 56)), s["contact"],
-               font=_font("regular", 30), fill=blend(b.grey, b.bg, a3), anchor="ma")
+               font=_font("regular", T_LABEL + 2), fill=blend(b.grey, b.bg, a3), anchor="ma")
 
 
 def _fit(d, s: str, weight: str, size: int, max_width: int, floor: int = 22):
@@ -546,7 +601,7 @@ def scene_trend(d, b, s, f):
         a2 = fade_in(f, 10)
         if a2 > 0:
             d.text((SAFE_X, 610 + rise(f, 10)), s["subheading"],
-                   font=_font("regular", 34), fill=blend(b.grey, b.bg, a2))
+                   font=_font("regular", T_SUPPORT), fill=blend(b.grey, b.bg, a2))
 
     if len(pts) >= 2:
         vals = [v for _, v in pts]
@@ -585,9 +640,9 @@ def scene_trend(d, b, s, f):
         labels = [f"{prefix}{v:,.0f}{suffix}".replace(",", ",") for _, v in pts]
         # Every point labelled if the gaps allow it; otherwise the ends and the
         # peak, which is the whole story anyway.
-        vf = _font("bold", 34)
+        vf = _font("bold", 40)
         while (max(d.textlength(t, font=vf) for t in labels) > step - 18
-               and vf.size > 24):
+               and vf.size > T_LABEL):
             vf = _font("bold", vf.size - 2)
         sparse = max(d.textlength(t, font=vf) for t in labels) > step - 18
         keep = {0, n - 1, vals.index(hi)} if sparse else set(range(n))
@@ -622,14 +677,14 @@ def scene_trend(d, b, s, f):
                        fill=blend(b.ink if not last else b.deep, b.bg, aa),
                        anchor="ms")
             if label:
-                d.text((px, bottom + 22), label, font=_font("regular", 30),
+                d.text((px, bottom + 22), label, font=_font("regular", T_LABEL + 2),
                        fill=blend(b.grey, b.bg, aa), anchor="ma")
 
     note = s.get("note")
     if note:
         an = fade_in(f, 62)
         if an > 0:
-            text(d, (SAFE_X, 1380), note, _font("regular", 26),
+            text(d, (SAFE_X, 1380), note, _font("regular", T_LABEL),
                  blend(b.grey, b.bg, an), max_width=W - SAFE_X * 2, line_gap=6)
 
 
@@ -654,7 +709,7 @@ def scene_figure(d, b, s, f):
         a2 = fade_in(f, 22)
         if a2 > 0:
             text(d, (W // 2, 990 + rise(f, 22, 30)), label,
-                 _font("regular", 46), blend(b.ink, b.bg, a2), anchor="ma",
+                 _font("regular", T_SUPPORT + 4), blend(b.ink, b.bg, a2), anchor="ma",
                  max_width=W - SAFE_X * 2 - 80, line_gap=12)
 
     note = s.get("note")
@@ -663,7 +718,7 @@ def scene_figure(d, b, s, f):
         if a3 > 0:
             d.line([(W // 2 - 120, 1180), (W // 2 + 120, 1180)],
                    fill=blend(b.line, b.bg, a3), width=3)
-            text(d, (W // 2, 1220), note, _font("regular", 28),
+            text(d, (W // 2, 1220), note, _font("regular", T_LABEL),
                  blend(b.grey, b.bg, a3), anchor="ma",
                  max_width=W - SAFE_X * 2 - 60, line_gap=8)
 
@@ -702,7 +757,7 @@ def scene_list(d, b, s, f):
         at = fade_in(f, 18 + len(items) * 10 + 12)
         if at > 0:
             text(d, (SAFE_X, y + len(items) * 118 + 60), tail,
-                 _font("regular", 40), blend(b.grey, b.bg, at),
+                 _font("regular", T_SUPPORT), blend(b.grey, b.bg, at),
                  max_width=W - SAFE_X * 2, line_gap=10)
 
 
@@ -732,6 +787,53 @@ def wipe(d, b, f, length=12):
                 dot_max=20, progress=1.0, color=b.deep)
 
 
+# ── transitions ─────────────────────────────────────────────────────────────
+# A cut where both scenes play at once, not an effect painted over the start
+# of the new one. Costs real time — the reel is SHORTER than the sum of its
+# scenes by exactly the frames the transitions overlap.
+
+TRANSITION_FRAMES = 12
+
+
+def _transition_kind(prev_type: str, next_type: str) -> str:
+    """Which cut suits these two scenes.
+
+    Chosen from the scene types rather than at random, so the same spec always
+    renders the same video — and so a chart is never yanked onto the screen:
+    data needs a beat to be read, movement fights that.
+    """
+    if next_type in ("trend", "figure"):
+        # Never yank a chart or a headline number onto the screen — it needs a
+        # beat to be read, and movement fights that.
+        return "fade"
+    if next_type in ("statement", "list"):
+        # Two text scenes crossfading superimpose two headlines for the length
+        # of the cut, which reads as a mistake. Slide them past each other.
+        return "slide"
+    return "dots"
+
+
+def _mix(a, b, p: float, kind: str, brand):
+    """One composited frame p (0→1) of the way through a cut."""
+    from PIL import Image, ImageDraw
+    if kind == "fade":
+        return Image.blend(a, b, p)
+    if kind == "slide":
+        # The outgoing scene drifts up a fraction of the distance the incoming
+        # one travels — parallax, so the two read as depth rather than a swap.
+        out = Image.new("RGB", (W, H), brand.bg)
+        out.paste(a, (0, -int(H * 0.28 * p)))
+        out.paste(b, (0, int(H * (1 - p))))
+        return out
+    out = a.copy()
+    x = int(W * p)
+    if x > 0:
+        out.paste(b.crop((0, 0, x, H)), (0, 0))
+    dotted_wave(ImageDraw.Draw(out), brand, x - 260, H // 2 - 300, rows=14,
+                cols=8, cell=44, dot_max=20, progress=1.0, color=brand.deep)
+    return out
+
+
 # ── render ──────────────────────────────────────────────────────────────────
 
 def render(spec: dict, out_path: str, on_progress=None) -> str:
@@ -756,7 +858,16 @@ def render(spec: dict, out_path: str, on_progress=None) -> str:
             raise ReelError(f"Unknown scene type {kind!r}. "
                             f"Known: {', '.join(sorted(SCENES))}")
         plan.append((SCENES[kind], sc, int(round(float(sc.get("seconds", 4)) * fps))))
-    total = sum(n for _, _, n in plan)
+
+    # Each cut overlaps its two scenes, so the reel runs shorter than the sum
+    # of the requested seconds — capped at half of either neighbour so a short
+    # scene is never swallowed whole by its own transition.
+    cuts = []
+    for i in range(len(plan) - 1):
+        n = min(TRANSITION_FRAMES, plan[i][2] // 2, plan[i + 1][2] // 2)
+        cuts.append((n, _transition_kind(plan[i][1].get("type", ""),
+                                         plan[i + 1][1].get("type", ""))))
+    total = sum(n for _, _, n in plan) - sum(n for n, _ in cuts)
 
     os.makedirs(os.path.dirname(os.path.abspath(out_path)) or ".", exist_ok=True)
     cmd = [exe, "-y", "-loglevel", "error",
@@ -766,18 +877,32 @@ def render(spec: dict, out_path: str, on_progress=None) -> str:
            "-pix_fmt", "yuv420p", "-movflags", "+faststart", out_path]
     proc = subprocess.Popen(cmd, stdin=subprocess.PIPE, stderr=subprocess.PIPE)
 
+    def paint(fn, sc, f):
+        img = Image.new("RGB", (W, H), brand.bg)
+        fn(ImageDraw.Draw(img), brand, sc, f)
+        return img
+
     done = 0
     try:
-        for fn, sc, count in plan:
-            for f in range(count):
-                img = Image.new("RGB", (W, H), brand.bg)
-                d = ImageDraw.Draw(img)
-                fn(d, brand, sc, f)
-                wipe(d, brand, f)
-                proc.stdin.write(img.tobytes())
+        for i, (fn, sc, count) in enumerate(plan):
+            # Frames at the head were already played inside the previous cut.
+            head = cuts[i - 1][0] if i else 0
+            tail, kind = cuts[i] if i < len(cuts) else (0, "")
+            for f in range(head, count - tail):
+                proc.stdin.write(paint(fn, sc, f).tobytes())
                 done += 1
                 if on_progress and done % fps == 0:
                     on_progress(done, total)
+            if tail:
+                nfn, nsc, _ = plan[i + 1]
+                for k in range(tail):
+                    p = EASE_INOUT((k + 1) / tail)
+                    frame = _mix(paint(fn, sc, count - tail + k),
+                                 paint(nfn, nsc, k), p, kind, brand)
+                    proc.stdin.write(frame.tobytes())
+                    done += 1
+                    if on_progress and done % fps == 0:
+                        on_progress(done, total)
         proc.stdin.close()
     except BrokenPipeError:
         err = proc.stderr.read().decode("utf-8", "ignore")
