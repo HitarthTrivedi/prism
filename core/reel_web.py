@@ -284,6 +284,29 @@ def missing_assets(spec: dict) -> list[str]:
     return sorted(used - have)
 
 
+def brand_faults(spec: dict) -> list[str]:
+    """Did the design actually use the client's colours?
+
+    Passing --accent into the page guarantees it is available, not that it is
+    used — and an art director handed a green company will cheerfully return
+    a blue reel. Measuring the colours and then not checking they survived
+    was the gap between "Prism matches your brand" and Prism actually doing
+    it.
+    """
+    brand = spec.get("brand") or {}
+    accent = str(brand.get("accent", "")).strip().lower()
+    if not accent:
+        return []
+    blob = (str((spec.get("design") or {}).get("css", "")) + " " +
+            " ".join(str(sc.get("html", "")) for sc in spec.get("scenes") or [])
+            ).lower()
+    if "var(--accent" in blob.replace(" ", "") or accent in blob:
+        return []
+    return [f"the client's accent colour {accent} appears nowhere in the "
+            "design — use var(--accent) for the element the eye goes to first "
+            "in each scene, or the reel is not in their colours"]
+
+
 def _drop_missing(text: str) -> str:
     """Remove what points at artwork that does not exist.
 
@@ -367,8 +390,13 @@ def render(spec: dict, out_path: str, on_progress=None,
     exe = ffmpeg_path()
 
     os.makedirs(os.path.dirname(os.path.abspath(out_path)) or ".", exist_ok=True)
+    # JPEG, not PNG, and it is not a close call. Measured on a real design:
+    # seeking the page costs 1 ms a frame, PNG-encoding it costs 303, JPEG at
+    # quality 95 costs 41. PNG was ~85% of the total render time, spent
+    # losslessly compressing a frame that is about to be thrown through H.264
+    # anyway — where the difference is invisible.
     cmd = [exe, "-y", "-loglevel", "error",
-           "-f", "image2pipe", "-framerate", str(fps), "-i", "-",
+           "-f", "image2pipe", "-c:v", "mjpeg", "-framerate", str(fps), "-i", "-",
            "-c:v", "libx264", "-preset", "medium", "-crf", "19",
            "-pix_fmt", "yuv420p", "-movflags", "+faststart", out_path]
 
@@ -406,7 +434,7 @@ def render(spec: dict, out_path: str, on_progress=None,
             try:
                 for f in range(total):
                     page.evaluate("t => window.__seek(t)", f * 1000.0 / fps)
-                    proc.stdin.write(page.screenshot(type="png"))
+                    proc.stdin.write(page.screenshot(type="jpeg", quality=95))
                     if on_progress and (f + 1) % fps == 0:
                         on_progress(f + 1, total)
                 proc.stdin.close()
@@ -461,6 +489,7 @@ def inspect(spec: dict, at: float = 0.75) -> list[str]:
         have = ", ".join((spec.get("_assets") or {}).keys()) or "none at all"
         faults.insert(0, f'the design uses "asset:{name}", which does not '
                           f'exist — the artwork available is: {have}')
+    faults[:0] = brand_faults(spec)
     return faults
 
 
@@ -593,11 +622,19 @@ def design_instructions(brand: dict | None = None, request: str = "",
     brand = brand or {}
     swatch = ""
     if brand:
-        swatch = ("\n\nThe client's own colours, measured from their artwork "
-                  "(available as CSS variables --accent, --deep, --ink, --bg): "
-                  + ", ".join(f"{k} {v}" for k, v in brand.items()) +
-                  ". Build the palette around these — they are the only part "
-                  "of the design that is not yours to choose.")
+        accent = brand.get("accent", "")
+        swatch = (
+            "\n\nTHE CLIENT'S COLOURS — measured from their own artwork, not "
+            "guessed: " + ", ".join(f"{k} {v}" for k, v in brand.items()) +
+            ".\nThese are already set as CSS variables (--accent, --deep, "
+            "--ink, --bg) and they are the ONE part of this design that is "
+            "not yours to choose. Whatever palette you build, the accent "
+            f"colour must be theirs: use var(--accent){f' ({accent})' if accent else ''} "
+            "for the element the eye goes to first in each scene — the "
+            "kicker, the rule, the figure, the active state. A reel in a "
+            "colour the client does not own is not their reel, however good "
+            "it looks, and the design is checked for this before it is "
+            "filmed.")
     return (
         "OUTPUT FORMAT — THIS OVERRIDES EVERY OTHER FORMATTING INSTRUCTION, "
         "INCLUDING ANY RULE ASKING FOR A HANDOFF OR A SUMMARY. Reply with "
