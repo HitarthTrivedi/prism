@@ -272,6 +272,41 @@ def _place_assets(text: str, uris: dict) -> str:
     return text
 
 
+def missing_assets(spec: dict) -> list[str]:
+    """Asset names the design asks for that were never made."""
+    import re
+    have = set((spec.get("_assets") or {}).keys())
+    used = set()
+    blobs = [(spec.get("design") or {}).get("css", "")]
+    blobs += [sc.get("html", "") for sc in (spec.get("scenes") or [])]
+    for blob in blobs:
+        used.update(re.findall(r"asset:([A-Za-z0-9_-]+)", str(blob)))
+    return sorted(used - have)
+
+
+def _drop_missing(text: str) -> str:
+    """Remove what points at artwork that does not exist.
+
+    Asked-for-but-absent assets are stripped rather than left in place,
+    because an unresolved src renders as a broken-image glyph and an
+    unresolved url() renders as a blank box — both of which end up in the
+    finished video. A missing picture should leave no trace, not a hole with
+    an icon in it.
+    """
+    import re
+    if "asset:" not in text:
+        return text
+    # Whole elements whose source is missing.
+    text = re.sub(r"<(img|image|picture|video)\b[^>]*\basset:[^>]*?>", "",
+                  text, flags=re.I)
+    # A missing background is simply no background.
+    text = re.sub(r"url\(\s*['\"]?asset:[A-Za-z0-9_-]+['\"]?\s*\)", "none",
+                  text, flags=re.I)
+    # Anything left is an attribute we do not know; empty it.
+    text = re.sub(r"asset:[A-Za-z0-9_-]+", "", text)
+    return text
+
+
 def build_html(spec: dict, fps: int = DEFAULT_FPS) -> str:
     """The whole reel as one self-contained page.
 
@@ -297,7 +332,7 @@ def build_html(spec: dict, fps: int = DEFAULT_FPS) -> str:
     uris = _asset_uris(spec.get("_assets") or {})
     body = []
     for i, sc in enumerate(scenes):
-        html = _place_assets(sc.get("html") or "", uris)
+        html = _drop_missing(_place_assets(sc.get("html") or "", uris))
         body.append(f'<section class="scene" id="s{i}" '
                     f'data-type="{sc.get("type", "")}">{html}</section>')
 
@@ -306,7 +341,7 @@ def build_html(spec: dict, fps: int = DEFAULT_FPS) -> str:
         f"{fonts}"
         f"<style>{_HARNESS_CSS}</style>"
         f"<style>:root{{{root_vars}}}</style>"
-        f"<style>{_place_assets(design.get('css', ''), uris)}</style>"
+        f"<style>{_drop_missing(_place_assets(design.get('css', ''), uris))}</style>"
         "</head><body>"
         f"<div id='stage'>{''.join(body)}</div>"
         f"<script>{_HARNESS_JS % json.dumps(plan)}</script>"
@@ -418,6 +453,14 @@ def inspect(spec: dict, at: float = 0.75) -> list[str]:
                         faults.append(fault)
         finally:
             browser.close()
+
+    # Reported even though the renderer strips them: the design asked for a
+    # picture that was never made, and the scene it planned around it is now
+    # emptier than intended. That is worth one correction.
+    for name in missing_assets(spec):
+        have = ", ".join((spec.get("_assets") or {}).keys()) or "none at all"
+        faults.insert(0, f'the design uses "asset:{name}", which does not '
+                          f'exist — the artwork available is: {have}')
     return faults
 
 
@@ -502,30 +545,37 @@ def imagery_instructions(request: str, has_own_artwork: bool = False,
         "anything: what they actually sell, what their existing branding "
         "looks like, their colours, the physical things their work involves. "
         "Do not guess from the name.\n\n"
-        f"STEP 2 — GENERATE AT MOST {MAX_GENERATED} IMAGES. Not four, not a "
-        "sheet of variations — at most three separate images, each one thing:\n"
-        + ("  · NO logo. The client's real mark was supplied and is already "
-           "in hand; anything you draw would be a lookalike and would be "
-           "thrown away.\n"
+        f"STEP 2 — GENERATE EXACTLY {MAX_GENERATED} SEPARATE IMAGES.\n"
+        f"  · {MAX_GENERATED} DIFFERENT IMAGE FILES. Run the image tool "
+        f"{MAX_GENERATED} times, once per subject.\n"
+        "  · NOT one image containing several things. No grid, no sheet, no "
+        "collage, no side-by-side comparison, no 'here are three options' "
+        "layout, no mockup board. A single image with three subjects in it "
+        "is a failed result and is discarded.\n"
+        "  · Each image is ONE subject, centred, with room around it.\n\n"
+        "WHAT THE THREE ARE:\n"
+        + ("  1. NO logo — the client's real mark was supplied and is already "
+           "in hand, so anything you draw would be a lookalike and would be "
+           "thrown away. Make three SUBJECT images instead.\n"
            if has_own_artwork else
-           "  · one wordmark or emblem for the company, in the spirit of what "
-           "your search found — their colours, their industry. Plain "
-           "lettering on its own is better than a clumsy icon.\n")
-        + "  · one or two images of the SUBJECT of their business — the "
-        "actual equipment, produce, or material. A seed company wants seed "
-        "and crop; an IT firm wants racks, cabling, cameras; a workshop "
-        "wants its machines.\n\n"
+           "  1. A wordmark or emblem for the company, in the spirit of what "
+           "your search found — their colours, their industry. The company "
+           "name must be spelled EXACTLY as it is written above; check it "
+           "character by character before you finish.\n")
+        + "  2-3. The SUBJECT of their business — the actual equipment, "
+        "produce or material. A seed company wants seed, crop, a field; an "
+        "IT firm wants racks, cabling, cameras; a workshop wants its "
+        "machines.\n\n"
         "EVERY IMAGE MUST:\n"
-        "  · be on a PLAIN, FLAT background — a single solid colour, no "
-        "gradient, no scene, no shadow spilling onto it. Say 'on a plain "
-        "white background' in the image prompt. The background is cut off "
-        "automatically afterwards, and that only works if it is flat.\n"
-        "  · contain NO text, no captions, no watermark, no letters other "
-        "than a wordmark if you were asked for one. Words are drawn by the "
-        "renderer in real type; generated lettering comes out misspelt.\n"
+        "  · have a TRANSPARENT background — a PNG with alpha, the subject "
+        "cut out and nothing behind it. No white card, no scene, no desk, no "
+        "drop shadow, no rounded panel. The reel places these on its own "
+        "background, so anything behind the subject shows up as a rectangle "
+        "stuck in the middle of the frame. If transparency is genuinely not "
+        "possible, use ONE flat solid colour and nothing else — that can be "
+        "removed afterwards; a gradient or a scene cannot.\n"
         "  · contain no people and no faces.\n"
-        "  · be square or portrait, and one subject per image, centred, with "
-        "room around it.\n\n"
+        "  · be square or portrait.\n\n"
         f"WHAT THE REEL IS ABOUT:\n{request}\n\n"
         + (f"WHAT RESEARCH ALREADY FOUND:\n{research[:1500]}\n\n"
            if research.strip() else "")
@@ -564,19 +614,28 @@ def design_instructions(brand: dict | None = None, request: str = "",
         "1080x1920 and filmed frame by frame, so ordinary CSS is what you "
         "have — gradients, grid, flexbox, clip-path, masks, filters, SVG, "
         "pseudo-elements, web fonts.\n\n"
-        + (("ASSETS ON HAND — the client's own artwork, already prepared:\n"
+        + (("ARTWORK ON HAND — this is the complete list:\n"
             + assets +
             "\n\nUse them by name, exactly like a URL: "
             '<img src="asset:logo" alt=""> or '
-            "background-image: url(asset:logo). The names above are the only "
-            "ones that exist; anything else resolves to nothing. Put the logo "
-            "where a logo belongs — the endcard at least — and size it in CSS "
-            "rather than relying on its pixel dimensions. Never redraw or "
-            "approximate a mark you have been given: it is the client's real "
-            "one, and a lookalike is worse than none.\n\n")
+            "background-image: url(asset:logo).\n"
+            "· THOSE NAMES ARE THE ONLY ONES THAT EXIST. Referring to any "
+            "other — asset:art2 when only asset:art1 is listed, asset:photo, "
+            "asset:bg — leaves a hole in the frame. Count the list above and "
+            "use only what is on it.\n"
+            "· Every scene does not need a picture. A scene with none must "
+            "still look finished: fill it with the background, type and "
+            "colour rather than leaving a gap where an image would have been. "
+            "An empty rectangle reads as a bug; deliberate space does not.\n"
+            "· Put the logo where a logo belongs — the endcard at least — and "
+            "size it in CSS rather than trusting its pixel dimensions.\n"
+            "· Never redraw or approximate a mark you have been given.\n\n")
            if assets else
-           "No client artwork was supplied, so build the reel from type, "
-           "colour and shape alone. Do not invent a logo.\n\n")
+           "NO ARTWORK IS AVAILABLE — not one image. Build the entire reel "
+           "from type, colour, shape and motion, and make that look "
+           "deliberate. Do not reference asset:anything; every such reference "
+           "resolves to nothing and leaves a hole. Do not draw a logo out of "
+           "CSS boxes either — set the company name in good type instead.\n\n")
         + '{\n'
         '  "design": {\n'
         '    "name": "one line describing the look you chose",\n'
@@ -623,6 +682,55 @@ def design_instructions(brand: dict | None = None, request: str = "",
         "paper, a colour block, a fine rule system — and typography with a "
         "point of view. Do not default to white with a grid."
     )
+
+
+def script_drift(spec: dict, script_text: str) -> list[str]:
+    """Lines the script wrote that the design did not carry over.
+
+    Two agents, and the second is told not to change a word — but told is not
+    the same as prevented. Reported rather than blocked: sometimes the design
+    legitimately splits a headline across elements, so this is a flag for a
+    person, not a rule for a machine.
+    """
+    import json as _json
+    import re
+    if not script_text.strip():
+        return []
+    try:
+        from . import reel as _pillow
+        blocks = _pillow._blocks(script_text, "{", "}")
+        script = None
+        for b in blocks:
+            try:
+                got = _json.loads(b)
+            except Exception:
+                continue
+            if isinstance(got, dict) and got.get("scenes"):
+                script = got
+                break
+        if not script:
+            return []
+    except Exception:
+        return []
+
+    page = " ".join(str(sc.get("html", "")) for sc in (spec.get("scenes") or []))
+    page = re.sub(r"<[^>]+>", " ", page)
+    page = re.sub(r"\s+", " ", page).lower()
+
+    lost = []
+    for sc in script["scenes"]:
+        for key in ("headline", "support"):
+            line = str(sc.get(key, "")).strip()
+            if len(line) < 12:
+                continue
+            words = [w for w in re.findall(r"[a-z0-9₹%.]+", line.lower())
+                     if len(w) > 3]
+            if not words:
+                continue
+            hits = sum(1 for w in words if w in page)
+            if hits < max(1, len(words) // 2):
+                lost.append(line[:60])
+    return lost
 
 
 def parse_spec(text: str) -> dict:

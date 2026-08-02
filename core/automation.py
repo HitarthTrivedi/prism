@@ -1349,6 +1349,14 @@ def run(routing: dict, cfg: dict, attachments=None, on_event=None,
                         if not faults:
                             if cand is not None:
                                 ui.ok("   design lays out clean at 1080x1920")
+                                # Told not to change a word is not the same as
+                                # prevented. Flagged, not blocked: a design may
+                                # legitimately split a headline across elements.
+                                script_txt = "\n".join(
+                                    all_responses.get(script_stage) or [])
+                                for line in _web.script_drift(cand, script_txt)[:4]:
+                                    ui.warn(f'   the design dropped or reworded: '
+                                            f'"{line}"')
                             break
                         if attempt:
                             ui.err("   still not laying out — filming it "
