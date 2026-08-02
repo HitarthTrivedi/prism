@@ -487,6 +487,48 @@ def _smart_wait(driver, agent_cfg, cap: int, poll: int = 5,
     return int(time.time() - start), settled
 
 
+def _wait_for_images(driver, agent_cfg, want: int, cap: int = 240) -> int:
+    """Wait for generated images to actually appear, then stop growing.
+
+    _smart_wait watches TEXT, and during image generation the text is finished
+    long before the pictures are — the model says "here are three images" and
+    then renders for another minute. Waiting on text alone scrapes the page
+    while every canvas is still empty, which looks exactly like a stage that
+    produced nothing.
+    """
+    sel = agent_cfg.get("response_selector", "")
+    js = """
+        const sel = arguments[0];
+        const scope = sel ? document.querySelectorAll(sel) : [document.body];
+        let n = 0;
+        for (const el of scope) {
+          for (const img of el.querySelectorAll('img')) {
+            if ((img.naturalWidth || 0) >= 256 && (img.naturalHeight || 0) >= 256)
+              n++;
+          }
+        }
+        return n;
+    """
+    start, last, steady = time.time(), 0, 0
+    while time.time() - start < cap:
+        time.sleep(4)
+        try:
+            n = int(driver.execute_script(js, sel) or 0)
+        except Exception:
+            continue
+        if n > last:
+            last, steady = n, 0
+            ui.info(f"   🖼️   {n} image(s) so far…")
+            if n >= want:
+                steady = 0
+        elif last:
+            steady += 4
+            # Two images that have been sitting there for 20s are all there is.
+            if steady >= 20:
+                break
+    return last
+
+
 def _click_by_text(driver, texts: list[str], timeout: int = 10) -> bool:
     """Best-effort: click the first visible, clickable element whose text
     matches one of `texts` (case-insensitive, substring). NotebookLM's UI
@@ -1259,6 +1301,22 @@ def run(routing: dict, cfg: dict, attachments=None, on_event=None,
                     timed_out = True
                     ui.warn(f"still generating after {took}s — scraping what "
                             f"is on the page and keeping the link")
+
+                if stage == "artwork":
+                    # The images are the deliverable here, not the text, so
+                    # this stage gets its own budget ON TOP of the agent's —
+                    # long only where it needs to be, rather than making every
+                    # ChatGPT stage in the pipeline wait like an image render.
+                    from . import reel_web as _rw
+                    ui.info("   ⏳  waiting for the pictures to finish "
+                            "rendering (up to 5 more minutes)…")
+                    got = _wait_for_images(driver, agent_cfg,
+                                           _rw.MAX_GENERATED, cap=300)
+                    if got:
+                        timed_out = False
+                    else:
+                        ui.warn("   no images appeared — the reel will be "
+                                "type and colour only")
 
                 texts = _capture(driver, agent_cfg)
                 if not texts:
