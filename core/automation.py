@@ -1038,6 +1038,13 @@ def run(routing: dict, cfg: dict, attachments=None, on_event=None,
                      None)
     design_feeder = None
     script_stage = ""
+    # Stages whose reply is READ BY A PROGRAM, not handed to another chat.
+    # The pipeline's normal rules demand a prose "HANDOFF FOR <next agent>"
+    # section as the last thing in the answer, which flatly contradicts "reply
+    # with only a JSON object" — and a model that spots the contradiction
+    # refuses outright rather than picking one. Each entry here replaces those
+    # rules for that stage.
+    machine_stages: dict[int, str] = {}
     if studio_at is not None:
         writer = next((i for i in range(studio_at - 1, -1, -1)
                        if not (A.resolve_agent("", stages[i][1]) or {}).get("local")),
@@ -1084,6 +1091,14 @@ def run(routing: dict, cfg: dict, attachments=None, on_event=None,
             if cfg.get("reel_imagery", True) and A.resolve_agent("visual", maker):
                 stages.insert(studio_at, ("artwork", maker, [
                     _web.imagery_instructions(query, bool(asset_list))]))
+                machine_stages[studio_at] = (
+                    "\n\nSTRICT PIPELINE RULES:\n"
+                    "The images themselves are collected from this page "
+                    "automatically — they ARE the deliverable. Produce them, "
+                    "then write one short line per image saying what it is. "
+                    "Do NOT add a handoff section, a summary, an explanation "
+                    "or a follow-up question; nothing but the images and "
+                    "those lines is read.")
                 studio_at += 1
                 ui.info(f"🖼️   {maker} will search the web and make up to "
                         f"{_web.MAX_GENERATED} images for it")
@@ -1100,6 +1115,20 @@ def run(routing: dict, cfg: dict, attachments=None, on_event=None,
             studio_at += 1
             design_feeder = studio_at - 1
             script_stage = stages[writer][0]
+            json_only = (
+                "\n\nSTRICT PIPELINE RULES:\n"
+                "Your answer is parsed by a program, not read by a person. "
+                "Obey the OUTPUT FORMAT block above exactly: the whole reply "
+                "is one JSON object and nothing else. Do NOT add a handoff "
+                "section, a summary, an explanation or a follow-up question. "
+                "If any earlier instruction asked for one, it does not apply "
+                "here — this is the only formatting rule that counts.")
+            # Both the writer and the art director answer in JSON, so both are
+            # exempt from the handoff rules, not just the one nearest the
+            # renderer. Missing the writer is what made it pad its JSON with
+            # commentary; missing the art director made it refuse outright.
+            machine_stages[writer] = json_only
+            machine_stages[design_feeder] = json_only
             ui.info(f"🎬  {stages[studio_at][1]} films the page — {an} writes "
                     f"the script, {director} art-directs it")
 
@@ -1222,6 +1251,14 @@ def run(routing: dict, cfg: dict, attachments=None, on_event=None,
                     f"uploaded to this chat: {names}. Use them as assets in "
                     "what you produce — do not recreate them from scratch.\n\n"
                 )
+            # The art director is handed the script verbatim further down, so
+            # the relay's "here is the previous stage" block adds nothing it
+            # needs — and the stage immediately before it is the image maker,
+            # whose text is chatter about the pictures. Forwarding that as the
+            # brief is how a design ends up answering the wrong question.
+            if stage_idx == design_feeder:
+                prior = []
+
             if prior:
                 prev_stage, prev_texts = prior[-1]
                 prev_text = "\n\n".join(t for t in prev_texts if t.strip())
@@ -1242,7 +1279,9 @@ def run(routing: dict, cfg: dict, attachments=None, on_event=None,
             # a JSON object", and a model resolving that contradiction writes
             # the handoff and drops the spec. That is exactly how a run ends up
             # with nothing to render.
-            if stage_idx == spec_feeder:
+            if stage_idx in machine_stages:
+                handoff = machine_stages[stage_idx]
+            elif stage_idx == spec_feeder:
                 handoff = (
                     "\n\nSTRICT PIPELINE RULES:\n"
                     "Your answer is consumed by a renderer, not by another "

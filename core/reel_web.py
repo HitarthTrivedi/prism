@@ -645,10 +645,16 @@ def design_instructions(brand: dict | None = None, request: str = "",
         '  },\n'
         '  "scenes": [\n'
         '    {"type": "hook", "seconds": 4.5,\n'
-        '     "html": "<div class=\\"grow\\"><div class=\\"kicker\\">FY 2026</div>'
+        '     "html": "<div class=\'grow\'><div class=\'kicker\'>FY 2026</div>'
         '<h1>A season that held its promise.</h1></div>"}\n'
         '  ]\n'
         '}\n\n'
+        "HTML ATTRIBUTES MUST USE SINGLE QUOTES — <div class='content'> and "
+        "<img src='asset:logo' alt=''>. Your markup lives inside a JSON "
+        "string, so a double quote in it has to be escaped, and an unescaped "
+        "one makes the whole reply unparseable. Single quotes are valid HTML "
+        "and sidestep the problem entirely. This is the single most common "
+        "way this stage fails.\n\n"
         "HOW MOTION WORKS — read this, it is the one unusual part:\n"
         "· Write ordinary CSS @keyframes and animation declarations. The "
         "renderer PAUSES the page and sets each animation's time by hand for "
@@ -733,6 +739,23 @@ def script_drift(spec: dict, script_text: str) -> list[str]:
     return lost
 
 
+def _fix_markup_quotes(block: str) -> str:
+    """Escape the double quotes an art director left raw inside its markup.
+
+    A design is JSON whose values are HTML, and the reply that comes back very
+    often contains  "html": "<div class="content">…"  — valid HTML, invalid
+    JSON, and the whole design lost over punctuation. The prompt asks for
+    single quotes; this is what happens when it doesn't get them.
+
+    Only quotes that look like HTML attributes are touched: `="` and the `"`
+    that closes it. A quote that is genuinely ending a JSON string is followed
+    by a comma, brace or colon, and is left alone.
+    """
+    import re
+    return re.sub(r'=\\?"([^"\\]*?)\\?"(?=[\s>/])',
+                  lambda m: "='" + m.group(1) + "'", block)
+
+
 def parse_spec(text: str) -> dict:
     """Pull the design/scene JSON out of an agent's reply — same balanced-brace
     scan as the Pillow renderer, since scrapes carry fences and preambles."""
@@ -741,7 +764,9 @@ def parse_spec(text: str) -> dict:
         raise ReelError("The agent returned nothing to render.")
     spec = None
     for block in _pillow._blocks(text, "{", "}"):
-        for candidate in (block, _pillow._loosen(block)):
+        for candidate in (block, _fix_markup_quotes(block),
+                          _pillow._loosen(block),
+                          _fix_markup_quotes(_pillow._loosen(block))):
             try:
                 got = json.loads(candidate)
             except Exception:
