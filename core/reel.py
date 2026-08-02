@@ -541,8 +541,14 @@ def spec_instructions() -> str:
     running order; this module decides the pixels — so the layout can never
     be broken by a model having an off day."""
     return (
-        "Reply with ONLY a JSON object describing the reel. No commentary, no "
-        "markdown fences. Shape:\n"
+        "OUTPUT FORMAT — THIS OVERRIDES EVERY OTHER FORMATTING INSTRUCTION "
+        "YOU HAVE BEEN GIVEN, INCLUDING ANY RULE ASKING FOR A HANDOFF, A "
+        "SUMMARY OR A PLAN:\n"
+        "Your reply is read by a program, not a person. Reply with ONLY a "
+        "JSON object describing the reel — no preamble, no commentary, no "
+        "handoff section, no markdown fences. Do NOT describe the JSON you "
+        "would write; write it. The first character of your reply must be "
+        "'{' and the last must be '}'. Shape:\n"
         '{\n'
         '  "fps": 30,\n'
         '  "brand": {"accent": "#68C04F", "deep": "#4B8A5D"},\n'
@@ -628,26 +634,107 @@ def sample_brand(image_paths: list[str]) -> dict:
     return out
 
 
+def has_spec(text: str) -> bool:
+    """Cheap check for 'this reply contains something renderable'. Used to
+    decide whether a stage needs asking again — never raises."""
+    try:
+        parse_spec(text)
+        return True
+    except Exception:
+        return False
+
+
+def _blocks(text: str, open_ch: str, close_ch: str) -> list[str]:
+    """Every balanced {...} (or [...]) run in the text, LAST one first.
+
+    Brace counting, not find/rfind: a reply that says "₹{amount}" before the
+    spec, or adds a note after it, used to make the naive outermost slice span
+    prose and fail as JSON. String-aware so a brace inside a headline doesn't
+    throw the depth off. Last block first because an agent that explains
+    itself and THEN emits the spec is the common case.
+    """
+    out, depth, start = [], 0, -1
+    in_str = esc = False
+    for i, ch in enumerate(text):
+        if in_str:
+            if esc:
+                esc = False
+            elif ch == "\\":
+                esc = True
+            elif ch == '"':
+                in_str = False
+            continue
+        if ch == '"':
+            in_str = True
+        elif ch == open_ch:
+            if depth == 0:
+                start = i
+            depth += 1
+        elif ch == close_ch and depth:
+            depth -= 1
+            if depth == 0:
+                out.append(text[start:i + 1])
+    return list(reversed(out))
+
+
+def _loosen(block: str) -> str:
+    """Last-resort repair of the JSON faults models actually make: trailing
+    commas, // comments, and curly quotes used as delimiters. Only ever tried
+    AFTER a strict parse has failed, so it can never corrupt valid JSON."""
+    import re
+    block = re.sub(r"(?m)^\s*//.*$", "", block)
+    block = block.replace("“", '"').replace("”", '"')
+    block = re.sub(r",\s*([}\]])", r"\1", block)
+    return block
+
+
 def parse_spec(text: str) -> dict:
     """Pull the scene spec out of an agent's reply.
 
-    Scrapes carry markdown fences, a preamble, sometimes a trailing note — so
-    take the outermost {...} rather than trusting the whole response to be
-    clean JSON.
+    Scrapes carry markdown fences, a preamble, sometimes a trailing note, and
+    sometimes the concatenated output of several stages — so hunt for the
+    outermost balanced block that actually looks like a spec rather than
+    trusting the whole response to be clean JSON.
     """
     import json
     if not text or not text.strip():
         raise ReelError("The agent returned nothing to render.")
-    s = text.strip()
-    start, end = s.find("{"), s.rfind("}")
-    if start == -1 or end <= start:
+
+    spec, bad_json = None, None
+    for block in _blocks(text, "{", "}"):
+        for candidate in (block, _loosen(block)):
+            try:
+                got = json.loads(candidate)
+            except Exception as e:
+                bad_json = bad_json or e
+                continue
+            if isinstance(got, dict) and isinstance(got.get("scenes"), list) \
+                    and got["scenes"]:
+                spec = got
+                break
+        if spec:
+            break
+
+    # Some replies drop the wrapper and hand over the scene list on its own.
+    if spec is None:
+        for block in _blocks(text, "[", "]"):
+            for candidate in (block, _loosen(block)):
+                try:
+                    got = json.loads(candidate)
+                except Exception:
+                    continue
+                if isinstance(got, list) and got and all(
+                        isinstance(x, dict) and "type" in x for x in got):
+                    spec = {"scenes": got}
+                    break
+            if spec:
+                break
+
+    if spec is None:
+        if bad_json:
+            raise ReelError(f"The scene spec isn't valid JSON: {bad_json}")
         raise ReelError("No JSON scene spec found in the agent's reply.")
-    try:
-        spec = json.loads(s[start:end + 1])
-    except Exception as e:
-        raise ReelError(f"The scene spec isn't valid JSON: {e}")
-    if not isinstance(spec.get("scenes"), list) or not spec["scenes"]:
-        raise ReelError("The scene spec has no scenes.")
+
     # Drop anything the renderer can't draw rather than failing the whole run.
     clean, dropped = [], []
     for sc in spec["scenes"]:

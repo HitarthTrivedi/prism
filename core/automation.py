@@ -395,6 +395,7 @@ _PROMPT_ECHO_MARKERS = (
     "strict pipeline rules:",
     "your only task is:",
     "reply with nothing except",
+    "reply with only a json object describing the reel",
     "<one subject line>",
     "<the full email body>",
     "your output will be passed directly to",
@@ -606,8 +607,79 @@ def _run_notebooklm(driver, agent_cfg: dict, stage: str, prompt: str) -> list[st
                 f"still be usable manually from here."]
 
 
-def _run_local(kind: str, prior_text: str, attachments, cfg: dict, stage: str):
+def _capture(driver, agent_cfg: dict) -> list[str]:
+    """Everything on the page that reads as a reply, longest captures only."""
+    from selenium.webdriver.common.by import By
+    try:
+        elements = driver.find_elements(
+            By.CSS_SELECTOR, agent_cfg.get("response_selector", ""))
+    except Exception:
+        return []
+    texts = []
+    for el in elements:
+        try:
+            t = el.text.strip()
+        except Exception:
+            continue
+        if len(t) > 50 and t not in texts:
+            texts.append(t)
+    # Response selectors often match a container AND pieces inside it
+    # (sections, citation chips…). Keep only the fullest captures: drop any
+    # text that is contained inside another element's text.
+    texts = [t for t in texts if not any(t != u and t in u for u in texts)]
+    # Several tools render OUR message with the same classes as the reply, so
+    # the prompt comes back as a "response" — which then gets forwarded
+    # downstream, or (for /email) parsed as a draft whose subject is the
+    # template we typed.
+    echoes = [t for t in texts if _is_prompt_echo(t)]
+    if echoes:
+        texts = [t for t in texts if t not in echoes]
+        ui.info(f"   ↩️   ignored {len(echoes)} echo(es) of our own prompt")
+    return texts
+
+
+def _reask(driver, agent_cfg: dict, prompt: str, expect: str = "") -> list[str]:
+    """Send one follow-up in the SAME tab and re-scrape.
+
+    Used when a stage answered but not in the shape the next stage needs. The
+    chat still holds everything it just wrote, so a one-line correction is far
+    cheaper — and far likelier to work — than failing the run or starting the
+    stage over."""
+    from selenium.webdriver.common.by import By
+    from selenium.webdriver.common.keys import Keys
+    from selenium.webdriver.support.ui import WebDriverWait
+    from selenium.webdriver.support import expected_conditions as EC
+    try:
+        box = WebDriverWait(driver, agent_cfg.get("input_wait", 15)).until(
+            EC.presence_of_element_located(
+                (By.CSS_SELECTOR, agent_cfg["textarea_selector"])))
+        if not _fast_type(driver, box, _bmp_safe(prompt)):
+            box.send_keys(_bmp_safe(prompt).replace("\n", " "))
+        time.sleep(1)
+        sel = agent_cfg.get("submit_selector", "")
+        clicked = False
+        if sel:
+            try:
+                WebDriverWait(driver, 5).until(
+                    EC.element_to_be_clickable((By.CSS_SELECTOR, sel))).click()
+                clicked = True
+            except Exception:
+                pass
+        if not clicked:
+            box.send_keys(Keys.ENTER)
+        _smart_wait(driver, agent_cfg, agent_cfg.get("wait_time", 60), expect=expect)
+        return _capture(driver, agent_cfg)
+    except Exception as e:
+        ui.err(f"   follow-up failed: {e}")
+        return []
+
+
+def _run_local(kind: str, prior_text, attachments, cfg: dict, stage: str):
     """Execute an agent that lives in Prism rather than in a browser.
+
+    prior_text is either a single string or the earlier stages' outputs,
+    newest first — each is tried in turn so one prose-heavy stage can't hide
+    the spec written by another.
 
     Returns (output_path, message). On failure the path is empty and the
     message explains what went wrong — a local stage must degrade the same
@@ -624,13 +696,20 @@ def _run_local(kind: str, prior_text: str, attachments, cfg: dict, stage: str):
     except Exception as e:
         return "", str(e)
 
-    try:
-        spec = reel.parse_spec(prior_text)
-    except Exception as e:
+    sources = [prior_text] if isinstance(prior_text, str) else list(prior_text)
+    spec, why = None, None
+    for text in sources:
+        try:
+            spec = reel.parse_spec(text)
+            break
+        except Exception as e:
+            why = why or e
+    if spec is None:
         # The writing stage produced prose instead of a scene spec. Say so
         # plainly — the fix is a routing one, not something to paper over.
-        return "", (f"{e} The stage before this one has to return the JSON "
-                    "scene spec for the renderer to draw.")
+        return "", (f"{why or 'Nothing was written for the renderer.'} The "
+                    "stage before this one has to return the JSON scene spec "
+                    "for the renderer to draw.")
 
     # Brand colour comes from the client's own artwork when they attached
     # any — measured, not described.
@@ -727,6 +806,7 @@ def run(routing: dict, cfg: dict, attachments=None, on_event=None,
     local_reel_at = next((i for i, (_, an, _) in enumerate(stages)
                           if (A.resolve_agent("", an) or {}).get("local") == "reel"),
                          None)
+    spec_feeder = None      # stage index that must answer in JSON, not prose
     if local_reel_at is not None:
         feeder = next((i for i in range(local_reel_at - 1, -1, -1)
                        if not (A.resolve_agent("", stages[i][1]) or {}).get("local")),
@@ -740,6 +820,7 @@ def run(routing: dict, cfg: dict, attachments=None, on_event=None,
                 st, an, qs = stages[feeder]
                 stages[feeder] = (st, an, qs[:-1] + [
                     qs[-1] + "\n\n" + _reel.spec_instructions()])
+                spec_feeder = feeder
                 ui.info(f"🎬  {stages[local_reel_at][1]} renders locally — "
                         f"{an} will write the scene spec for it")
             except Exception:
@@ -766,8 +847,11 @@ def run(routing: dict, cfg: dict, attachments=None, on_event=None,
         # A LOCAL agent runs inside Prism — no tab, no upload, no scrape. It
         # consumes the previous stage's text and produces a real file here.
         if agent_cfg.get("local"):
-            prior_text = "\n\n".join(
-                t for ts in all_responses.values() for t in ts if t.strip())
+            # Newest stage first, each kept separate: the spec comes from the
+            # stage right before this one, and merging every stage into one
+            # blob only gives the parser more prose to trip over.
+            prior_text = [t for ts in reversed(list(all_responses.values()))
+                          for t in ts if t.strip()]
             out, note = _run_local(agent_cfg["local"], prior_text, attachments,
                                    cfg, stage)
             if out:
@@ -846,7 +930,24 @@ def run(routing: dict, cfg: dict, attachments=None, on_event=None,
                     "Now continue the pipeline and complete the following:\n\n"
                 )
 
-            if stage_idx + 1 < len(stages):
+            # The stage feeding a LOCAL renderer is machine-read, so it gets
+            # the final-stage rules even though a stage follows it. The normal
+            # handoff rules below demand a prose "HANDOFF FOR …" section as the
+            # LAST thing in the answer — flatly contradicting "reply with only
+            # a JSON object", and a model resolving that contradiction writes
+            # the handoff and drops the spec. That is exactly how a run ends up
+            # with nothing to render.
+            if stage_idx == spec_feeder:
+                handoff = (
+                    "\n\nSTRICT PIPELINE RULES:\n"
+                    "Your answer is consumed by a renderer, not by another "
+                    "chat. Obey the OUTPUT FORMAT block above exactly: the "
+                    "whole reply is one JSON object and nothing else. Do NOT "
+                    "add a handoff section, a summary, an explanation or a "
+                    "follow-up question — any of those and nothing can be "
+                    "rendered."
+                )
+            elif stage_idx + 1 < len(stages):
                 nxt_stage, nxt_agent, _ = stages[stage_idx + 1]
                 rules = [
                     "Perform ONLY the task above — nothing more. Do not build, "
@@ -944,6 +1045,11 @@ def run(routing: dict, cfg: dict, attachments=None, on_event=None,
                 # so (e.g. /email needs "SUBJECT:"), and a mid-answer pause
                 # can no longer end the wait early.
                 expect = (routing.get(stage) or {}).get("expect", "")
+                if stage_idx == spec_feeder:
+                    # A spec streams in over several seconds and pauses mid-way;
+                    # without a marker a pause reads as "finished" and we scrape
+                    # the preamble before the JSON has been written.
+                    expect = '"scenes"'
                 ui.info(f"   ⏳  waiting up to {wait}s for {agent_name} to finish…")
                 emit("waiting", {"stage": stage, "seconds": wait})
                 took, settled = _smart_wait(driver, agent_cfg, wait, expect=expect)
@@ -958,27 +1064,7 @@ def run(routing: dict, cfg: dict, attachments=None, on_event=None,
                     ui.warn(f"still generating after {took}s — scraping what "
                             f"is on the page and keeping the link")
 
-                elements = driver.find_elements(By.CSS_SELECTOR, agent_cfg.get("response_selector", ""))
-                texts = []
-                for el in elements:
-                    try:
-                        t = el.text.strip()
-                    except Exception:
-                        continue
-                    if len(t) > 50 and t not in texts:
-                        texts.append(t)
-                # Response selectors often match a container AND pieces inside it
-                # (sections, citation chips…). Keep only the fullest captures:
-                # drop any text that is contained inside another element's text.
-                texts = [t for t in texts if not any(t != u and t in u for u in texts)]
-                # Several tools render OUR message with the same classes as
-                # the reply, so the prompt comes back as a "response" —
-                # which then gets forwarded downstream, or (for /email)
-                # parsed as a draft whose subject is the template we typed.
-                echoes = [t for t in texts if _is_prompt_echo(t)]
-                if echoes:
-                    texts = [t for t in texts if t not in echoes]
-                    ui.info(f"   ↩️   ignored {len(echoes)} echo(es) of our own prompt")
+                texts = _capture(driver, agent_cfg)
                 if not texts:
                     stage_responses = []
                 elif len(questions) == 1:
@@ -986,6 +1072,39 @@ def run(routing: dict, cfg: dict, attachments=None, on_event=None,
                     stage_responses = [max(texts, key=len)]
                 else:
                     stage_responses = texts[-len(questions):]
+
+                # This stage feeds a renderer, so "it answered" isn't enough —
+                # it has to have answered in JSON. Prefer a capture that
+                # actually parses (the spec is often shorter than the prose
+                # around it), and if none does, ask once more in the same tab
+                # before the run reaches the renderer with nothing to draw.
+                if stage_idx == spec_feeder and texts:
+                    from . import reel as _reel
+                    spec_texts = [t for t in texts if _reel.has_spec(t)]
+                    if spec_texts:
+                        # LAST, not longest: the prompt we typed carries an
+                        # example spec, so "biggest thing that parses" can be
+                        # our own echo. Chat DOM order is chronological, so
+                        # the newest capture is the reply.
+                        stage_responses = [spec_texts[-1]]
+                    else:
+                        ui.warn(f"{agent_name} wrote about the reel instead of "
+                                "writing the spec — asking again for JSON only")
+                        emit("retry", {"stage": stage, "reason": "no scene spec"})
+                        again = _reask(
+                            driver, agent_cfg,
+                            "That reply cannot be rendered. Send the scene "
+                            "spec itself now: reply with ONLY the JSON object, "
+                            "first character '{', last character '}', no "
+                            "preamble, no handoff, no fences.",
+                            expect='"scenes"')
+                        fixed = [t for t in again if _reel.has_spec(t)]
+                        if fixed:
+                            stage_responses = [fixed[-1]]
+                            ui.ok("   got the scene spec on the second ask")
+                        else:
+                            ui.err("   still no scene spec — the renderer will "
+                                   "have nothing to draw")
             if stage_responses:
                 ui.info(f"   📥  captured {sum(len(t) for t in stage_responses)} chars")
 
