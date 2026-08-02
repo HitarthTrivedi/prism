@@ -175,6 +175,24 @@ window.__check = function () {
                  'px — under the %dpx minimum for video');
       }
     }
+
+    // Images are checked too: a logo half off the frame is exactly as broken
+    // as a headline half off it, and only the browser knows where it landed.
+    for (const el of scene.querySelectorAll('img, svg, picture')) {
+      const r = el.getBoundingClientRect();
+      if (r.width < 2 || r.height < 2) continue;
+      const cs = getComputedStyle(el);
+      if (cs.visibility === 'hidden' || parseFloat(cs.opacity) < 0.05) continue;
+      if (r.left < -2 || r.right > %d + 2 || r.top < -2 || r.bottom > %d + 2) {
+        const what = el.getAttribute('alt') || el.tagName.toLowerCase();
+        const key = 'img|' + what + Math.round(r.left);
+        if (!seen.has(key)) {
+          seen.add(key);
+          out.push('an image (' + what + ', ' + Math.round(r.width) + 'x' +
+                   Math.round(r.height) + ') runs off the frame');
+        }
+      }
+    }
   }
   const d = document.documentElement;
   if (d.scrollWidth > %d || d.scrollHeight > %d) {
@@ -183,7 +201,7 @@ window.__check = function () {
   }
   return out;
 };
-""" % ("%s", W, H, T_LABEL, T_LABEL, W, H)
+""" % ("%s", W, H, T_LABEL, T_LABEL, W, H, W, H)
 
 
 def _plan(spec: dict, fps: int):
@@ -219,6 +237,41 @@ def _plan(spec: dict, fps: int):
     return out, int(round(total_ms / 1000.0 * fps))
 
 
+def _asset_uris(table: dict) -> dict:
+    """Every asset as a data: URI.
+
+    Inlined rather than linked because the page is loaded with set_content and
+    has no base URL — a file:// path or a bare filename simply does not
+    resolve, and the image silently fails to appear. Inlining also means the
+    saved design JSON is the whole reel: re-render it next year and the logo
+    is still there.
+    """
+    import base64
+    out = {}
+    for name, a in (table or {}).items():
+        path = a.get("path") if isinstance(a, dict) else a
+        try:
+            if not path or os.path.getsize(path) > 6_000_000:
+                continue
+            with open(path, "rb") as f:
+                raw = f.read()
+        except OSError:
+            continue
+        ext = os.path.splitext(path)[1].lower()
+        mime = {".png": "image/png", ".jpg": "image/jpeg", ".jpeg": "image/jpeg",
+                ".webp": "image/webp", ".gif": "image/gif"}.get(ext, "image/png")
+        out[name] = f"data:{mime};base64,{base64.b64encode(raw).decode()}"
+    return out
+
+
+def _place_assets(text: str, uris: dict) -> str:
+    """Swap asset:name for the real thing. Longest name first, so asset:art1
+    can never eat the front of asset:art10."""
+    for name in sorted(uris, key=len, reverse=True):
+        text = text.replace(f"asset:{name}", uris[name])
+    return text
+
+
 def build_html(spec: dict, fps: int = DEFAULT_FPS) -> str:
     """The whole reel as one self-contained page.
 
@@ -241,9 +294,10 @@ def build_html(spec: dict, fps: int = DEFAULT_FPS) -> str:
     root_vars = ";".join(f"--{k}:{v}" for k, v in brand.items()
                          if isinstance(v, str) and v.strip())
 
+    uris = _asset_uris(spec.get("_assets") or {})
     body = []
     for i, sc in enumerate(scenes):
-        html = sc.get("html") or ""
+        html = _place_assets(sc.get("html") or "", uris)
         body.append(f'<section class="scene" id="s{i}" '
                     f'data-type="{sc.get("type", "")}">{html}</section>')
 
@@ -252,7 +306,7 @@ def build_html(spec: dict, fps: int = DEFAULT_FPS) -> str:
         f"{fonts}"
         f"<style>{_HARNESS_CSS}</style>"
         f"<style>:root{{{root_vars}}}</style>"
-        f"<style>{design.get('css', '')}</style>"
+        f"<style>{_place_assets(design.get('css', ''), uris)}</style>"
         "</head><body>"
         f"<div id='stage'>{''.join(body)}</div>"
         f"<script>{_HARNESS_JS % json.dumps(plan)}</script>"
@@ -424,7 +478,8 @@ def script_instructions() -> str:
     )
 
 
-def design_instructions(brand: dict | None = None, request: str = "") -> str:
+def design_instructions(brand: dict | None = None, request: str = "",
+                        assets: str = "") -> str:
     """The art-direction pass. This is the one that makes two clients' reels
     different films rather than one template with new words."""
     brand = brand or {}
@@ -451,7 +506,20 @@ def design_instructions(brand: dict | None = None, request: str = "") -> str:
         "1080x1920 and filmed frame by frame, so ordinary CSS is what you "
         "have — gradients, grid, flexbox, clip-path, masks, filters, SVG, "
         "pseudo-elements, web fonts.\n\n"
-        '{\n'
+        + (("ASSETS ON HAND — the client's own artwork, already prepared:\n"
+            + assets +
+            "\n\nUse them by name, exactly like a URL: "
+            '<img src="asset:logo" alt=""> or '
+            "background-image: url(asset:logo). The names above are the only "
+            "ones that exist; anything else resolves to nothing. Put the logo "
+            "where a logo belongs — the endcard at least — and size it in CSS "
+            "rather than relying on its pixel dimensions. Never redraw or "
+            "approximate a mark you have been given: it is the client's real "
+            "one, and a lookalike is worse than none.\n\n")
+           if assets else
+           "No client artwork was supplied, so build the reel from type, "
+           "colour and shape alone. Do not invent a logo.\n\n")
+        + '{\n'
         '  "design": {\n'
         '    "name": "one line describing the look you chose",\n'
         '    "google_fonts": ["Fraunces:opsz,wght@9..144,700", "Inter:wght@400;600"],\n'

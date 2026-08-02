@@ -711,6 +711,18 @@ def _run_studio(prior_text, attachments, cfg: dict):
         if brand:
             spec["brand"] = brand
 
+    # Rebuilt, not passed along: collect() names assets from the files in a
+    # fixed order, so the table the design stage was shown and the table the
+    # renderer resolves are the same one without either holding a reference.
+    if attachments:
+        try:
+            from . import assets as _assets
+            spec["_assets"] = {
+                k: {kk: vv for kk, vv in v.items() if kk != "ink"}
+                for k, v in _assets.collect(attachments).items()}
+        except Exception as e:
+            ui.warn(f"   couldn't prepare the artwork ({e})")
+
     import json as _json
     import time as _time
     from . import config as C
@@ -887,7 +899,7 @@ def run(routing: dict, cfg: dict, attachments=None, on_event=None,
             st, an, qs = stages[writer]
             stages[writer] = (st, an, qs[:-1] + [
                 qs[-1] + "\n\n" + _web.script_instructions()])
-            brand = {}
+            brand, asset_list = {}, ""
             if attachments:
                 imgs = [a["path"] for a in attachments
                         if a.get("path", "").lower().endswith(
@@ -898,12 +910,25 @@ def run(routing: dict, cfg: dict, attachments=None, on_event=None,
                         ui.info(f"🎨  brand colours read from the artwork — "
                                 f"accent {brand.get('accent')}, "
                                 f"deep {brand.get('deep')}")
+                    # Cut the client's own marks out of what they sent, so the
+                    # art director can place the REAL logo rather than ask a
+                    # model to draw one that looks nearly like it.
+                    try:
+                        from . import assets as _assets
+                        table = _assets.collect(attachments)
+                        asset_list = _assets.manifest(table)
+                        if table:
+                            ui.info(f"✂️   {len(table)} asset(s) prepared from "
+                                    "the artwork: " + ", ".join(table))
+                    except Exception as e:
+                        ui.warn(f"couldn't prepare the artwork ({e}) — the "
+                                "reel will be type and colour only")
             # The art director is the same tool as the writer unless a
             # stronger one is switched on: this pass is the harder of the two.
             director = agents.get("brains") or agents.get("content") or an
             stages.insert(studio_at, ("design", director,
-                                      [_web.design_instructions(brand,
-                                                                query)]))
+                                      [_web.design_instructions(brand, query,
+                                                                asset_list)]))
             studio_at += 1
             design_feeder = studio_at - 1
             ui.info(f"🎬  {stages[studio_at][1]} films the page — {an} writes "
@@ -958,7 +983,12 @@ def run(routing: dict, cfg: dict, attachments=None, on_event=None,
             # blob only gives the parser more prose to trip over.
             prior_text = [t for ts in reversed(list(all_responses.values()))
                           for t in ts if t.strip()]
-            out, note = _run_local(agent_cfg["local"], prior_text, attachments,
+            # Images an earlier stage GENERATED count as artwork too — that is
+            # the whole point of harvesting them. The client's own files come
+            # first so their real mark wins the 'logo' slot over anything a
+            # model drew.
+            out, note = _run_local(agent_cfg["local"], prior_text,
+                                   (attachments or []) + pipeline_files,
                                    cfg, stage)
             if out:
                 all_responses[stage] = [note]

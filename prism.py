@@ -1230,7 +1230,20 @@ def _reel_designed(cfg, request, brand, images, writer_agent, director_agent):
     """
     import json as _json
     import time
-    from core import automation, reel_web
+    from core import automation, assets as _assets, reel_web
+
+    # The client's own marks, cut out of what they sent. Never regenerated:
+    # a model asked to redraw a logo produces a lookalike, and a lookalike on
+    # a client's reel is worse than no logo at all.
+    table = {}
+    if images:
+        try:
+            table = _assets.collect(images)
+            if table:
+                ui.ok(f"✂️   {len(table)} asset(s) from the artwork: "
+                      + ", ".join(table))
+        except Exception as e:
+            ui.warn(f"couldn't prepare the artwork ({e})")
 
     responses, links = automation.run(
         {}, cfg, attachments=images, chatgpt_analysis=False,
@@ -1240,7 +1253,8 @@ def _reel_designed(cfg, request, brand, images, writer_agent, director_agent):
               f"WHAT THE CLIENT ASKED FOR:\n{request}\n\n"
               + reel_web.script_instructions()]),
             ("design", director_agent,
-             [reel_web.design_instructions(brand, request)]),
+             [reel_web.design_instructions(brand, request,
+                                           _assets.manifest(table))]),
         ],
         query=f"design a reel — {request}")
 
@@ -1259,6 +1273,8 @@ def _reel_designed(cfg, request, brand, images, writer_agent, director_agent):
         return
     if brand:
         spec["brand"] = brand
+    if table:
+        spec["_assets"] = table
 
     # Measured, not trusted: the page is laid out and every line checked
     # before a minute is spent filming it.
