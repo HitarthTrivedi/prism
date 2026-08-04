@@ -20,7 +20,8 @@ machine, with one of:
 
   • GNU LibreDWG (free, scriptable, recommended):
         macOS   →  brew install libredwg          (gives the `dwg2dxf` CLI)
-        Debian  →  sudo apt install libredwg-tools
+        Linux   →  build LibreDWG from source (many current Debian/Ubuntu
+                    repositories do not package the `dwg2dxf` utility)
     Coverage of newer/exotic DWG features is not perfect — good enough for
     ordinary 2D architectural drawings, which is the common case here.
 
@@ -49,6 +50,7 @@ import math
 import os
 import shutil
 import subprocess
+import sys
 import tempfile
 
 _CONVERTER_CANDIDATES = ["dwg2dxf", "ODAFileConverter", "ODAFileConverter.exe"]
@@ -85,7 +87,15 @@ def _read_dxf(path: str):
     make sense of the file. Confirmed necessary against a real client DWG
     whose full-mode conversion produced one malformed numeric tag — enough
     to make the strict reader reject the entire file outright."""
-    import ezdxf
+    try:
+        import ezdxf
+    except ModuleNotFoundError as e:
+        if e.name != "ezdxf":
+            raise
+        raise BoqError(
+            "DXF measurement needs the `ezdxf` Python package. Install it into "
+            f"the Python that started Prism:\n  {sys.executable} -m pip install ezdxf"
+        ) from e
     try:
         return ezdxf.readfile(path), []
     except Exception:
@@ -128,9 +138,9 @@ def dwg_to_dxf(dwg_path: str, out_dir: str | None = None) -> tuple[str, list[str
         raise BoqError(
             "No DWG→DXF converter found on this machine. Install one:\n"
             "  • brew install libredwg        (macOS, gives `dwg2dxf`)\n"
-            "  • sudo apt install libredwg-tools   (Debian/Ubuntu)\n"
-            "  • or ODA File Converter: "
+            "  • On Linux, install ODA File Converter (the simplest supported option): "
             "https://www.opendesign.com/guestfiles/oda_file_converter\n"
+            "    (or build LibreDWG from source to get `dwg2dxf`)\n"
             "Then re-run /boq — or convert it yourself and attach the .dxf directly."
         )
     out_dir = out_dir or tempfile.mkdtemp(prefix="prism_boq_")

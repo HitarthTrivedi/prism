@@ -232,6 +232,12 @@ HELP = """
                 an agent formats them into a professional BOQ document —
                 /attach a template alongside the drawing to match its exact
                 columns/structure instead of a generic layout
+  [teal]/reel <what it's about>[/teal]  a finished vertical reel, rendered on this
+                machine — no account, no upload, no watermark. /attach the
+                client's logo or artwork and their real colours are measured
+                from it. Needs FFmpeg; Prism Studio (which art-directs the
+                reel instead of using the house template) also needs
+                `playwright install chromium`
   [teal]/exit[/teal]        quit
 
 Anything else you type is treated as a task and routed to your agents.
@@ -1358,53 +1364,80 @@ def repl(cfg):
             continue
         line = raw.strip()
 
-        if line in ("/exit", "/quit", "/q"):
-            ui.info("bye ◈")
-            return
-        elif line in ("/help", "/?", "help"):
-            ui.panel(HELP.strip(), title="Prism", style="teal")
-        elif line == "/status":
-            cmd_status(cfg)
-            if attachments:
-                ui.info(f"📎  {len(attachments)} file(s) attached to your next task.")
-        elif line == "/catalog":
-            ui.catalog_table()
-        elif line == "/agents":
-            cmd_agents(cfg)
-        elif line == "/profile":
-            cmd_profile(cfg)
-        elif line == "/key":
-            cmd_key(cfg)
-        elif line == "/chrome":
-            cmd_chrome(cfg)
-        elif line == "/login":
-            cmd_login(cfg)
-        elif line == "/config":
-            cfg = cmd_config(cfg)
-        elif line.startswith("/attach"):
-            cmd_attach(line[len("/attach"):].strip(), attachments, cfg)
-        elif line.startswith("/find"):
-            cmd_find(line[len("/find"):].strip(), cfg, attachments)
-        elif line == "/files":
-            cmd_files(attachments)
-        elif line == "/detach":
-            cmd_detach(attachments)
-        elif line == "/runs":
-            cmd_runs(cfg)
-        elif line.startswith("/remote"):
-            cmd_remote(cfg, line[len("/remote"):].strip())
-        elif line.startswith("/email"):
-            cmd_email(cfg, line[len("/email"):].strip(), attachments)
-        elif line.startswith("/boq"):
-            cmd_boq(cfg, line[len("/boq"):].strip(), attachments)
-        elif line.startswith("/reel"):
-            cmd_reel(cfg, line[len("/reel"):].strip(), attachments)
-        elif line.startswith("/dry"):
-            run_query(cfg, line[4:].strip(), dry=True, attachments=attachments)
-        elif line.startswith("/"):
-            ui.warn(f"Unknown command: {line}. Try /help.")
-        else:
-            run_query(cfg, line, dry=False, attachments=attachments)
+        # One command must never be able to end the session. Before this, an
+        # unexpected error anywhere inside a command propagated out of the
+        # loop and quit Prism outright, taking the attachment list and all the
+        # context with it — the user's punishment for a bug being that they
+        # had to set the whole task up again.
+        try:
+            cfg, keep_going = _dispatch(cfg, line, attachments)
+            if not keep_going:
+                return
+        except KeyboardInterrupt:
+            # Ctrl-C interrupts the COMMAND, not the session. Coming back to
+            # the prompt with the attachments intact is the point of a REPL.
+            ui.warn("\nStopped. Back at the prompt — your attachments are "
+                    "still here.")
+        except Exception as e:
+            ui.err(f"That command hit an unexpected problem: {e}")
+            ui.info("Nothing else was changed. Try again, or /help for the "
+                    "list of commands.")
+
+
+def _dispatch(cfg: dict, line: str, attachments: list) -> tuple[dict, bool]:
+    """Run one command line.
+
+    Returns (cfg, keep_going). cfg comes back because /config replaces it
+    wholesale, and the REPL has to keep the new one.
+    """
+    if line in ("/exit", "/quit", "/q"):
+        ui.info("bye ◈")
+        return cfg, False
+    elif line in ("/help", "/?", "help"):
+        ui.panel(HELP.strip(), title="Prism", style="teal")
+    elif line == "/status":
+        cmd_status(cfg)
+        if attachments:
+            ui.info(f"📎  {len(attachments)} file(s) attached to your next task.")
+    elif line == "/catalog":
+        ui.catalog_table()
+    elif line == "/agents":
+        cmd_agents(cfg)
+    elif line == "/profile":
+        cmd_profile(cfg)
+    elif line == "/key":
+        cmd_key(cfg)
+    elif line == "/chrome":
+        cmd_chrome(cfg)
+    elif line == "/login":
+        cmd_login(cfg)
+    elif line == "/config":
+        cfg = cmd_config(cfg)
+    elif line.startswith("/attach"):
+        cmd_attach(line[len("/attach"):].strip(), attachments, cfg)
+    elif line.startswith("/find"):
+        cmd_find(line[len("/find"):].strip(), cfg, attachments)
+    elif line == "/files":
+        cmd_files(attachments)
+    elif line == "/detach":
+        cmd_detach(attachments)
+    elif line == "/runs":
+        cmd_runs(cfg)
+    elif line.startswith("/remote"):
+        cmd_remote(cfg, line[len("/remote"):].strip())
+    elif line.startswith("/email"):
+        cmd_email(cfg, line[len("/email"):].strip(), attachments)
+    elif line.startswith("/boq"):
+        cmd_boq(cfg, line[len("/boq"):].strip(), attachments)
+    elif line.startswith("/reel"):
+        cmd_reel(cfg, line[len("/reel"):].strip(), attachments)
+    elif line.startswith("/dry"):
+        run_query(cfg, line[4:].strip(), dry=True, attachments=attachments)
+    elif line.startswith("/"):
+        ui.warn(f"Unknown command: {line}. Try /help.")
+    else:
+        run_query(cfg, line, dry=False, attachments=attachments)
+    return cfg, True
 
 
 def _drain_pending_lines() -> str:

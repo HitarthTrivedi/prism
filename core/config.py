@@ -29,18 +29,61 @@ def load() -> dict:
                 data = json.load(f)
             return {**DEFAULT, **data}
         except Exception:
-            pass
+            # An unreadable config used to fall through to DEFAULT in silence,
+            # which looks exactly like a fresh install: the user is asked to
+            # onboard again and concludes Prism "forgot" their key. Keep the
+            # bad file — it still contains their API key and agent choices,
+            # recoverable by hand — and leave a trail saying so.
+            _quarantine(CONFIG_PATH)
     return dict(DEFAULT)
 
 
-def save(cfg: dict) -> None:
-    os.makedirs(CONFIG_DIR, exist_ok=True)
-    with open(CONFIG_PATH, "w", encoding="utf-8") as f:
-        json.dump(cfg, f, indent=2, ensure_ascii=False)
+def _quarantine(path: str) -> str:
+    """Move a file that failed to parse aside, and say where it went."""
+    import time
+    kept = f"{path}.corrupt-{int(time.time())}"
     try:
-        os.chmod(CONFIG_PATH, 0o600)  # key is sensitive — owner-only
+        os.replace(path, kept)
     except OSError:
-        pass
+        return ""
+    print(f"⚠️  {os.path.basename(path)} could not be read and was kept as "
+          f"{kept}\n    Starting from defaults — your settings are still in "
+          f"that file if you need them back.")
+    return kept
+
+
+def save(cfg: dict) -> None:
+    """Write the config so that an interrupted write cannot destroy it.
+
+    The old version truncated config.json and then wrote into it. A crash,
+    a full disk or a pulled power cable anywhere in between left a half-written
+    file, load() silently discarded it, and the user's API key, profile and
+    agent choices were gone — from a routine settings save. Writing a complete
+    temporary file first and swapping it in with os.replace (atomic on POSIX
+    and on Windows) means the config is only ever the old one or the new one.
+    """
+    os.makedirs(CONFIG_DIR, exist_ok=True)
+    tmp = f"{CONFIG_PATH}.tmp"
+    try:
+        with open(tmp, "w", encoding="utf-8") as f:
+            json.dump(cfg, f, indent=2, ensure_ascii=False)
+            f.flush()
+            # The rename is atomic, but only orders against data that has
+            # actually reached the disk — without this the swap can land while
+            # the contents are still buffered, and a power loss then leaves an
+            # empty file where the config used to be.
+            os.fsync(f.fileno())
+        try:
+            os.chmod(tmp, 0o600)  # key is sensitive — owner-only, before it lands
+        except OSError:
+            pass
+        os.replace(tmp, CONFIG_PATH)
+    except Exception:
+        try:
+            os.unlink(tmp)
+        except OSError:
+            pass
+        raise
 
 
 def is_configured(cfg: dict) -> bool:

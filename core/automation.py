@@ -55,6 +55,26 @@ def _get_driver(cfg: dict):
     return _active_driver, True
 
 
+def shutdown() -> None:
+    """Close Prism's browser, if one is open.
+
+    Nothing in a normal run calls this — the tabs are left up on purpose, since
+    a slow tool often finishes in its tab after Prism stops watching. But when
+    the APP itself is quitting there is no one left to read them, and leaving
+    the driver running strands a headless Chrome and its profile lock, so the
+    next launch fails with "profile appears to be in use".
+    """
+    global _active_driver
+    if _active_driver is None:
+        return
+    try:
+        _active_driver.quit()
+    except Exception:
+        pass
+    finally:
+        _active_driver = None
+
+
 def _bmp_safe(text: str) -> str:
     """ChromeDriver's send_keys only accepts Basic-Multilingual-Plane characters
     (<= U+FFFF). Drop anything above it (emoji, etc.) so typing never crashes
@@ -533,9 +553,28 @@ def _safe_url(driver, exclude=()) -> str:
     return "" if url in exclude else url
 
 
+def _sleep_interruptibly(seconds: float, should_stop=None) -> bool:
+    """time.sleep, but it notices a cancel. Returns True if we were stopped.
+
+    The waits in here are long by design (a tool can take five minutes), so a
+    plain sleep makes a Stop button feel broken — the user presses it and
+    nothing happens until the current poll interval ends. Sleeping in short
+    slices keeps cancellation under a second without polling the page harder.
+    """
+    if should_stop is None:
+        time.sleep(seconds)
+        return False
+    deadline = time.time() + seconds
+    while time.time() < deadline:
+        if should_stop():
+            return True
+        time.sleep(min(0.25, max(0.0, deadline - time.time())))
+    return should_stop()
+
+
 def _smart_wait(driver, agent_cfg, cap: int, poll: int = 5,
                 stable_for: int = 25, min_wait: int = 35,
-                expect: str = "") -> tuple[int, bool]:
+                expect: str = "", should_stop=None) -> tuple[int, bool]:
     """Wait for the agent to finish generating — but no longer than needed.
     Polls the response selector and returns once the total response text has
     stopped growing for `stable_for` seconds (after having grown at least
@@ -570,7 +609,11 @@ def _smart_wait(driver, agent_cfg, cap: int, poll: int = 5,
             return False
 
     while time.time() - start < cap:
-        time.sleep(poll)
+        # Stopping here returns settled=False, which the caller already treats
+        # as "we stopped watching, the tool didn't fail" — exactly the truth
+        # after a cancel. It re-checks should_stop before scraping.
+        if _sleep_interruptibly(poll, should_stop):
+            break
         try:
             total = sum(len(el.text) for el in
                         driver.find_elements(By.CSS_SELECTOR, sel))
@@ -759,6 +802,49 @@ def _run_notebooklm(driver, agent_cfg: dict, stage: str, prompt: str) -> list[st
         return [f"NotebookLM automation stopped early at an unverified UI "
                 f"step ({e}). Check the open tab — your source/prompt may "
                 f"still be usable manually from here."]
+
+
+# Words that only appear on a page asking you to identify yourself. Matched
+# against the visible body text, lowercased. Kept deliberately specific: "sign
+# in" alone also appears in the header of a page you ARE signed into, so every
+# entry here has to be something a signed-in user would not be looking at.
+_SIGNIN_MARKERS = (
+    "sign in to continue", "log in to continue", "please sign in",
+    "please log in", "sign in to your account", "create an account to",
+    "you must be logged in", "session expired", "your session has expired",
+    "continue with google", "sign in with google", "verify you are human",
+    "are you a robot", "checking your browser",
+)
+
+
+def _looks_signed_out(driver) -> str:
+    """"" if the page looks usable, else what the user has to do about it.
+
+    Not being signed in is the single most common reason a run comes back with
+    nothing, and it was indistinguishable from every other empty result: the
+    scrape found no reply, so the user was told "Prism couldn't read the
+    response off the page" — which reads as Prism being broken rather than as
+    "log in to Perplexity". Cheap to check and only consulted when a stage
+    produced nothing, so a false positive costs a wrong sentence, not a run.
+    """
+    try:
+        body = (driver.find_element("tag name", "body").text or "").lower()
+    except Exception:
+        return ""
+    if not body or len(body) > 4000:
+        # A real conversation page is long; a sign-in wall is short. This keeps
+        # the check off pages that merely mention signing in somewhere.
+        return ""
+    for marker in _SIGNIN_MARKERS:
+        if marker in body:
+            if "robot" in marker or "human" in marker or "browser" in marker:
+                return ("This tool is showing a human-verification check. Open "
+                        "the tab, clear it once, and run again — Prism reuses "
+                        "the same browser profile, so it usually only asks once.")
+            return ("You're not signed in to this tool. Use “Login tabs” in the "
+                    "sidebar, sign in once in the window Prism opens, then run "
+                    "again — the login is remembered from then on.")
+    return ""
 
 
 def _capture(driver, agent_cfg: dict) -> list[str]:
@@ -987,7 +1073,8 @@ def _run_local(kind: str, prior_text, attachments, cfg: dict, stage: str,
 
 def run(routing: dict, cfg: dict, attachments=None, on_event=None,
         query: str = "", chatgpt_analysis: bool = True,
-        custom_stages: list[tuple[str, str, list[str]]] | None = None):
+        custom_stages: list[tuple[str, str, list[str]]] | None = None,
+        should_stop=None):
     """Execute the pipeline. Returns (responses, links).
 
     attachments: list of records from core.files.attach() — uploaded to each
@@ -1006,6 +1093,15 @@ def run(routing: dict, cfg: dict, attachments=None, on_event=None,
                  (they key the responses/links dicts and drive the next-stage
                  handoff); they don't need to match a real category name.
     on_event(kind, payload) is an optional callback for live UI updates.
+    should_stop() is an optional predicate polled between and during stages.
+                 A routed run drives a browser for minutes at a time, so a
+                 caller with a Stop button needs a way to be let go of that
+                 isn't killing the process. When it returns True the run
+                 finishes the current poll, emits "cancelled", and RETURNS what
+                 has already landed rather than raising — a cancelled run still
+                 has real output in it, and throwing that away punishes the
+                 user for stopping. The browser is deliberately left open, same
+                 as every other exit from here.
     """
     from selenium.webdriver.common.by import By
     from selenium.webdriver.common.keys import Keys
@@ -1195,6 +1291,16 @@ def run(routing: dict, cfg: dict, attachments=None, on_event=None,
             except Exception:
                 pass
 
+    # Before the browser, not after: launching Chrome is the single slowest
+    # and most visible thing this function does, and a run cancelled while the
+    # plan was still being assembled would otherwise still throw a window onto
+    # the user's screen before noticing it had been called off.
+    if should_stop and should_stop():
+        if on_event:
+            on_event("cancelled", {"stage": "", "done": 0})
+        ui.warn("Stopped before anything ran.")
+        return {}, {}
+
     driver, fresh = _get_driver(cfg)
     all_responses: dict[str, list[str]] = {}
     all_links: dict[str, str] = {}
@@ -1204,10 +1310,26 @@ def run(routing: dict, cfg: dict, attachments=None, on_event=None,
     # always open a new tab in that case so nothing gets navigated away.
     first_tab = fresh
 
+    def stopped() -> bool:
+        return bool(should_stop and should_stop())
+
     for stage_idx, (stage, agent_name, questions) in enumerate(stages):
+        if stopped():
+            ui.warn("Stopped at your request — keeping everything finished so far.")
+            emit("cancelled", {"stage": stage, "done": len(all_responses)})
+            break
+
         agent_cfg = A.resolve_agent(stage, agent_name)
         if not agent_cfg:
+            # This `continue` used to be invisible to anything but a terminal:
+            # the GUI got no event, so the step simply never appeared and the
+            # run looked like it had silently skipped part of the plan.
             ui.warn(f"No registry entry for {agent_name} — skipping {stage}.")
+            emit("stage_skipped", {
+                "stage": stage, "agent": agent_name,
+                "reason": f"{agent_name} isn't in Prism's tool registry, so "
+                          "this step was left out. Pick a different tool for "
+                          "it in the plan."})
             continue
 
         emit("stage_start", {"stage": stage, "agent": agent_name})
@@ -1481,7 +1603,29 @@ def run(routing: dict, cfg: dict, attachments=None, on_event=None,
                     expect = '"scenes"'
                 ui.info(f"   ⏳  waiting up to {wait}s for {agent_name} to finish…")
                 emit("waiting", {"stage": stage, "seconds": wait})
-                took, settled = _smart_wait(driver, agent_cfg, wait, expect=expect)
+                took, settled = _smart_wait(driver, agent_cfg, wait,
+                                            expect=expect, should_stop=should_stop)
+                if stopped():
+                    # Scrape before leaving: the tool has been generating for
+                    # however long the user waited before pressing Stop, and
+                    # that partial answer is theirs. The link is kept too, so
+                    # the tab they can still read is one click away.
+                    ui.warn("Stopped at your request — keeping this step's "
+                            "output so far.")
+                    try:
+                        captured = _capture(driver, agent_cfg)
+                        partial = [max(captured, key=len)] if captured else []
+                    except Exception:
+                        partial = []
+                    all_links[stage] = driver.current_url
+                    if partial:
+                        all_responses[stage] = partial
+                    emit("stage_done", {"stage": stage, "count": len(partial),
+                                        "texts": partial,
+                                        "url": driver.current_url,
+                                        "timed_out": True})
+                    emit("cancelled", {"stage": stage, "done": len(all_responses)})
+                    break
                 if settled:
                     ui.info(f"   ✓  response settled after {took}s")
                 else:
@@ -1671,10 +1815,17 @@ def run(routing: dict, cfg: dict, attachments=None, on_event=None,
                                     "texts": stage_responses, "url": driver.current_url,
                                     "timed_out": timed_out})
             else:
-                ui.warn("no response scraped, but link saved")
+                # Nothing came back. Before reporting that as a scrape miss,
+                # ask the far more likely question: is this a sign-in wall?
+                blocked = _looks_signed_out(driver)
+                if blocked:
+                    ui.err(blocked)
+                else:
+                    ui.warn("no response scraped, but link saved")
                 emit("stage_done", {"stage": stage, "count": 0, "texts": [],
                                     "url": driver.current_url,
-                                    "timed_out": timed_out})
+                                    "timed_out": timed_out,
+                                    "blocked": blocked})
             ui.info(f"   🔗  {driver.current_url}")
 
         except Exception as ex:

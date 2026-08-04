@@ -41,19 +41,71 @@ _THEME = {
 
 console = Console(theme=Theme(_THEME)) if _RICH else None
 
+# ── the sink ─────────────────────────────────────────────────────────────────
+# Everything the engine has to say about a run — which tool it is on, what it
+# is waiting for, that it read the brand colours off the artwork, that it could
+# not prepare a logo — is written through this module. In the terminal that
+# lands on screen. In the desktop app it landed on a stdout that a windowed
+# build does not have, so a GUI user saw a spinner and nothing else for minutes
+# at a time while the CLI user running the identical code saw the whole story.
+#
+# A sink is a callable taking (level, text) with the markup already stripped.
+# set_sink(None) puts it back. The console output is unaffected either way, so
+# nothing about the terminal changes.
+_sink = None
+
+
+def set_sink(fn) -> None:
+    """Mirror every message to `fn(level, text)` as well as the console."""
+    global _sink
+    _sink = fn
+
+
+def _strip_markup(msg: str) -> str:
+    """'[bold]Claude[/bold] is thinking' → 'Claude is thinking'.
+
+    A sink is feeding a Qt label, not a terminal — rich's tags would show up
+    verbatim. Uses rich's own parser when it is available so the two can never
+    disagree about what counts as a tag.
+    """
+    if _RICH:
+        try:
+            from rich.text import Text as _Text
+            return _Text.from_markup(msg).plain
+        except Exception:
+            pass
+    import re
+    return re.sub(r"\[/?[a-zA-Z0-9 #_.-]*\]", "", msg)
+
+
+def _tell(level: str, msg: str) -> None:
+    """Hand one message to the sink, if there is one. Never raises: a broken
+    listener must not take down the run it is only watching."""
+    if _sink is None:
+        return
+    try:
+        _sink(level, _strip_markup(str(msg)).strip())
+    except Exception:
+        pass
+
 
 def _plain(msg: str):
     print(msg)
 
 
 def rule(label: str = "", style: str = "pink"):
+    _tell("rule", label)
     if _RICH:
         console.print(Rule(label, style=style))
     else:
         _plain(f"── {label} " + "─" * max(0, 40 - len(label)))
 
 
-def say(msg: str, style: str = ""):
+def say(msg: str, style: str = "", _level: str = "info"):
+    # ok/warn/err/info all route through here, and each passes its own level
+    # so a listener can tell a warning from a progress note without parsing
+    # the emoji back out of the text.
+    _tell(_level, msg)
     if _RICH:
         console.print(msg, style=style)
     else:
@@ -61,19 +113,19 @@ def say(msg: str, style: str = ""):
 
 
 def ok(msg: str):
-    say(f"✅  {msg}", "ok")
+    say(f"✅  {msg}", "ok", _level="ok")
 
 
 def warn(msg: str):
-    say(f"⚠️  {msg}", "warn")
+    say(f"⚠️  {msg}", "warn", _level="warn")
 
 
 def err(msg: str):
-    say(f"❌  {msg}", "err")
+    say(f"❌  {msg}", "err", _level="err")
 
 
 def info(msg: str):
-    say(f"[dim]{msg}[/dim]" if _RICH else msg)
+    say(f"[dim]{msg}[/dim]" if _RICH else msg, _level="info")
 
 
 def banner():
@@ -101,6 +153,7 @@ def banner():
 
 
 def panel(body: str, title: str = "", style: str = "pink"):
+    _tell("panel", f"{title}\n{body}" if title else body)
     if _RICH:
         console.print(Panel(body, title=title, border_style=style, padding=(1, 2)))
     else:

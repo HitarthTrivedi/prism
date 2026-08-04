@@ -194,7 +194,13 @@ def _stage_lines(agents: dict, premium: list | None = None) -> str:
                 continue
         spec = A.specialty_for(stage, name)
         star = "  ⭐ PREMIUM (the user pays for this tool)" if name in premium else ""
-        lines.append(f"- {stage.upper()} → {name}: {spec}{star}\n    USE FOR: {_STAGE_HELP.get(stage, "")}")
+        # The inner quotes are single on purpose: reusing double quotes inside a
+        # double-quoted f-string is PEP 701 syntax and only parses on Python
+        # 3.12+. Prism supports 3.10+, and on anything older this is a
+        # SyntaxError raised at IMPORT time — so the whole engine, and the GUI
+        # that imports it through core_bridge, failed to start at all.
+        lines.append(f"- {stage.upper()} → {name}: {spec}{star}\n"
+                     f"    USE FOR: {_STAGE_HELP.get(stage, '')}")
     return "\n".join(lines)
 
 
@@ -473,6 +479,48 @@ User's raw request (authoritative on scope — if the brief conflicts, this wins
 
 Return ONLY this JSON (no markdown, no commentary), using exactly these keys:
 {_schema_stub(agents)}"""
+
+
+def verify_key(api_key: str, model: str = "") -> str:
+    """Check a Groq key against Groq. Returns "" if it works, else why not.
+
+    Both the CLI and the GUI only ever checked that a key starts with 'gsk_'
+    and is long enough, which a typo, a revoked key and a key pasted with half
+    a newline in it all pass. The first sign of trouble was then the first real
+    task failing with a raw HTTP 401 body — minutes after setup, and worded for
+    a developer. This is the same question asked at the moment the key is
+    entered, when it is still obvious what to do about the answer.
+    """
+    api_key = (api_key or "").strip()
+    if not api_key:
+        return "No key entered."
+    if not api_key.startswith("gsk_"):
+        return "A Groq key starts with 'gsk_' — this doesn't look like one."
+    try:
+        resp = requests.get(
+            "https://api.groq.com/openai/v1/models",
+            headers={"Authorization": f"Bearer {api_key}"}, timeout=20)
+    except Exception as e:
+        return (f"Couldn't reach Groq to check the key ({e}).\nIf you're behind "
+                "a proxy or offline, the key may still be fine.")
+    if resp.status_code == 401:
+        return ("Groq rejected this key. Make a new one at console.groq.com/keys "
+                "and paste it again — copying it twice by accident is the usual "
+                "cause.")
+    if resp.status_code == 429:
+        return ("The key is valid, but Groq is rate-limiting it right now. "
+                "Routing may be slow until that clears.")
+    if resp.status_code != 200:
+        return f"Groq answered HTTP {resp.status_code} — the key may not be usable."
+    if model:
+        try:
+            names = {m.get("id") for m in resp.json().get("data", [])}
+            if names and model not in names:
+                return (f"The key works, but '{model}' isn't available on it. "
+                        "Prism will fall back to whatever Groq allows.")
+        except Exception:
+            pass
+    return ""
 
 
 def route(query: str, cfg: dict, attachments: list | None = None) -> dict:
