@@ -29,6 +29,11 @@ _CHROME_BINARIES = [
     r"C:\Program Files (x86)\Google\Chrome\Application\chrome.exe",
 ]
 
+# Windows opens a console window for every subprocess unless told not to, and
+# in a frozen GUI build that is a black rectangle flashing over the app. Zero
+# on every other platform, where the flag does not exist.
+_NO_WINDOW = getattr(subprocess, "CREATE_NO_WINDOW", 0)
+
 # Cap on how much of the previous stage's output is forwarded. The tail is
 # kept (not the head) because that's where the HANDOFF summary lives.
 _MAX_FORWARD_CHARS = 8000
@@ -92,8 +97,49 @@ def parse_chrome_version(raw) -> int | None:
         return None
 
 
+def _windows_chrome_version() -> int | None:
+    """The installed Chrome major version on Windows.
+
+    `chrome.exe --version` cannot be used here. Chrome ships as a GUI-subsystem
+    binary on Windows, so it has no console to print to: the command exits
+    silently with empty stdout rather than failing, and the caller is left
+    parsing an empty string. Ask Windows itself instead — the registry first,
+    since Chrome writes its own version to BLBeacon on every update, then the
+    executable's file version as a fallback for installs that lack the key.
+
+    Getting None back here is not cosmetic: it disables the pinned-version
+    guard in _setup_chrome_driver, which is what lets a stale pin drive the
+    wrong chromedriver until Chrome dies a second after launch.
+    """
+    try:
+        out = subprocess.check_output(
+            ["reg", "query", r"HKCU\Software\Google\Chrome\BLBeacon",
+             "/v", "version"],
+            text=True, stderr=subprocess.DEVNULL, timeout=10,
+            creationflags=_NO_WINDOW)
+        # "    version    REG_SZ    147.0.7727.139"
+        return int(out.strip().split()[-1].split(".")[0])
+    except Exception:
+        pass
+    for path in _CHROME_BINARIES:
+        if not os.path.exists(path):
+            continue
+        try:
+            out = subprocess.check_output(
+                ["powershell", "-NoProfile", "-NonInteractive", "-Command",
+                 f"(Get-Item '{path}').VersionInfo.ProductVersion"],
+                text=True, stderr=subprocess.DEVNULL, timeout=20,
+                creationflags=_NO_WINDOW)
+            return int(out.strip().split(".")[0])
+        except Exception:
+            continue
+    return None
+
+
 def detect_chrome_version() -> int | None:
     """Return the installed Chrome major version, or None if it can't be found."""
+    if platform.system() == "Windows":
+        return _windows_chrome_version()
     for path in _CHROME_BINARIES:
         if not os.path.exists(path):
             continue
@@ -256,6 +302,27 @@ def _prune_preferences() -> None:
         pass
 
 
+def _uc_cache_dir() -> str:
+    """Where undetected-chromedriver keeps the driver it patched last time.
+
+    Mirrors Patcher.data_path in undetected_chromedriver/patcher.py. This was
+    hardcoded to the macOS path, which silently made the staleness check in
+    _setup_chrome_driver a no-op on Windows and Linux — the two platforms where
+    it matters most, since a Chrome auto-update there leaves a version-behind
+    driver sitting in this directory and uc reuses it forever.
+    """
+    system = platform.system()
+    if system == "Windows":
+        d = "~/appdata/roaming/undetected_chromedriver"
+    elif system == "Linux":
+        d = "~/.local/share/undetected_chromedriver"
+    elif system == "Darwin":
+        d = "~/Library/Application Support/undetected_chromedriver"
+    else:
+        d = "~/.undetected_chromedriver"
+    return os.path.abspath(os.path.expanduser(d))
+
+
 def _setup_chrome_driver(version_main=None, reseed: bool = False):
     """Launch undetected-chromedriver against Prism's own persistent profile,
     seeded from the user's real Chrome the first time so their logins carry
@@ -295,21 +362,32 @@ def _setup_chrome_driver(version_main=None, reseed: bool = False):
     # architecture, or a version behind the browser. undetected-chromedriver
     # reuses whatever it patched last time, which is exactly how a stale one
     # survives a Chrome update.
-    uc_cache = os.path.expanduser("~/Library/Application Support/undetected_chromedriver")
+    uc_cache = _uc_cache_dir()
     if os.path.exists(uc_cache):
         for f in [x for x in os.listdir(uc_cache) if "chromedriver" in x.lower()]:
             fp = os.path.join(uc_cache, f)
+            if not os.path.isfile(fp):
+                continue
             drop = None
-            try:
-                r = subprocess.run(["file", fp], capture_output=True, text=True)
-                if "x86" in r.stdout and "arm" not in r.stdout.lower():
-                    drop = "built for the wrong architecture"
-            except Exception:
-                pass
+            # Apple Silicon only. uc can end up with an x86 driver under
+            # Rosetta there, which is what this catches. It must NOT run
+            # elsewhere: on Linux x86 `file` reports "x86-64" for a perfectly
+            # good native driver, and this would delete and re-download it on
+            # every single launch.
+            if platform.system() == "Darwin" and platform.machine() == "arm64":
+                try:
+                    r = subprocess.run(["file", fp], capture_output=True, text=True)
+                    if "x86" in r.stdout and "arm" not in r.stdout.lower():
+                        drop = "built for the wrong architecture"
+                except Exception:
+                    pass
             if drop is None and version_main:
                 try:
+                    # chromedriver, unlike chrome, is a console binary on
+                    # Windows and does print its version.
                     r = subprocess.run([fp, "--version"], capture_output=True,
-                                       text=True, timeout=10)
+                                       text=True, timeout=10,
+                                       creationflags=_NO_WINDOW)
                     have = int(r.stdout.strip().split()[1].split(".")[0])
                     if have != version_main:
                         drop = f"built for Chrome v{have}, not v{version_main}"
@@ -320,6 +398,8 @@ def _setup_chrome_driver(version_main=None, reseed: bool = False):
                     os.remove(fp)
                     ui.info(f"   ♻️   replacing the cached driver — {drop}")
                 except OSError:
+                    # Windows refuses to unlink a running executable. Nothing
+                    # to do but let uc try it and report the real failure.
                     pass
 
     return uc.Chrome(options=opts, user_data_dir=tmp, version_main=version_main)
