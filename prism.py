@@ -597,25 +597,37 @@ def _discover_recipients(cfg, goal: str, source_files: list | None = None,
     through the normal preview/edit/confirm in cmd_email."""
     import time
     from core.onboarding import _ask_confirm
-    agents = C.active_agents(cfg)
-    finder = next((s for s in ("research", "brains") if agents.get(s)), None)
-    if not finder:
-        return []
-    structurer = next((s for s in ("brains", "content")
-                       if agents.get(s) and s != finder), finder)
-    _flush_stdin_noise()
-    if not _ask_confirm(
-            f"No recipients given — have {agents[finder]} search the web for "
-            f"who actually matches this, so Prism can draft AND send them an "
-            f"email — \"{goal}\"?", default=True):
-        return []
     try:
         from core import automation, mailer
     except Exception as e:
         ui.err(f"Automation deps not available ({e}).")
         return []
 
-    research_q, structure_q = mailer.discovery_prompts(goal)
+    agents = C.active_agents(cfg)
+    # "leads" is the stage built for this, so it is asked first. After that,
+    # a lead database wins the slot from whichever category it is set in —
+    # verified contact records beat a chat model recalling company names, and
+    # this is the only place that knows the run is outreach rather than
+    # ordinary research. Web-search agents are the last resort, not the plan.
+    _FINDERS = ("leads", "research", "brains")
+    finder = next((s for s in _FINDERS if agents.get(s)
+                   and mailer.prefers_lead_database(agents[s])), None)
+    if not finder:
+        finder = next((s for s in _FINDERS if agents.get(s)), None)
+    if not finder:
+        return []
+    structurer = next((s for s in ("brains", "content", "research")
+                       if agents.get(s) and s != finder), finder)
+    _flush_stdin_noise()
+    how = ("look up who actually matches this in its verified contact database"
+           if mailer.prefers_lead_database(agents[finder])
+           else "search the web for who actually matches this")
+    if not _ask_confirm(
+            f"No recipients given — have {agents[finder]} {how}, so Prism can "
+            f"draft AND send them an email — \"{goal}\"?", default=True):
+        return []
+
+    research_q, structure_q = mailer.discovery_prompts(goal, agents[finder])
     custom_stages = [
         ("research", agents[finder], [research_q]),
         ("structure", agents[structurer], [structure_q]),

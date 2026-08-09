@@ -126,13 +126,50 @@ def recipients_from_text(text: str):
 
 # ── discovered recipients (a research agent found them, not the user) ────────
 
-def discovery_prompts(goal: str) -> tuple[str, str]:
+# Tools that are lead databases rather than chat models. They are told to
+# FILTER, not to "search the web and write about it", because the whole reason
+# to route a discovery run through one is that its addresses were verified by
+# somebody other than a language model.
+LEAD_DATABASES = {"Apollo"}
+
+
+def prefers_lead_database(agent_name: str) -> bool:
+    """True when this agent looks up real contact records instead of writing
+    prose about companies. Callers use it to pick a finder for outreach runs
+    and to decide which research prompt to send."""
+    return (agent_name or "").strip() in LEAD_DATABASES
+
+
+def discovery_prompts(goal: str, finder: str = "") -> tuple[str, str]:
     """(research prompt, structuring prompt) for finding recipients that match
     a description — "the best-suited agencies in Vadodara", not one named
     org. Two stages because a research agent free-writes prose; asking it to
     also format strict CSV in the same breath tends to lose rows. Splitting
     the jobs is exactly the 'let stages cycle back through agents' pattern —
-    the structuring stage often reuses whichever agent already ran."""
+    the structuring stage often reuses whichever agent already ran.
+
+    `finder` is the agent that will run the first stage. A lead database is
+    driven differently from a chat model — it is asked to build a filter and
+    read its own results grid, not to recall companies — so the first prompt
+    changes shape entirely. The structuring stage is identical either way,
+    which is the point: whatever comes back becomes the same CSV.
+    """
+    if prefers_lead_database(finder):
+        research = (
+            "Your ONLY task is to build a prospect list for this request: "
+            f"{goal}. Use the search filters — job title, company industry, "
+            "employee headcount, and location — to narrow to companies that "
+            "genuinely match, then read the results table. For each contact "
+            "with a verified work email, list: Company name, Website, Email, "
+            "and a one-line reason it fits. One per line, in the form: "
+            "Name — Website — Email — Reason. Only include rows where the "
+            "email is actually shown and marked verified; write exactly "
+            "'unknown' for anything locked, hidden behind credits, or shown "
+            "as a guess. Never reconstruct an address from a pattern. Do not "
+            "pad the list to hit a number."
+        )
+        return research, _DISCOVERY_STRUCTURE
+
     research = (
         "Your ONLY task is: based on the brief above, find real, currently "
         f"operating businesses that match this request: {goal}. Search the "
@@ -144,16 +181,22 @@ def discovery_prompts(goal: str) -> tuple[str, str]:
         "Name — Website — Email — Reason. List every genuine candidate you "
         "can find; do not pad the list to hit a number."
     )
-    structure = (
-        "Take the candidate list from the previous stage and convert it to a "
-        "strict CSV. Reply with NOTHING except the CSV — no commentary, no "
-        "markdown fences. First line exactly: name,website,email,reason. "
-        "Then one row per candidate that has a real email address — DROP any "
-        "candidate whose email is 'unknown', blank, or that you are not "
-        "confident is real. Quote any field that contains a comma. If no "
-        "candidate has a confirmed email, reply with just the header row."
-    )
-    return research, structure
+    return research, _DISCOVERY_STRUCTURE
+
+
+# One structuring prompt for every finder. Whatever shape the first stage
+# replied in — scraped prose or a filtered results table — this turns it into
+# the same CSV, so parse_structured_csv_text() below never has to care which
+# tool found the rows.
+_DISCOVERY_STRUCTURE = (
+    "Take the candidate list from the previous stage and convert it to a "
+    "strict CSV. Reply with NOTHING except the CSV — no commentary, no "
+    "markdown fences. First line exactly: name,website,email,reason. "
+    "Then one row per candidate that has a real email address — DROP any "
+    "candidate whose email is 'unknown', blank, or that you are not "
+    "confident is real. Quote any field that contains a comma. If no "
+    "candidate has a confirmed email, reply with just the header row."
+)
 
 
 def parse_structured_csv_text(text: str) -> list[dict]:

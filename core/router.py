@@ -18,6 +18,139 @@ from . import ui
 
 GROQ_URL = "https://api.groq.com/openai/v1/chat/completions"
 
+# ── surviving Groq ────────────────────────────────────────────────────────────
+# Hosted open models get retired on a few weeks' notice, and every install
+# carries the same default. A single hardcoded model name means the day Groq
+# drops it, every customer stops being able to plan anything, at the same hour,
+# with "model_not_found" in a dialog box.
+#
+# So the model is a LIST, tried in order. The first one that answers is written
+# back into the config, so the fallback costs one wasted request once and
+# nothing afterwards. Ordered by capability: routing is the most demanding
+# thing Prism asks a model to do, and a weaker one produces worse plans rather
+# than visible errors.
+MODEL_FALLBACKS = (
+    "llama-3.3-70b-versatile",
+    "llama-3.1-8b-instant",
+    "openai/gpt-oss-120b",
+    "gemma2-9b-it",
+)
+
+# HTTP statuses worth trying again rather than surfacing. 429 is Groq's rate
+# limit, which a queue of tasks hits routinely on the free tier; 5xx is Groq
+# having a moment. Anything else is a real answer and is reported.
+_RETRY_STATUS = (429, 500, 502, 503, 504)
+
+
+def model_chain(preferred: str = "") -> list[str]:
+    """The models to try, the caller's choice first and never duplicated."""
+    chain = [m for m in ([preferred] if preferred else []) if m]
+    chain += [m for m in MODEL_FALLBACKS if m not in chain]
+    return chain
+
+
+def _remember_model(model: str, preferred: str) -> None:
+    """Persist a fallback that worked, so the next run starts there.
+
+    Written through config.load/save rather than the caller's dict: route() is
+    handed a cfg the GUI keeps in memory across dialogs, and writing that back
+    wholesale is how a stale copy erases someone's API key.
+    """
+    if not model or model == preferred:
+        return
+    try:
+        from . import config as C
+        saved = C.load()
+        if saved.get("model") != model:
+            saved["model"] = model
+            C.save(saved)
+        ui.warn(f"Groq no longer offers {preferred or 'the saved model'} — "
+                f"switched to {model} and saved it.")
+    except Exception:                                   # noqa: BLE001
+        pass        # a config we cannot write must not fail the run
+
+
+def _model_is_gone(status: int, body: dict) -> bool:
+    """Did Groq refuse because THIS MODEL is unavailable, as opposed to
+    because the key, the quota or the request was wrong?"""
+    if status not in (400, 404):
+        return False
+    blob = json.dumps(body).lower()
+    return ("model" in blob
+            and any(w in blob for w in ("not found", "does not exist",
+                                        "decommission", "deprecat",
+                                        "no longer", "unavailable")))
+
+
+def groq_chat(api_key: str, model: str, prompt: str, *, temperature: float = 0.3,
+              timeout: int = 60, retries: int = 1) -> str:
+    """One Groq completion, with the two failures a daily user actually hits.
+
+    Rate limits are retried after the wait Groq asks for; a retired model falls
+    through to the next in the chain and the working one is saved. Everything
+    else raises with the server's own words, because those are usually
+    actionable ("invalid api key") and paraphrasing them loses that.
+    """
+    headers = {"Authorization": f"Bearer {api_key}",
+               "Content-Type": "application/json"}
+    last = ""
+    for candidate in model_chain(model):
+        for attempt in range(retries + 1):
+            try:
+                resp = requests.post(
+                    GROQ_URL, headers=headers,
+                    json={"model": candidate,
+                          "messages": [{"role": "user", "content": prompt}],
+                          "temperature": temperature},
+                    timeout=timeout)
+            except requests.RequestException as e:
+                raise RuntimeError(
+                    f"Couldn't reach Groq — check your internet connection. "
+                    f"({e})") from e
+
+            try:
+                body = resp.json()
+            except ValueError:
+                body = {}
+
+            if resp.status_code == 200 and "choices" in body:
+                _remember_model(candidate, model)
+                return body["choices"][0]["message"]["content"]
+
+            if resp.status_code in _RETRY_STATUS and attempt < retries:
+                # Groq names the wait in a header; honour it, but cap it —
+                # nobody wants the window to sit there for two minutes.
+                import time
+                delay = 5
+                try:
+                    delay = min(int(float(resp.headers.get("retry-after", 5))), 20)
+                except (TypeError, ValueError):
+                    pass
+                ui.warn(f"Groq is rate-limiting this key — waiting {delay}s "
+                        f"and trying once more.")
+                time.sleep(delay)
+                continue
+
+            if _model_is_gone(resp.status_code, body):
+                ui.warn(f"Groq has retired {candidate} — trying the next model.")
+                break               # next candidate in the chain
+
+            if resp.status_code == 429:
+                raise RuntimeError(
+                    "Groq is rate-limiting your API key. Wait a minute and try "
+                    "again, or raise your limits at console.groq.com.")
+            if resp.status_code == 401:
+                raise RuntimeError(
+                    "Groq rejected your API key. Re-enter it in Setup → Groq "
+                    "API key.")
+            last = f"HTTP {resp.status_code}: {json.dumps(body)[:300]}"
+            raise RuntimeError(f"Groq API error ({last})")
+
+    raise RuntimeError(
+        "None of the models Prism knows about are available on your Groq key. "
+        "Check console.groq.com for the current model list, then set it in "
+        f"Setup. Tried: {', '.join(model_chain(model))}")
+
 # Human field notes about the tools — written by the user from real experience
 # (pros, cons, "use this one for X, avoid for Y"). If this file exists, its
 # contents are injected into every routing prompt so Groq routes with the
@@ -162,6 +295,13 @@ _STAGE_HELP = {
                 "wouldn't already know, e.g. a complex build needing current docs or real market data. "
                 "NOT for analysing given material and NOT for simple asks."
                 "For research purpose where you'll need the factual evidences on recent events or when webscraping will be needed along with writing something about that information in depth",
+    "leads": "finding WHO to approach — real companies, named decision-makers and their "
+             "contact email addresses. Turn this on for anything shaped like 'find "
+             "customers / prospects / leads / companies in <place or industry>', or an "
+             "outreach task that names no recipients. It answers WHO, never WHAT: it "
+             "does not write the email, that is content or brains. Independent of "
+             "research — a run may need research to decide which industry to target "
+             "and leads to pull the companies in it, so turning BOTH on is normal.",
     "brains": "the DEFAULT workhorse — analysis, reasoning, strategy, architecture, planning, AND short"
               "written outputs like briefs, plans, explanations or prompts for the next stage. Small tasks "
               "usually need ONLY this stage.",
@@ -239,17 +379,12 @@ Raw request:
 {query}
 
 Return ONLY the brief as plain text bullets — no preamble, no commentary."""
-    headers = {"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"}
-    payload = {
-        "model": model,
-        "messages": [{"role": "user", "content": prompt}],
-        "temperature": 0.3,
-    }
-    resp = requests.post(GROQ_URL, headers=headers, json=payload, timeout=45)
-    rj = resp.json()
-    if "choices" not in rj:
+    # Enrichment is a nicety — routing works without it — so a failure here
+    # returns empty rather than raising and taking the plan down with it.
+    try:
+        return groq_chat(api_key, model, prompt, timeout=45).strip()
+    except Exception:                                   # noqa: BLE001
         return ""
-    return rj["choices"][0]["message"]["content"].strip()
 
 
 def _norm_name(s: str) -> str:
@@ -333,15 +468,8 @@ fine, suggest nothing for that stage — most stages should get NO suggestion.
 Return ONLY a JSON array (empty if nothing stands out):
 [{{"stage": "...", "current": "...", "suggested": "...", "reason": "one sentence"}}]"""
     try:
-        resp = requests.post(
-            GROQ_URL,
-            headers={"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"},
-            json={"model": model, "messages": [{"role": "user", "content": prompt}],
-                  "temperature": 0},
-            timeout=45,
-        )
-        rj = resp.json()
-        text = rj["choices"][0]["message"]["content"]
+        text = groq_chat(api_key, model, prompt, temperature=0, timeout=45,
+                         retries=0)
         s, e = text.find("["), text.rfind("]") + 1
         data = json.loads(text[s:e]) if s != -1 and e > s else []
         out = []
@@ -358,6 +486,39 @@ Return ONLY a JSON array (empty if nothing stands out):
         return out
     except Exception:
         return []
+
+
+
+# Tools that run their own multi-pass research loop. Prism's house style —
+# "Your ONLY task is", an exhaustive deliverable spec, a fixed section list —
+# reads to these as an instruction to stop after one pass, and they come back
+# thinner than the tool they were chosen over. They need the goal and the
+# quality bar, not the procedure.
+#
+# Read off the registry rather than listed here, so marking a new tool
+# self-directing is one flag in agents.py and nothing else.
+def _self_directing_names() -> list[str]:
+    return sorted(name for name, cfg in A.AGENT_REGISTRY.items()
+                  if cfg.get("prompt_style") == "natural")
+
+
+def _self_directing_rule(agents: dict) -> str:
+    """The carve-out, included only when such a tool is actually in the plan."""
+    names = [n for n in _self_directing_names() if n in set(agents.values())]
+    if not names:
+        return ""
+    listed = " and ".join(names)
+    return (
+        f"- SELF-DIRECTING TOOLS ({listed}). {listed} runs its own multi-pass\n"
+        f"  research loop and scrapes the live web itself. For its stage ONLY,\n"
+        f"  write the prompt as a well-briefed human would ask a specialist:\n"
+        f"    • Do NOT use the \"Your ONLY task is:\" opener.\n"
+        f"    • Give it the SUBJECT, the audience, and what a good answer must\n"
+        f"      cover — then let it choose how to get there.\n"
+        f"    • Do NOT prescribe the steps, the section list, or the word count.\n"
+        f"    • Keep ROLE and CONTEXT; drop the rigid DELIVERABLE SPEC.\n"
+        f"  Over-specifying makes {listed} skip its analyse and optimise passes,\n"
+        f"  which is the entire reason it was picked over a plain search tool.\n")
 
 
 def build_prompt(query: str, profile: str, agents: dict, attachments: list | None = None,
@@ -388,6 +549,7 @@ def build_prompt(query: str, profile: str, agents: dict, attachments: list | Non
         "SCOPE LOCK, and never enable a stage the task doesn't need just because its "
         "tool is premium.\n" if enabled_premium else ""
     )
+    self_directing_block = _self_directing_rule(agents)
     brief_block = (
         "\n═══ TASK BRIEF (auto-expanded from the raw request by a prompt-"
         "engineering pass; mine it for context, deliverable specs, quality "
@@ -457,7 +619,7 @@ outputs as context:
   stage genuinely needs distinct prompts.
 - DEVELOPMENT prompts must include full specs so the agent can ship a working
   result. SUMMARY must explicitly reference and combine the earlier outputs.
-- PROMPT CRAFT (this is why Prism exists — every stage prompt must read like
+{self_directing_block}- PROMPT CRAFT (this is why Prism exists — every stage prompt must read like
   professional prompt engineering, never a paraphrase of the user's words).
   After the mandatory "Your ONLY task is:" opener, every prompt MUST contain:
     • ROLE: cast the agent as a specific senior expert matched to the task
@@ -546,17 +708,9 @@ def route(query: str, cfg: dict, attachments: list | None = None) -> dict:
     # Pass 2 — routing: pick stages and write engineered prompts from the brief.
     prompt = build_prompt(query, cfg.get("profile", ""), agents, attachments,
                           premium=cfg.get("premium") or [], brief=brief)
-    headers = {"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"}
-    payload = {
-        "model": model,
-        "messages": [{"role": "user", "content": prompt}],
-        "temperature": 0.3,
-    }
-    resp = requests.post(GROQ_URL, headers=headers, json=payload, timeout=60)
-    rj = resp.json()
-    if "choices" not in rj:
-        raise RuntimeError(f"Groq API error (HTTP {resp.status_code}): {json.dumps(rj)[:400]}")
-    text = rj["choices"][0]["message"]["content"]
+    # The one call the whole plan depends on, so this is the one that gets a
+    # retry and the full model chain.
+    text = groq_chat(api_key, model, prompt, timeout=60)
     s, e = text.find("{"), text.rfind("}") + 1
     if s == -1 or e <= s:
         raise RuntimeError(f"Groq returned no JSON:\n{text[:400]}")

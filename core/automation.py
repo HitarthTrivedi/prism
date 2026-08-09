@@ -402,7 +402,26 @@ def _setup_chrome_driver(version_main=None, reseed: bool = False):
                     # to do but let uc try it and report the real failure.
                     pass
 
-    return uc.Chrome(options=opts, user_data_dir=tmp, version_main=version_main)
+    try:
+        return uc.Chrome(options=opts, user_data_dir=tmp,
+                         version_main=version_main)
+    except Exception as e:
+        # Chrome updates itself about monthly, and for a day or two after a
+        # major release there may be no matching driver to download — as there
+        # is none on a machine behind a proxy that blocks the fetch. The raw
+        # Selenium traceback tells a business owner nothing, and this is the
+        # first thing that happens when they press Start the work.
+        detail = str(e).strip().splitlines()[0][:180] if str(e).strip() else ""
+        raise RuntimeError(
+            "Prism couldn't start Chrome.\n\n"
+            "This is almost always a version mismatch — Chrome updated itself "
+            "and the matching driver isn't available yet.\n\n"
+            "Two things fix it:\n"
+            "  1. Update Chrome (Chrome menu → About Google Chrome) and try "
+            "again.\n"
+            "  2. If you have pinned a version in Settings → Chrome, clear "
+            "that box so Prism detects it automatically.\n\n"
+            + (f"Technical detail: {detail}" if detail else "")) from e
 
 
 def _needed_stages(routing: dict, agents: dict):
@@ -785,6 +804,271 @@ def _click_by_text(driver, texts: list[str], timeout: int = 10) -> bool:
         return True
     except Exception:
         return False
+
+
+# ── how firmly to talk to a tool ──────────────────────────────────────────────
+# Most agents are chat models being used as pipeline components, and they need
+# telling: do only this, hand over in this shape, do not ask me questions back.
+# That block of STRICT PIPELINE RULES is what keeps a ten-stage run coherent.
+#
+# It is also actively harmful to a tool that does its own multi-pass work.
+# LAZYCOOK runs Generate → Analyze → Optimize → Validate and scrapes the web
+# itself; "perform ONLY the task above — nothing more" reads to it as an
+# instruction to skip those passes, and it answers in one shot. The tool then
+# underperforms the Perplexity it was picked over, which looks like Prism
+# choosing badly rather than Prism asking badly.
+#
+# So an agent can declare prompt_style="natural" and get asked the way a person
+# would ask. The pipeline still needs a handoff, so it is still requested — as
+# a request, at the end, in a sentence rather than as rule 3 of 4.
+def _is_natural(agent_cfg: dict) -> bool:
+    return (agent_cfg or {}).get("prompt_style") == "natural"
+
+
+def _context_header(agent_cfg: dict, prev_stage: str) -> str:
+    """The line that introduces the previous stage's output."""
+    if _is_natural(agent_cfg):
+        return ("Here's what I've got so far on this — use whatever is useful "
+                "and ignore the rest:\n\n")
+    return (f"Context from the previous pipeline stage ({prev_stage.upper()}) — "
+            "it already includes the distilled findings of every stage "
+            "before it. Build directly on this brief:\n\n")
+
+
+def _context_footer(agent_cfg: dict) -> str:
+    if _is_natural(agent_cfg):
+        return "\n\nWith that in mind:\n\n"
+    return "\n\nNow continue the pipeline and complete the following:\n\n"
+
+
+def _natural_handoff(nxt_agent: str, final: bool) -> str:
+    """A request, not a rule sheet.
+
+    Deliberately says nothing about performing only the task, nothing about
+    the reader being a machine, and nothing about not asking questions. Those
+    three are what suppress a self-directing tool. What it does keep is the
+    one thing the pipeline genuinely cannot work without: a short summary at
+    the end that the next tool can read on its own.
+    """
+    if final:
+        return ("\n\nGo as deep as you think it needs — research it properly, "
+                "check what you find, and give me the finished piece rather "
+                "than an outline. Please don't finish by asking me what I'd "
+                "like next; just give me your best work.")
+    return (
+        "\n\nTake your time with this one — research it properly and use your "
+        "own judgement about what matters. Depth is welcome.\n\n"
+        f"One thing I need at the end: I'm passing your answer straight to "
+        f"{nxt_agent}, and it won't see any of this conversation. So finish "
+        f"with a short section headed 'HANDOFF FOR {nxt_agent.upper()}' — just "
+        f"the key facts, figures and decisions it would need to carry on "
+        f"without me explaining anything. Keep it brief; the detailed work "
+        f"goes above it.")
+
+
+def _resolve_suffix(agent_cfg: dict, stage: str, query: str) -> str:
+    """The literal text appended to this agent's prompt for this stage.
+
+    A registry entry is either a plain string — always appended — or a switch:
+
+        {"when": ("canva", "editable", …),
+         "asked":     "…build it as an editable Canva design…",
+         "otherwise": "…generate the image yourself, do not use Canva…"}
+
+    which is resolved against THE USER'S OWN WORDS, not against the router's
+    rewrite of them. That distinction is the whole point. ChatGPT with the
+    Canva app connected will route every image through it given the chance,
+    and the result is a stock template where an illustration was wanted — so
+    the editable-design path has to be something the customer asked for out
+    loud, and a router paraphrasing a brief must not be able to opt them in.
+
+    Both branches are spelled out because silence is not neutral: leaving the
+    prompt quiet is what let ChatGPT reach for Canva unprompted.
+    """
+    entry = (agent_cfg.get("stage_suffix") or {}).get(stage, "")
+    if isinstance(entry, str):
+        return entry
+    if not isinstance(entry, dict):
+        return ""
+    triggers = entry.get("when") or ()
+    lowered = (query or "").lower()
+    asked = any(str(t).lower() in lowered for t in triggers)
+    return entry.get("asked" if asked else "otherwise", "") or ""
+
+
+# ── Apollo: a filter screen, not a chat box ───────────────────────────────────
+#
+# Every other tool in the registry takes one blob of text. Apollo takes a set
+# of FIELDS, and its API refuses any single field over 200 characters — which
+# is how a normal pipeline brief ended a run with:
+#     Value too long: 'Context from the previous pipeline stage (RESEA…'
+#
+# Two halves to the fix. agents._APOLLO_HANDOFF makes the previous stage write
+# a fixed block of filter lines instead of prose; everything below parses that
+# block and puts the values into Apollo's own search URL.
+#
+# Why the URL and not the filter widgets: Apollo mirrors its entire search
+# state into the address bar, so navigating to a built URL sets the same
+# filters as clicking through the left rail — without touching a single one
+# of the class names that rail is built from. The results grid is the only
+# part of the DOM this still depends on.
+#
+# The parameter names are Apollo's own, read off the address bar of a search
+# built by hand in the UI. If Apollo renames one, that filter silently stops
+# applying (the search still runs, just wider) — so a run that comes back
+# with obviously unfiltered results means it is time to build the search in
+# Apollo once and compare its URL against _APOLLO_PARAMS.
+_APOLLO_PARAMS = {
+    "TITLES":     "personTitles[]",
+    "LOCATIONS":  "personLocations[]",
+    "INDUSTRIES": "qOrganizationKeywordTags[]",
+}
+
+# Apollo expresses headcount as a "low,high" pair. The handoff spec asks for
+# these exact labels so the mapping can be a lookup rather than a parser.
+_APOLLO_HEADCOUNT = {
+    "1-10": "1,10", "11-20": "11,20", "21-50": "21,50", "51-100": "51,100",
+    "101-200": "101,200", "201-500": "201,500", "501-1000": "501,1000",
+    "1001-2000": "1001,2000", "2001-5000": "2001,5000",
+    "5001-10000": "5001,10000", "10001+": "10001,1000000",
+}
+
+_APOLLO_FIELDS = ("TITLES", "INDUSTRIES", "LOCATIONS", "HEADCOUNT", "KEYWORDS")
+
+
+def _apollo_filters(text: str, cap: int = 180) -> dict[str, list[str]]:
+    """Pull the 'HANDOFF FOR APOLLO' block out of the previous stage's answer.
+
+    Tolerant on purpose: the block is looked for anywhere in the text, the
+    field names are matched case-insensitively, and markdown bullets or bold
+    the model added anyway are stripped off. A field it could not narrow comes
+    back as "any", which is treated as absent rather than searched for
+    literally — searching Apollo for the job title "any" returns nothing.
+
+    Every value is truncated to `cap`, because the whole point of this path is
+    that Apollo rejects long ones. Truncation is the last line of defence: the
+    prompt already asked for short values, but a prompt is a request and this
+    is a guarantee.
+    """
+    import re
+
+    out: dict[str, list[str]] = {}
+    for field in _APOLLO_FIELDS:
+        # Last occurrence wins — models often restate the block, and the final
+        # one is the considered answer rather than an example being echoed.
+        hits = re.findall(rf"^\W*{field}\s*:\s*(.+)$", text,
+                          re.IGNORECASE | re.MULTILINE)
+        if not hits:
+            continue
+        raw = hits[-1].strip().strip("*_`").strip()
+        values = []
+        for part in raw.split(","):
+            v = part.strip().strip("*_`[]").strip()
+            # "any"/"n/a"/"none" all mean "the model declined to narrow this".
+            if not v or v.lower() in ("any", "n/a", "na", "none", "all", "-"):
+                continue
+            values.append(v[:cap])
+        if values:
+            out[field] = values[:8]   # a 40-title search is not a search
+    return out
+
+
+def _apollo_url(base: str, filters: dict[str, list[str]]) -> str:
+    """Turn parsed filters into an Apollo people-search URL.
+
+    Apollo is a hash-routed SPA, so the query string lives after '#/people'.
+    The '[]' in its repeated parameters is left literal rather than
+    percent-encoded — that is how Apollo writes its own links.
+    """
+    from urllib.parse import quote
+
+    parts = ["page=1",
+             # The reason to use Apollo at all rather than ask a model to
+             # guess addresses. Without it the table fills with rows whose
+             # email column is a locked placeholder.
+             "contactEmailStatusV2[]=verified"]
+
+    for field, param in _APOLLO_PARAMS.items():
+        for value in filters.get(field, []):
+            parts.append(f"{param}={quote(value)}")
+    if filters.get("INDUSTRIES"):
+        # Tells Apollo which company fields the industry keywords above should
+        # be matched against; without it the keyword filter is ignored.
+        parts.append("includedOrganizationKeywordFields[]=tags")
+        parts.append("includedOrganizationKeywordFields[]=name")
+    for band in filters.get("HEADCOUNT", []):
+        pair = _APOLLO_HEADCOUNT.get(band.replace(" ", ""))
+        if pair:
+            parts.append(f"organizationNumEmployeesRanges[]={quote(pair)}")
+    if filters.get("KEYWORDS"):
+        parts.append("qKeywords=" + quote(" ".join(filters["KEYWORDS"])))
+
+    root = base.split("?")[0] or "https://app.apollo.io/#/people"
+    return f"{root}?" + "&".join(parts)
+
+
+def _run_apollo(driver, agent_cfg: dict, stage: str, brief: str) -> list[str]:
+    """Drive Apollo by URL from the filter block the previous stage wrote.
+
+    Falls back to typing a short query into the search box when there is no
+    parseable block — an Apollo search on rough keywords still beats failing
+    the stage, and the truncation keeps it inside the 200-character limit that
+    caused the original error either way.
+    """
+    from selenium.webdriver.common.by import By
+    from selenium.webdriver.common.keys import Keys
+    from selenium.webdriver.support.ui import WebDriverWait
+    from selenium.webdriver.support import expected_conditions as EC
+
+    cap = int(agent_cfg.get("max_query_chars", 180))
+    filters = _apollo_filters(brief, cap)
+
+    if filters:
+        shown = "; ".join(f"{k.lower()}: {', '.join(v)}"
+                          for k, v in filters.items())
+        ui.info(f"   🎯  Apollo filters — {shown}")
+        url = _apollo_url(agent_cfg.get("url", ""), filters)
+        try:
+            driver.get(url)
+        except Exception as e:
+            ui.warn(f"   couldn't open the filtered search ({e})")
+    else:
+        # Nothing structured came back. Take the longest line that looks like
+        # prose about who to find, and search on that.
+        ui.warn("   the previous stage sent no APOLLO filter block — falling "
+                "back to a plain keyword search")
+        words = [ln.strip() for ln in brief.splitlines()
+                 if len(ln.strip()) > 20 and not ln.strip().startswith("#")]
+        query = _bmp_safe((words[-1] if words else brief)[:cap])
+        try:
+            box = WebDriverWait(driver, agent_cfg.get("input_wait", 30)).until(
+                EC.presence_of_element_located(
+                    (By.CSS_SELECTOR, agent_cfg["textarea_selector"])))
+            box.clear()
+            if not _fast_type(driver, box, query):
+                box.send_keys(query)
+            box.send_keys(Keys.ENTER)
+        except Exception as e:
+            ui.err(f"   couldn't run the Apollo search: {e}")
+            return []
+
+    # The grid loads asynchronously well after the URL settles.
+    try:
+        WebDriverWait(driver, agent_cfg.get("input_wait", 45)).until(
+            EC.presence_of_element_located(
+                (By.CSS_SELECTOR, agent_cfg["response_selector"])))
+    except Exception:
+        pass
+    time.sleep(4)
+
+    rows = _capture(driver, agent_cfg)
+    if not rows:
+        ui.warn("   Apollo returned no rows. Three things do this: the "
+                "filters matched nobody, this Apollo account is signed out, "
+                "or it is out of email credits for the month. Open Login "
+                "tabs, check you can see the People table, and check your "
+                "credit balance at the top of Apollo.")
+    return rows
 
 
 def _run_notebooklm(driver, agent_cfg: dict, stage: str, prompt: str) -> list[str]:
@@ -1189,8 +1473,18 @@ def run(routing: dict, cfg: dict, attachments=None, on_event=None,
     from selenium.webdriver.support import expected_conditions as EC
     from . import files as F
 
+    from . import lang as L
+
     attachments = attachments or []
     attach_ctx = F.context_block(attachments)
+
+    # "Reply in Gujarati", if the user asked for it. Resolved once per run
+    # rather than per prompt: it is the same sentence every time, and reading
+    # it here keeps the per-stage code to one `if`.
+    answer_language = L.directive(cfg.get("output_language") or "")
+    if answer_language:
+        ui.info(f"   🌐  tools will answer in "
+                f"{L.NAMES.get(cfg['output_language'], '')}")
 
     def emit(kind, payload):
         if on_event:
@@ -1506,13 +1800,9 @@ def run(routing: dict, cfg: dict, attachments=None, on_event=None,
                 prev_text = "\n\n".join(t for t in prev_texts if t.strip())
                 if len(prev_text) > _MAX_FORWARD_CHARS:
                     prev_text = prev_text[-_MAX_FORWARD_CHARS:]
-                context += (
-                    f"Context from the previous pipeline stage ({prev_stage.upper()}) — "
-                    "it already includes the distilled findings of every stage "
-                    "before it. Build directly on this brief:\n\n"
-                    f"{prev_text}\n\n"
-                    "Now continue the pipeline and complete the following:\n\n"
-                )
+                context += (_context_header(agent_cfg, prev_stage)
+                            + prev_text
+                            + _context_footer(agent_cfg))
 
             # The stage feeding a LOCAL renderer is machine-read, so it gets
             # the final-stage rules even though a stage follows it. The normal
@@ -1521,6 +1811,17 @@ def run(routing: dict, cfg: dict, attachments=None, on_event=None,
             # a JSON object", and a model resolving that contradiction writes
             # the handoff and drops the spec. That is exactly how a run ends up
             # with nothing to render.
+            # Is this stage's answer read by a person, or parsed by something?
+            # It decides whether the user's "write back in Gujarati" setting
+            # applies further down: a JSON scene spec or an Apollo filter block
+            # translated into another language parses as nothing at all.
+            machine_shaped = (
+                stage_idx in machine_stages
+                or stage_idx == spec_feeder
+                or (stage_idx + 1 < len(stages)
+                    and A.AGENT_REGISTRY.get(stages[stage_idx + 1][1], {})
+                         .get("handoff_spec")))
+
             if stage_idx in machine_stages:
                 handoff = machine_stages[stage_idx]
             elif stage_idx == spec_feeder:
@@ -1533,6 +1834,14 @@ def run(routing: dict, cfg: dict, attachments=None, on_event=None,
                     "follow-up question — any of those and nothing can be "
                     "rendered."
                 )
+            elif machine_shaped and stage_idx + 1 < len(stages):
+                # The next tool is not a chat box — it is a search screen with
+                # its own idea of what an input looks like (Apollo's fields cap
+                # at 200 characters and ignore prose). Such a tool ships the
+                # exact handoff it can parse, and it replaces the generic prose
+                # rules below wholesale rather than being appended to them:
+                # asking for a prose summary AND a filter block gets the prose.
+                handoff = A.AGENT_REGISTRY[stages[stage_idx + 1][1]]["handoff_spec"]
             elif stage_idx + 1 < len(stages):
                 nxt_stage, nxt_agent, _ = stages[stage_idx + 1]
                 rules = [
@@ -1559,10 +1868,13 @@ def run(routing: dict, cfg: dict, attachments=None, on_event=None,
                     "follow-up question or an offer of options. The handoff "
                     "section must be the LAST thing in your answer."
                 )
-                handoff = "\n\nSTRICT PIPELINE RULES:\n" + "\n".join(
-                    f"{i}. {r}" for i, r in enumerate(rules, 1))
-            else:
                 handoff = (
+                    _natural_handoff(nxt_agent, final=False)
+                    if _is_natural(agent_cfg) else
+                    "\n\nSTRICT PIPELINE RULES:\n" + "\n".join(
+                        f"{i}. {r}" for i, r in enumerate(rules, 1)))
+            else:
+                handoff = _natural_handoff("", final=True) if _is_natural(agent_cfg) else (
                     "\n\nSTRICT PIPELINE RULES:\n"
                     "You are the FINAL stage. The context above is your complete "
                     "brief — everything important from earlier stages is already "
@@ -1571,7 +1883,25 @@ def run(routing: dict, cfg: dict, attachments=None, on_event=None,
                     "section, and do not ask any follow-up questions."
                 )
 
-            if agent_name == "NotebookLM":
+            # The user asked for answers in their own language. Appended last
+            # so it is the final instruction the model reads, and skipped for
+            # machine-shaped stages, where translating the output would break
+            # whatever is about to parse it.
+            if answer_language and not machine_shaped:
+                handoff += "\n\n" + answer_language
+
+            if agent_cfg.get("search_tool") == "apollo":
+                # Deliberately does NOT get `context`. That blob opens with
+                # "Context from the previous pipeline stage (RESEARCH) —" and
+                # is thousands of characters long; handing it to Apollo is the
+                # exact call that failed with "Value too long". What Apollo
+                # needs out of the previous stage is the filter block, which
+                # _run_apollo parses for itself — and the questions carry the
+                # user's own wording as the fallback if that block is missing.
+                stage_responses = _run_apollo(
+                    driver, agent_cfg, stage,
+                    _bmp_safe("\n".join(questions) + "\n" + context))
+            elif agent_name == "NotebookLM":
                 # NotebookLM is not a chat box — it's a "sources" notebook
                 # (add a source, then either ask about it or generate a
                 # Video/Audio Overview). Best-effort automation driven by
@@ -1623,6 +1953,18 @@ def run(routing: dict, cfg: dict, attachments=None, on_event=None,
                             if script else "")
                     questions = [head + q.replace(_web_token(), listing)
                                  for q in questions]
+
+                # A tool's own capabilities are described to the ROUTER, which
+                # then decides what to ask for — a nudge, not an instruction,
+                # and router.py explicitly tells the model to weigh field notes
+                # above those descriptions. So a capability that only exists
+                # because the user connected something (ChatGPT + the Canva
+                # app) needs saying literally, in the prompt, every time that
+                # agent runs that stage. Keyed by stage so ChatGPT's brains
+                # turn is not told to go and make a design.
+                suffix = _resolve_suffix(agent_cfg, stage, query)
+                if suffix:
+                    questions = [q + "\n\n" + suffix for q in questions]
 
                 for idx, prompt in enumerate(questions, 1):
                     try:

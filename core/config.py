@@ -95,11 +95,18 @@ def active_agents(cfg: dict) -> dict:
     return {k: v for k, v in (cfg.get("agents") or {}).items() if v}
 
 
-def save_run(record: dict) -> str:
-    """Persist one query's routing + responses to ~/.prism/runs/<ts>.json."""
+def save_run(record: dict, runs_dir: str = "") -> str:
+    """Persist one query's routing + responses to <runs_dir>/run_<ts>.json.
+
+    `runs_dir` defaults to ~/.prism/runs, which is where the CLI has always
+    written and still does. The GUI passes a per-member folder instead when
+    the copy belongs to a company team, so one person's history does not land
+    in another's — see prism_gui/workspace.py.
+    """
     import time
-    os.makedirs(RUNS_DIR, exist_ok=True)
-    path = os.path.join(RUNS_DIR, f"run_{int(time.time())}.json")
+    runs_dir = runs_dir or RUNS_DIR
+    os.makedirs(runs_dir, exist_ok=True)
+    path = os.path.join(runs_dir, f"run_{int(time.time())}.json")
     with open(path, "w", encoding="utf-8") as f:
         json.dump(record, f, indent=2, ensure_ascii=False)
     return path

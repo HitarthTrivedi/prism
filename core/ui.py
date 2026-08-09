@@ -28,6 +28,7 @@ _THEME = {
     "brand": "bold #EF4B77",
     "brains": "#EF4B77",
     "research": "#4C9AFF",
+    "leads": "#4BE08A",
     "content": "#FF8A4B",
     "visual": "#4CD9B4",
     "media": "#B47BFF",
