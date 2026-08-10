@@ -200,6 +200,11 @@ class Item:
 @dataclass
 class Result:
     counts: dict = field(default_factory=dict)
+    # Every message with what it was sorted as, in arrival order — including
+    # the ones nothing happens to. The counts alone are a summary; a customer
+    # deciding whether to trust the sorting needs to see the newsletter sitting
+    # in the promotions column with "carries an unsubscribe link" next to it.
+    sorted_mail: list = field(default_factory=list)   # [(Message, Verdict)]
     new_inquiries: list[Item] = field(default_factory=list)
     replies: list[Item] = field(default_factory=list)
     orders: list[Item] = field(default_factory=list)
@@ -262,6 +267,7 @@ def check(cfg: dict, paths: Paths, *, state: State | None = None,
     verdicts = triage.classify(messages, api_key, knowledge=knowledge,
                                local_only=local_only)
     out.counts = triage.summarise(verdicts)
+    out.sorted_mail = list(zip(messages, verdicts))
 
     try:
         rows = register.load(paths.register_csv)
