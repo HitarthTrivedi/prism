@@ -241,6 +241,13 @@ def check(cfg: dict, paths: Paths, *, state: State | None = None,
     """
     today = today or date.today()
     api_key = (cfg or {}).get("api_key", "")
+    # local_only has to mean every AI call on message content, not just the
+    # sorting one. It was passed to triage alone at first, which left the
+    # detail extraction and the reply reading still sending customer
+    # correspondence out — a privacy switch that quietly did two thirds of
+    # what its name promises is worse than not offering one.
+    if local_only:
+        api_key = ""
     knowledge = knowledge or triage.Knowledge()
     out = Result(state=state or State(), knowledge=knowledge)
 

@@ -51,17 +51,46 @@ def rupees(value) -> Decimal:
     return value.quantize(PAISE, rounding=ROUND_HALF_UP)
 
 
+# A money cell as an Indian office actually writes it. The whole string has to
+# match: currency in front, the number, then at most one piece of decoration
+# after it. Being strict is the point — a cell holding two numbers, or prose,
+# is not a price, and picking the first digits out of it would be a guess
+# wearing the clothes of an answer.
+#
+#   Rs.1,000/-   ₹ 1,42,500.00   28.50/nos   1,000 nos   -500   142500
+#
+# The trailing "/-" is why this is a regex rather than a character strip. The
+# first version deleted everything that was not a digit, a dot or a minus,
+# which turned "Rs.1,000/-" into ".1000-" — unparseable, and so silently zero.
+# Every order value typed the normal way summarised as ₹0, and a rate written
+# "28.50/-" quoted at nothing.
+_MONEY_CELL = re.compile(r"""
+    ^\s*
+    (?:rs\.?|inr|₹|₹)?\s*          # optional currency in front
+    (?P<number>-?\d[\d,]*(?:\.\d+)?)    # the number itself
+    \s*(?:/-|/=)?                       # the Indian "and no paise" ending
+    \s*(?:/\s*)?[a-z%.]{0,12}           # an optional trailing unit: /nos, kg
+    \s*$
+""", re.IGNORECASE | re.VERBOSE)
+
+
 def to_decimal(value, default: str = "0") -> Decimal:
-    """Whatever was in the cell, as a Decimal. Handles "₹ 1,42,500.00"."""
+    """Whatever was in the cell, as a Decimal. Unreadable cells give `default`.
+
+    Deliberately returns the default rather than raising: one mistyped cell in
+    a five-thousand-row rate list must not stop the whole file loading. The
+    caller sees a zero, which is visible; an exception would lose the other
+    4,999 rows.
+    """
     if isinstance(value, Decimal):
         return value
     if isinstance(value, (int, float)):
         return Decimal(str(value))
-    text = re.sub(r"[^\d.\-]", "", str(value or "").strip())
-    if not text or text in ("-", ".", "-."):
+    match = _MONEY_CELL.match(str(value or ""))
+    if not match:
         return Decimal(default)
     try:
-        return Decimal(text)
+        return Decimal(match.group("number").replace(",", ""))
     except Exception:
         return Decimal(default)
 

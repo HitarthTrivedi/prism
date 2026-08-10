@@ -27,7 +27,7 @@ import os
 import re
 from dataclasses import dataclass
 from datetime import date, datetime
-from decimal import Decimal, InvalidOperation
+from decimal import Decimal
 
 # ── the statuses an inquiry moves through ────────────────────────────────────
 NEW = "New"
@@ -230,6 +230,55 @@ def add_thread(row: dict, message) -> None:
     row["Thread"] = " ".join(sorted(ids))
 
 
+# Subjects that say nothing about what was wanted. Half of all inquiries arrive
+# under one of these, and on their own they are useless twice over: a human
+# reading the register learns nothing, and matching them against a rate list
+# finds nothing.
+_GENERIC_SUBJECT = {
+    "enquiry", "enquiry.", "inquiry", "quotation", "quote", "quotation required",
+    "quotation request", "requirement", "requirements", "rfq", "query",
+    "request", "price", "prices", "rate", "rates", "price list", "urgent",
+    "hello", "hi", "regarding", "reg", "no subject", "your quotation",
+}
+
+_GREETING = ("dear", "hi ", "hii", "hello", "respected", "sir", "madam",
+             "greetings", "good morning", "good afternoon", "good evening",
+             "thanks", "thank you", "regards")
+
+
+def _first_real_line(body: str, limit: int = 140) -> str:
+    """The first line of an email that is not a greeting — what they want."""
+    for line in (body or "").splitlines():
+        line = line.strip(" >\t")
+        if len(line) < 8:
+            continue
+        if line.lower().startswith(_GREETING):
+            continue
+        return line[:limit]
+    return ""
+
+
+def product_summary(message) -> str:
+    """What was asked for, for the register and for matching a rate list.
+
+    Uses the subject when the subject carries information. When it does not —
+    a bare "Enquiry", which is how half of them arrive — the opening line of
+    the message is added, because that is the line a person would read to find
+    out what the mail is about.
+    """
+    subject = re.sub(r"^\s*(re|fw|fwd)\s*:\s*", "",
+                     getattr(message, "subject", "") or "",
+                     flags=re.IGNORECASE).strip()
+    words = [w for w in re.findall(r"[A-Za-z0-9]+", subject) if len(w) > 1]
+    informative = subject and subject.lower() not in _GENERIC_SUBJECT and len(words) >= 4
+    if informative:
+        return subject[:200]
+    opening = _first_real_line(getattr(message, "body", "") or "")
+    if subject and opening:
+        return f"{subject} — {opening}"[:200]
+    return (opening or subject)[:200]
+
+
 def from_message(message, details: dict | None = None, *, prefix: str = "INQ",
                  rows: list[dict] | None = None, folder: str = "") -> dict:
     """A fresh register row for a message that triage called an inquiry.
@@ -249,7 +298,7 @@ def from_message(message, details: dict | None = None, *, prefix: str = "INQ",
     row["Contact person"] = details.get("contact") or getattr(message, "from_name", "") or ""
     row["Email"] = getattr(message, "from_addr", "") or ""
     row["Phone"] = details.get("phone", "")
-    row["Product asked"] = details.get("product") or getattr(message, "subject", "") or ""
+    row["Product asked"] = details.get("product") or product_summary(message)
     row["Quantity"] = details.get("quantity", "")
     names = list(getattr(message, "attachment_names", []) or [])
     row["Drawing"] = ", ".join(names) if names else "No"
@@ -314,28 +363,16 @@ def note_reminder(row: dict, when: date | None = None) -> dict:
 
 # ── money and dates, read back from a file a human has been editing ──────────
 
-_MONEY_JUNK = re.compile(r"[^\d.\-]")
-
-
 def money(value) -> Decimal:
-    """A Decimal from whatever is in the cell — "₹ 1,42,500.00" included.
+    """A Decimal from whatever is in the cell — "₹ 1,42,500.00", "Rs.1,000/-".
 
-    Indian digit grouping (1,42,500) breaks every naive parser, and the owner
-    formats the column because it is their file. Strip to digits and take what
-    is there; anything unreadable is zero rather than an exception, because one
-    mistyped cell must not stop the month-end summary.
+    One parser, shared with quoting, so the register's idea of what a rupee
+    looks like can never drift from the quotation's. Anything unreadable is
+    zero rather than an exception: one mistyped cell must not stop the
+    month-end summary.
     """
-    if isinstance(value, Decimal):
-        return value
-    if isinstance(value, (int, float)):
-        return Decimal(str(value))
-    text = _MONEY_JUNK.sub("", str(value or "").strip())
-    if not text or text in ("-", ".", "-."):
-        return Decimal(0)
-    try:
-        return Decimal(text)
-    except InvalidOperation:
-        return Decimal(0)
+    from .quoting import to_decimal
+    return to_decimal(value)
 
 
 def money_str(value) -> str:
