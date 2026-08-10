@@ -269,11 +269,21 @@ def product_summary(message) -> str:
     subject = re.sub(r"^\s*(re|fw|fwd)\s*:\s*", "",
                      getattr(message, "subject", "") or "",
                      flags=re.IGNORECASE).strip()
-    words = [w for w in re.findall(r"[A-Za-z0-9]+", subject) if len(w) > 1]
-    informative = subject and subject.lower() not in _GENERIC_SUBJECT and len(words) >= 4
-    if informative:
-        return subject[:200]
     opening = _first_real_line(getattr(message, "body", "") or "")
+
+    words = [w for w in re.findall(r"[A-Za-z0-9]+", subject) if len(w) > 1]
+    named = bool(subject) and subject.lower() not in _GENERIC_SUBJECT and len(words) >= 4
+
+    # The digits are the specification. "Enquiry for compression springs" names
+    # the product and reads fine, but every spring on the rate list is a
+    # compression spring — what picks the row is "2mm wire, 25 OD", and that
+    # lives in the body. So a subject without numbers is never the whole story
+    # when the first line of the message has them.
+    subject_has_spec = bool(re.search(r"\d", subject))
+    opening_has_spec = bool(re.search(r"\d", opening))
+
+    if named and (subject_has_spec or not opening_has_spec):
+        return subject[:200]
     if subject and opening:
         return f"{subject} — {opening}"[:200]
     return (opening or subject)[:200]
