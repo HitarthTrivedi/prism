@@ -1,0 +1,384 @@
+"""
+Prism — the daily loop
+──────────────────────
+Ties inbox, triage, register, quoting, sop and po together into the one thing
+the owner actually does: press *Check my mail*.
+
+One call to check() does everything that cannot cost money if it goes wrong —
+fetch, sort, file the attachments, register the inquiries, work out what is due
+a follow-up — and hands back a worklist of the things that need a person. It
+never sends anything. Sending is the caller's decision, made once per item,
+because both remaining human steps are about money leaving the company.
+
+Errors do not raise out of check(). This runs on a ten-minute timer next to
+somebody trying to run a factory: a mail server having a bad afternoon belongs
+in a status line, not in a dialog box.
+"""
+from __future__ import annotations
+
+import json
+import os
+import re
+from dataclasses import dataclass, field
+from datetime import date
+
+from . import inbox, register, sop, triage, ui
+from .inbox import Message, State
+
+# Sub-folders under the company folder. Flat, obvious names — the owner will
+# open these in Explorer, and a folder called "artifacts" helps nobody.
+INQUIRIES_DIR = "inquiries"
+SOPS_DIR = "sops"
+QUOTES_DIR = "quotations"
+
+
+@dataclass
+class Paths:
+    """Where everything lives, derived from one folder the customer chooses."""
+    root: str
+
+    @property
+    def inquiries(self) -> str:
+        return os.path.join(self.root, INQUIRIES_DIR)
+
+    @property
+    def register_csv(self) -> str:
+        return os.path.join(self.root, register.FILENAME)
+
+    @property
+    def sops(self) -> str:
+        return os.path.join(self.root, SOPS_DIR)
+
+    @property
+    def sop_log(self) -> str:
+        return os.path.join(self.root, SOPS_DIR, sop.LOG_FILENAME)
+
+    @property
+    def client_sops(self) -> str:
+        return os.path.join(self.root, SOPS_DIR, sop.CLIENTS_FILENAME)
+
+    @property
+    def quotations(self) -> str:
+        return os.path.join(self.root, QUOTES_DIR)
+
+    def folder_for(self, inquiry_no: str) -> str:
+        """One folder per inquiry: the mail, the drawings, the quote, the PO.
+
+        The number carries slashes (INQ/25-26/0087) and a slash in a path is a
+        directory separator, so it becomes INQ-25-26-0087 on disk. Reversible
+        by eye, which is what matters when somebody is looking for it.
+        """
+        return os.path.join(self.inquiries, inquiry_no.replace("/", "-"))
+
+    def ensure(self) -> None:
+        for folder in (self.inquiries, self.sops, self.quotations):
+            os.makedirs(folder, exist_ok=True)
+
+
+# ── pulling the details out of an inquiry ────────────────────────────────────
+
+_DETAILS_PROMPT = """Read this email from a customer and return ONLY a JSON
+object. No explanation, no markdown fences.
+
+Use exactly these keys:
+{
+  "customer": "the company name, if stated",
+  "contact": "the person's name, if stated",
+  "phone": "phone number, if stated",
+  "product": "what they want, in under 15 words, using their own words",
+  "quantity": "the quantity with its unit, e.g. 5000 nos — empty if not stated",
+  "notes": "anything a salesperson would need to know, in one short line"
+}
+
+Rules:
+- Use empty strings for anything not stated. Never invent a company name, a
+  quantity or a phone number.
+- Do not summarise the whole email — just fill the fields.
+- Copy specifications exactly as written, including numbers and units.
+
+EMAIL:
+"""
+
+
+def _json_from(text: str) -> dict:
+    raw = re.sub(r"^```[a-z]*\s*|\s*```$", "", (text or "").strip(),
+                 flags=re.I | re.M).strip()
+    start, end = raw.find("{"), raw.rfind("}")
+    if start == -1 or end <= start:
+        return {}
+    try:
+        parsed = json.loads(raw[start:end + 1])
+    except json.JSONDecodeError:
+        return {}
+    return parsed if isinstance(parsed, dict) else {}
+
+
+def extract_details(message: Message, api_key: str = "", model: str = "") -> dict:
+    """Customer, contact, product, quantity — as far as the mail states them.
+
+    Everything here is optional. A failed call returns {} and the register row
+    is still created from the sender and the subject, because an inquiry
+    recorded imperfectly beats one that exists only in the inbox.
+    """
+    if not api_key:
+        return {}
+    from .router import groq_chat
+    try:
+        reply = groq_chat(api_key, model or "",
+                          _DETAILS_PROMPT + message.snippet(3000),
+                          temperature=0.0, timeout=45)
+    except Exception:
+        return {}
+    data = _json_from(reply)
+    return {k: str(v or "").strip() for k, v in data.items() if isinstance(k, str)}
+
+
+# ── what a reply means ────────────────────────────────────────────────────────
+
+ACCEPTED = "accepted"
+REJECTED = "rejected"
+NEGOTIATING = "negotiating"
+NEEDS_INFO = "needs_info"
+UNCLEAR = "unclear"
+
+_INTENT_PROMPT = """A supplier sent a customer a quotation. Here is the
+customer's reply. What is the customer doing?
+
+Answer with ONE word, nothing else:
+  accepted     - they are confirming the order or asking to proceed
+  rejected     - they are declining, or have bought elsewhere
+  negotiating  - they want a better rate, or different terms
+  needs_info   - they are asking a question before deciding
+  unclear      - it is genuinely not any of the above
+
+REPLY:
+"""
+
+
+def reply_intent(message: Message, api_key: str = "", model: str = "") -> str:
+    """What the customer's reply means. UNCLEAR when it cannot be told.
+
+    "Please send your best price" is negotiating, not acceptance, and the cost
+    of getting that wrong is a register that lies. So the honest answer is
+    allowed and is the default: an UNCLEAR reply is shown to the owner rather
+    than acted on.
+    """
+    if not api_key:
+        return UNCLEAR
+    from .router import groq_chat
+    try:
+        reply = groq_chat(api_key, model or triage.FAST_MODEL,
+                          _INTENT_PROMPT + message.snippet(1500),
+                          temperature=0.0, timeout=30)
+    except Exception:
+        return UNCLEAR
+    word = (reply or "").strip().lower()
+    for candidate in (ACCEPTED, REJECTED, NEGOTIATING, NEEDS_INFO):
+        if candidate in word:
+            return candidate
+    return UNCLEAR
+
+
+# ── the worklist ──────────────────────────────────────────────────────────────
+
+@dataclass
+class Item:
+    """One thing that came out of a check and may need a person."""
+    kind: str                      # "inquiry" · "reply" · "order" · "sop"
+    message: Message | None = None
+    row: dict | None = None        # its register row, where it has one
+    folder: str = ""
+    files: list[str] = field(default_factory=list)
+    intent: str = ""
+    note: str = ""
+
+    @property
+    def inquiry_no(self) -> str:
+        return (self.row or {}).get("Inquiry no", "")
+
+
+@dataclass
+class Result:
+    counts: dict = field(default_factory=dict)
+    new_inquiries: list[Item] = field(default_factory=list)
+    replies: list[Item] = field(default_factory=list)
+    orders: list[Item] = field(default_factory=list)
+    followups: list[dict] = field(default_factory=list)
+    sops: list = field(default_factory=list)
+    state: State = field(default_factory=State)
+    knowledge: triage.Knowledge = field(default_factory=triage.Knowledge)
+    error: str = ""
+    fetched: int = 0
+
+    @property
+    def needs_attention(self) -> int:
+        return len(self.new_inquiries) + len(self.replies) + len(self.orders)
+
+    def headline(self) -> str:
+        """The one line shown after a check, in the owner's words."""
+        if self.error:
+            return self.error
+        if not self.fetched:
+            return "No new mail."
+        parts = [triage.describe(self.counts)]
+        if self.followups:
+            parts.append(f"{len(self.followups)} quotation(s) due a reminder")
+        if self.sops:
+            parts.append(f"{len(self.sops)} SOP(s) due")
+        return " · ".join(parts)
+
+
+def check(cfg: dict, paths: Paths, *, state: State | None = None,
+          knowledge: triage.Knowledge | None = None,
+          model: str = "", local_only: bool = False,
+          followup_days: int = 3, today: date | None = None) -> Result:
+    """One run of the whole loop. Never raises, never sends.
+
+    Order of work is deliberate: fetch, sort, then act only on what sorting
+    called actionable. Everything else is counted and left alone, so a busy
+    inbox costs one AI call for the handful of genuinely new correspondents
+    rather than one per message.
+    """
+    today = today or date.today()
+    api_key = (cfg or {}).get("api_key", "")
+    knowledge = knowledge or triage.Knowledge()
+    out = Result(state=state or State(), knowledge=knowledge)
+
+    paths.ensure()
+    messages, new_state, error = inbox.fetch_new(cfg, state)
+    out.state = new_state
+    if error:
+        out.error = error
+        return out
+    out.fetched = len(messages)
+
+    verdicts = triage.classify(messages, api_key, knowledge=knowledge,
+                               local_only=local_only)
+    out.counts = triage.summarise(verdicts)
+
+    try:
+        rows = register.load(paths.register_csv)
+    except register.RegisterLocked as e:
+        out.error = str(e)
+        return out
+
+    dirty = False
+    for message, verdict in zip(messages, verdicts):
+        if not verdict.actionable:
+            continue
+
+        existing = register.find_by_thread(rows, message)
+
+        # A reply on an inquiry we already know about is never a new inquiry,
+        # whatever the sorter called it — otherwise a three-message
+        # negotiation becomes three rows and the register stops being true.
+        if existing is not None:
+            register.add_thread(existing, message)
+            existing["Last contact"] = today.strftime("%d-%m-%Y")
+            folder = existing.get("Folder") or paths.folder_for(
+                existing.get("Inquiry no", "unknown"))
+            files = inbox.save_attachments(message, folder)
+            item = Item("order" if verdict.category == triage.ORDER else "reply",
+                        message, existing, folder, files)
+            if verdict.category == triage.ORDER:
+                item.note = "a purchase order may be attached"
+                out.orders.append(item)
+            else:
+                item.intent = reply_intent(message, api_key, model)
+                out.replies.append(item)
+            dirty = True
+            continue
+
+        # Genuinely new. An ORDER from somebody with no inquiry on file is
+        # still an order — it gets a row so it can be tracked, marked as
+        # having skipped the quotation stage.
+        details = extract_details(message, api_key, model)
+        row = register.from_message(message, details, rows=rows)
+        folder = paths.folder_for(row["Inquiry no"])
+        row["Folder"] = folder
+        # Made even when nothing was attached. The register points at this
+        # folder from the moment the row exists, and the quotation and the PO
+        # land in it later — a path in the file that opens onto nothing is the
+        # kind of small broken thing that makes people stop trusting the rest.
+        os.makedirs(folder, exist_ok=True)
+        files = inbox.save_attachments(message, folder)
+        if files:
+            row["Drawing"] = ", ".join(os.path.basename(f) for f in files)
+        rows.append(row)
+        dirty = True
+
+        item = Item("order" if verdict.category == triage.ORDER else "inquiry",
+                    message, row, folder, files)
+        if verdict.category == triage.ORDER:
+            item.note = "ordered without a quotation from us"
+            out.orders.append(item)
+        else:
+            out.new_inquiries.append(item)
+
+    if dirty:
+        try:
+            register.save(rows, paths.register_csv)
+        except register.RegisterLocked as e:
+            # The work is done and in memory; only the write failed. Say so —
+            # the owner can close Excel and press check again, and nothing is
+            # lost because unsaved rows have no bookmark advance behind them.
+            out.error = str(e)
+            out.state = state or State()
+            return out
+
+    out.followups = register.awaiting_followup(rows, after_days=followup_days,
+                                               today=today)
+    out.sops = _sops_due(paths, today)
+    return out
+
+
+def _sops_due(paths: Paths, today: date) -> list:
+    """Documents due to go out. Never fails the whole check.
+
+    An unreadable client map is a setup problem, not a reason to stop sorting
+    somebody's mail — so it is reported through the log and the run carries on.
+    """
+    try:
+        library = sop.load_library(paths.sops)
+        if not library:
+            return []
+        rules = sop.load_client_map(paths.client_sops)
+        if not rules:
+            return []
+        return sop.pending(rules, library, sop.load_log(paths.sop_log), today=today)
+    except Exception as e:
+        ui.warn(f"Couldn't check which SOPs are due: {e}")
+        return []
+
+
+# ── the end-of-day note ───────────────────────────────────────────────────────
+
+def day_summary(paths: Paths, *, today: date | None = None) -> str:
+    """The fifteen-second read at 6 p.m.
+
+    Deliberately ends on what is still open. The count of quotations waiting on
+    a reply is the money already earned and not yet collected on, and it is the
+    number nobody in a small factory knows today.
+    """
+    today = today or date.today()
+    try:
+        rows = register.load(paths.register_csv)
+    except register.RegisterLocked as e:
+        return str(e)
+    month_start = today.replace(day=1)
+    stats = register.summarise(rows, since=month_start, until=today)
+
+    from .quoting import indian_currency
+    lines = [f"This month ({month_start.strftime('%B %Y')}):",
+             f"  Inquiries received : {stats.received}",
+             f"  Quotations sent    : {stats.quoted}  "
+             f"— ₹{indian_currency(stats.quoted_value)}",
+             f"  Orders won         : {stats.converted}  "
+             f"— ₹{indian_currency(stats.converted_value)}",
+             f"  Conversion         : {stats.conversion}%",
+             f"  Waiting on a reply : {stats.waiting}"]
+    if stats.reasons:
+        worst = sorted(stats.reasons.items(), key=lambda kv: -kv[1])
+        lines.append("  Lost because       : " +
+                     ", ".join(f"{reason} ({count})" for reason, count in worst))
+    return "\n".join(lines)
