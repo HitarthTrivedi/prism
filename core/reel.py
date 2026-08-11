@@ -111,14 +111,18 @@ def _font(weight: str, size: int):
 
 
 def ffmpeg_path() -> str:
-    exe = shutil.which("ffmpeg")
-    if not exe:
-        raise ReelError(
-            "FFmpeg is not installed — it does the encoding.\n"
-            "  macOS:   brew install ffmpeg\n"
-            "  Debian:  sudo apt install ffmpeg\n"
-            "  Windows: https://ffmpeg.org/download.html")
-    return exe
+    """Where FFmpeg is. See core/ffmpeg.py for the four places looked in.
+
+    Was `shutil.which("ffmpeg")` here and again in reel_web.py — which finds
+    nothing on a Windows machine, because Windows does not come with it and
+    nobody installs it by accident. The first Windows customer met a codec
+    install guide instead of a video.
+    """
+    from . import ffmpeg as ffmpeg_tool
+    found = ffmpeg_tool.locate()
+    if not found:
+        raise ReelError(ffmpeg_tool.MISSING)
+    return found
 
 
 # ── easing & helpers ────────────────────────────────────────────────────────

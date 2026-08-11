@@ -50,14 +50,16 @@ class ReelError(Exception):
 
 
 def ffmpeg_path() -> str:
-    exe = shutil.which("ffmpeg")
-    if not exe:
-        raise ReelError(
-            "FFmpeg is not installed — it does the encoding.\n"
-            "  macOS:   brew install ffmpeg\n"
-            "  Debian:  sudo apt install ffmpeg\n"
-            "  Windows: https://ffmpeg.org/download.html")
-    return exe
+    """Same resolver as reel.py — see core/ffmpeg.py.
+
+    These two were separate copies of `shutil.which("ffmpeg")`, which meant
+    two places to fix and, predictably, only one of them getting fixed.
+    """
+    from . import ffmpeg as ffmpeg_tool
+    found = ffmpeg_tool.locate()
+    if not found:
+        raise ReelError(ffmpeg_tool.MISSING)
+    return found
 
 
 def available() -> tuple[bool, str]:
