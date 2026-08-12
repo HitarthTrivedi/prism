@@ -45,7 +45,12 @@ STATUSES = OPEN_STATUSES + CLOSED_STATUSES
 # Column order is the order they read it in. Identity first, then what was
 # asked, then what we did, then how it ended.
 COLUMNS = [
-    "Inquiry no", "Date received", "Customer", "Contact person", "Email",
+    # Time as well as date. Two inquiries from one customer on the same
+    # morning are indistinguishable in a date-only register, and "which of
+    # these came first" is exactly the question asked when somebody revises
+    # their requirement an hour after sending it.
+    "Inquiry no", "Date received", "Time received", "Customer",
+    "Contact person", "Email",
     "Phone", "Product asked", "Quantity", "Drawing", "Status",
     "Quotation no", "Quotation date", "Quotation value", "Reminders sent",
     "Last contact", "Result", "Reason if lost", "PO number", "PO date",
@@ -304,6 +309,10 @@ def from_message(message, details: dict | None = None, *, prefix: str = "INQ",
                                     getattr(message, "date", None) or date.today())
     when = getattr(message, "date", None)
     row["Date received"] = when.strftime("%d-%m-%Y") if when else date.today().strftime("%d-%m-%Y")
+    # Only from a real timestamp. A row that fell back to today's date must
+    # not carry the clock time of the moment Prism happened to run — that
+    # would read as the time the customer wrote, and it isn't.
+    row["Time received"] = _clock(when)
     row["Customer"] = details.get("customer") or getattr(message, "from_name", "") or ""
     row["Contact person"] = details.get("contact") or getattr(message, "from_name", "") or ""
     row["Email"] = getattr(message, "from_addr", "") or ""
@@ -318,6 +327,25 @@ def from_message(message, details: dict | None = None, *, prefix: str = "INQ",
     row["Notes"] = details.get("notes", "")
     add_thread(row, message)
     return row
+
+
+def _clock(when) -> str:
+    """"14:35" in the reader's own timezone, or "" when there is no timestamp.
+
+    A mail Date header carries the SENDER's offset. Left as-is, a 9 a.m.
+    enquiry from Germany files itself at 09:00 in a Gujarat register and the
+    column stops meaning "when it reached us" — which is the only thing the
+    owner reads it as. Naive timestamps are left alone: there is nothing to
+    convert from, and guessing would be worse than the plain number.
+    """
+    if not isinstance(when, datetime):
+        return ""
+    if when.tzinfo is not None:
+        try:
+            when = when.astimezone()
+        except (OSError, OverflowError, ValueError):
+            pass       # a broken local timezone must not lose us the row
+    return when.strftime("%H:%M")
 
 
 def update(rows: list[dict], inquiry_no: str, changes: dict) -> dict | None:
@@ -356,6 +384,48 @@ def mark_converted(row: dict, po_number: str, value, when: date | None = None) -
     row["PO date"] = when.strftime("%d-%m-%Y")
     row["Order value"] = money_str(value)
     row["Last contact"] = when.strftime("%d-%m-%Y")
+    return row
+
+
+# What a reply means, in register terms. The keys are mailflow's intents; they
+# are strings rather than an import because mailflow imports this module and a
+# cycle between the two would be a silly thing to introduce for four words.
+#
+# Note what is NOT here: "accepted" does not become Converted. A customer
+# saying "go ahead" is a promise; Converted is a fact backed by a PO number and
+# an order value. Collapsing the two would make the conversion figure in the
+# month-end summary optimistic by exactly the orders that never arrived, and
+# that figure is the one number the owner would repeat to a bank.
+REPLY_STATUS = {
+    "accepted": ACCEPTED,
+    "rejected": NOT_CONVERTED,
+    "negotiating": NEGOTIATING,
+    "needs_info": NEGOTIATING,
+}
+
+
+def mark_reply(row: dict, intent: str, when: date | None = None,
+               note: str = "") -> dict:
+    """Move a row on because the customer answered.
+
+    An intent Prism could not read leaves the status exactly as it was and
+    only touches Last contact. That is deliberate: a wrong status is worse
+    than a stale one, because the owner acts on the register without
+    re-reading the mail, and a quotation wrongly marked Not converted is one
+    they will never chase again.
+    """
+    when = when or date.today()
+    row["Last contact"] = when.strftime("%d-%m-%Y")
+    if note:
+        row["Notes"] = f"{(row.get('Notes') or '').strip()} {note}".strip()
+    status = REPLY_STATUS.get((intent or "").strip().lower())
+    if not status:
+        return row
+    if status == NOT_CONVERTED:
+        # Reuse mark_lost so Result and Reason are filled the same way they are
+        # when the owner closes a row by hand — one shape of "lost" in the file.
+        return mark_lost(row, "Declined by customer", when)
+    row["Status"] = status
     return row
 
 
