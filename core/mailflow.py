@@ -155,6 +155,101 @@ REPLY:
 """
 
 
+# ── reading a reply without asking anybody ───────────────────────────────────
+# Replies to a quotation are close to formulaic. "We confirm the order",
+# "kindly send your best price", "we have finalised with another party" —
+# three sentences that turn up in some form on most replies a factory gets,
+# and none of them need a language model.
+#
+# Every one of these settled locally is one fewer AI call, one fewer message
+# leaving the computer, and one fewer thing to go wrong at 9am. The ambiguous
+# remainder still goes to the model, which is where it belongs.
+#
+# Order matters and is not alphabetical: a reply can contain the words of two
+# of these at once ("your rate is high, but we confirm the order"), and the
+# first rule to match wins.
+
+_QUOTED_LINE = re.compile(r"^\s*(>|on .{5,80}wrote:|from:\s)", re.I)
+
+_LOCAL_INTENT = [
+    # Acceptance first. It is the only one where acting on a wrong reading
+    # costs the owner an order rather than a follow-up.
+    (ACCEPTED, re.compile(
+        r"\b(we\s+confirm|confirming\s+the\s+order|order\s+confirmed|"
+        r"please\s+proceed|kindly\s+proceed|you\s+may\s+proceed|"
+        r"go\s+ahead|approved\s+for\s+production|"
+        r"release[sd]?\s+the\s+order|placing\s+the\s+order|"
+        r"our\s+(purchase\s+order|po)\s+(is\s+)?attach|"
+        r"attached\s+(is\s+)?(our\s+)?(purchase\s+order|po)\b)", re.I)),
+    # A clean refusal. Deliberately narrow: it must name the OUTCOME, not just
+    # an objection. "Your rate is too high" is a complaint about price and
+    # belongs below, not here.
+    (REJECTED, re.compile(
+        r"\b(not\s+interested|no\s+longer\s+(interested|required)|"
+        r"we\s+regret|regret\s+to\s+inform|"
+        r"(finali[sz]ed|placed|ordered|gone|going)\s+(the\s+order\s+)?"
+        r"(with|to|elsewhere|another)|"
+        r"another\s+(supplier|vendor|party)|"
+        r"(project|requirement|enquiry|inquiry)\s+(is\s+)?"
+        r"(dropped|cancelled|canceled|on\s+hold|shelved)|"
+        r"drop\s+this\s+(enquiry|inquiry))", re.I)),
+    # Haggling. The commonest reply there is, and the most expensive to
+    # misread as a refusal — the deal is still very much alive.
+    (NEGOTIATING, re.compile(
+        r"\b(best\s+(and\s+final\s+)?(price|rate|offer)|last\s+price|"
+        r"final\s+rate|(rate|price)s?\s+(is|are|seems?|looks?)\s+"
+        r"(too\s+)?(high|steep|much)|"
+        r"(reduce|revise|reconsider|relook|work\s+out)\s+"
+        r"(the\s+|your\s+)?(rate|price|quote|quotation)|"
+        r"(any|some)\s+(discount|concession|rebate)|"
+        r"more\s+competitive|match\s+(the|this|their)\s+(rate|price)|"
+        r"budget\s+is)", re.I)),
+    # A question before deciding.
+    (NEEDS_INFO, re.compile(
+        r"(\?)|"
+        r"\b(what\s+is\s+the|when\s+can\s+you|how\s+(soon|long|many)|"
+        r"kindly\s+(confirm|clarify|advise)|please\s+(confirm|clarify|advise)|"
+        r"lead\s+time|delivery\s+(time|schedule|period)|"
+        r"send\s+(us\s+)?(the\s+)?(drawing|sample|datasheet|catalogue))", re.I)),
+]
+
+
+def _own_words(message: Message, limit: int = 1500) -> str:
+    """The part of a reply the customer actually typed.
+
+    A reply carries our own quotation underneath it, and our covering letter
+    says things like "please let us know if you need anything clarified" —
+    which is a question, and would have every reply in the world read as
+    NEEDS_INFO. Everything from the first quoted line down is dropped.
+    """
+    kept = []
+    for line in (getattr(message, "body", "") or "").splitlines():
+        if _QUOTED_LINE.match(line):
+            break
+        kept.append(line)
+        if sum(len(k) for k in kept) > limit:
+            break
+    text = "\n".join(kept).strip()
+    # A top-posted reply with no separator we recognise still gives us the
+    # first paragraph, which is where the answer lives.
+    return text[:limit] if text else (getattr(message, "body", "") or "")[:limit]
+
+
+def local_intent(message: Message) -> str:
+    """What the reply plainly says, or "" when it is not plain.
+
+    Returning "" is a real answer and the common one for anything subtle. It
+    means "ask somebody cleverer", not "no idea".
+    """
+    text = _own_words(message)
+    if not text.strip():
+        return ""
+    for intent, pattern in _LOCAL_INTENT:
+        if pattern.search(text):
+            return intent
+    return ""
+
+
 def reply_intent(message: Message, api_key: str = "", model: str = "") -> str:
     """What the customer's reply means. UNCLEAR when it cannot be told.
 
@@ -162,7 +257,14 @@ def reply_intent(message: Message, api_key: str = "", model: str = "") -> str:
     of getting that wrong is a register that lies. So the honest answer is
     allowed and is the default: an UNCLEAR reply is shown to the owner rather
     than acted on.
+
+    Local rules first, always — including when a key is configured. Most
+    replies say what they mean in words we can match, and a reply settled here
+    never leaves the computer.
     """
+    plain = local_intent(message)
+    if plain:
+        return plain
     if not api_key:
         return UNCLEAR
     from .router import groq_chat
@@ -236,7 +338,8 @@ class Result:
 def check(cfg: dict, paths: Paths, *, state: State | None = None,
           knowledge: triage.Knowledge | None = None,
           model: str = "", local_only: bool = False,
-          followup_days: int = 3, today: date | None = None) -> Result:
+          followup_days: int = 2, max_reminders: int = 3,
+          today: date | None = None) -> Result:
     """One run of the whole loop. Never raises, never sends.
 
     Order of work is deliberate: fetch, sort, then act only on what sorting
@@ -340,6 +443,7 @@ def check(cfg: dict, paths: Paths, *, state: State | None = None,
             return out
 
     out.followups = register.awaiting_followup(rows, after_days=followup_days,
+                                               max_reminders=max_reminders,
                                                today=today)
     out.sops = _sops_due(paths, today)
     return out
