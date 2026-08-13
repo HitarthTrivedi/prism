@@ -335,8 +335,37 @@ python3 whisper.py --mode none     # raw transcription, no LLM cleanup
 | `core/onboarding.py` | first-run wizard |
 | `core/config.py` | persistent config at `~/.prism` |
 | `core/ui.py` | rich terminal styling |
+| `core/voice.py` | speech in, at the prompt |
+| `core/lang.py` | which language the tools answer in |
 | `run_prism.command` | macOS / Linux launcher (builds venv on first run) |
 | `run_prism.bat` | Windows launcher (builds venv on first run) |
+
+### Inbox to Order
+
+The mail-to-order workflow, built with a spring manufacturer at GIDC. Driven
+from the desktop app's **Inquiry Automation** screen — there is no REPL command
+for it, because it is a screen you leave open rather than a prompt you type.
+
+| File | Role |
+|---|---|
+| `core/inbox.py` | IMAP reading. `readonly=True` + `BODY.PEEK[]` — never marks, moves or deletes anything, so the owner keeps using Outlook on the same account. Stores UIDVALIDITY beside the last UID, so a renumbered mailbox starts over instead of re-importing years of mail as new inquiries |
+| `core/triage.py` | Sorting. Local rules first — unsubscribe headers, auto-replies, known senders — so most mail never leaves the machine; only unknown senders reach the model, batched, with forged prompt boundaries defanged |
+| `core/register.py` | The inquiry CSV. Atomic writes, hand-added columns preserved, Indian financial-year numbering (`INQ/25-26/0087`), and "close it in Excel" rather than a lost row when the file is locked |
+| `core/quoting.py` | Pricing, from a rate list or from the owner's own cost sheet. `Decimal` with `ROUND_HALF_UP`, lakh grouping, quantity slabs. No AI ever touches a figure |
+| `core/mailflow.py` | The daily loop that ties the rest together. Never raises, never sends. Reads a reply with local rules before asking any model |
+| `core/sop.py` | Which documents are due to which regular customer |
+| `core/po.py` | Reads a purchase order and compares it against what was quoted, judging a rate difference by `gap × quantity` rather than by the gap alone |
+| `core/drafting.py` | The few emails a week worth writing well — a negotiation, a reminder — written by the AI tools in the user's own browser rather than through the API. Deliberately *not* used for sorting mail or for touching the register; the module docstring says why |
+
+### Documents and media
+
+| File | Role |
+|---|---|
+| `core/boq.py` | Bill of quantities from a DXF drawing or a written spec. Counts and measures; never prices |
+| `core/reel.py` · `core/reel_web.py` | Short videos: Pillow draws the frames, FFmpeg encodes them |
+| `core/ffmpeg.py` | Finds FFmpeg — `PRISM_FFMPEG`, then the copy bundled with Prism, then one downloaded earlier, then `PATH`. Can fetch it, verifying against the digest PyPI publishes for that exact wheel before unpacking |
+| `core/mailer.py` | SMTP sending, one message per recipient |
+| `core/assets.py` | brand assets for generated media |
 
 ## Notes & limits
 
