@@ -579,6 +579,43 @@ def resolve_agent(stage: str, name: str) -> dict | None:
     return AGENT_REGISTRY.get(name)
 
 
+def alternatives_for(stage: str, tried: list | tuple = (),
+                     cfg: dict | None = None, limit: int = 2) -> list[str]:
+    """Other tools that could do this stage, best first.
+
+    Used when a tool cannot finish — most often a free tier running out
+    part-way through a long run. The alternative has to be able to do the same
+    JOB, so candidates come from the stage's own category rather than from
+    whatever else the user happens to have configured: swapping a failed image
+    stage onto a research tool would produce an answer, and the answer would be
+    an essay about pictures.
+
+    Ordering, and the reasoning for it:
+
+      1. **Tools the user already picked somewhere.** They chose them, which
+         almost always means they are signed in — and a signed-out alternative
+         fails exactly as fast as the tool it is replacing.
+      2. **The rest of the category, registry order.** That order is roughly
+         "most capable first" and is a reasonable second guess.
+
+    Local agents are excluded. They are Prism's own renderers, not web tools,
+    and a stage that failed in a browser is not fixed by handing it to one.
+    """
+    seen = {t for t in tried if t}
+    picked = set((cfg or {}).get("agents", {}).values())
+    catalogue = CATEGORIES.get(stage, {}).get("agents", [])
+
+    preferred, rest = [], []
+    for name in catalogue:
+        if name in seen:
+            continue
+        entry = AGENT_REGISTRY.get(name)
+        if not entry or entry.get("local"):
+            continue
+        (preferred if name in picked else rest).append(name)
+    return (preferred + rest)[:limit]
+
+
 def summary_agent_name(agents: dict) -> str | None:
     """Which agent should run the final 'summary' stage, given user selections."""
     for cat in SUMMARY_FALLBACK_ORDER:

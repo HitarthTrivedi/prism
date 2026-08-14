@@ -1181,6 +1181,52 @@ _SIGNIN_MARKERS = (
 )
 
 
+# A tool that has run out for now. Kept apart from _SIGNIN_MARKERS because the
+# two need opposite advice: signing in is something only the user can do,
+# whereas an exhausted quota is something Prism can route around by itself.
+# Telling somebody to "sign in again" when Claude has merely used up its free
+# messages sends them off to fix a thing that is not broken.
+_EXHAUSTED_MARKERS = (
+    "you've reached your limit", "you have reached your limit",
+    "message limit reached", "reached the limit", "usage limit",
+    "out of free messages", "no free messages", "free messages remaining",
+    "daily limit", "limit resets", "limit will reset",
+    "upgrade to continue", "upgrade your plan to continue",
+    "subscribe to continue", "too many requests", "rate limit",
+    "quota exceeded", "out of credits", "no credits remaining",
+    "plan limit", "capacity constraints", "currently at capacity",
+)
+
+
+def _looks_exhausted(driver) -> str:
+    """"" if the tool is fine, else why it cannot answer right now.
+
+    The commonest way a long run dies at the last step: the free tier on
+    whichever tool drew the heaviest stage runs out, and Prism reports "no
+    response scraped" — which reads as Prism being broken rather than as
+    "Claude is finished for the next few hours, use something else".
+
+    Only consulted when a stage produced nothing, so a false positive costs one
+    wrong sentence and one unnecessary attempt on another tool — never a good
+    answer.
+    """
+    try:
+        body = (driver.find_element("tag name", "body").text or "").lower()
+    except Exception:
+        return ""
+    if not body:
+        return ""
+    # No length ceiling here, unlike the sign-in check below. A quota notice
+    # appears ON a full conversation page with every previous turn still on it,
+    # so the "a real page is long" heuristic that makes the sign-in check safe
+    # would miss every one of these.
+    for marker in _EXHAUSTED_MARKERS:
+        if marker in body:
+            return (f"This tool has hit its usage limit for now — the page "
+                    f"says \"{marker}\".")
+    return ""
+
+
 def _looks_signed_out(driver) -> str:
     """"" if the page looks usable, else what the user has to do about it.
 
@@ -1438,7 +1484,7 @@ def _run_local(kind: str, prior_text, attachments, cfg: dict, stage: str,
 def run(routing: dict, cfg: dict, attachments=None, on_event=None,
         query: str = "", chatgpt_analysis: bool = True,
         custom_stages: list[tuple[str, str, list[str]]] | None = None,
-        should_stop=None):
+        should_stop=None, failover: bool = True):
     """Execute the pipeline. Returns (responses, links).
 
     attachments: list of records from core.files.attach() — uploaded to each
@@ -1466,6 +1512,12 @@ def run(routing: dict, cfg: dict, attachments=None, on_event=None,
                  has real output in it, and throwing that away punishes the
                  user for stopping. The browser is deliberately left open, same
                  as every other exit from here.
+    failover: after the pipeline, hand any stage that produced NOTHING to a
+                 different tool from the same category and try once more. On by
+                 default, because the failure it covers — a free tier running
+                 out at the last stage of a forty-minute run — otherwise costs
+                 the whole run. Set False for the retry itself, so a category
+                 where every tool is having a bad afternoon cannot recurse.
     """
     from selenium.webdriver.common.by import By
     from selenium.webdriver.common.keys import Keys
@@ -1686,6 +1738,10 @@ def run(routing: dict, cfg: dict, attachments=None, on_event=None,
 
     def stopped() -> bool:
         return bool(should_stop and should_stop())
+
+    # Stages that produced nothing, and why. Read by the failover pass after
+    # the loop; see _retry_failed_stages().
+    failures: dict[str, dict] = {}
 
     for stage_idx, (stage, agent_name, questions) in enumerate(stages):
         if stopped():
@@ -2238,16 +2294,23 @@ def run(routing: dict, cfg: dict, attachments=None, on_event=None,
                                     "timed_out": timed_out})
             else:
                 # Nothing came back. Before reporting that as a scrape miss,
-                # ask the far more likely question: is this a sign-in wall?
-                blocked = _looks_signed_out(driver)
+                # ask the two far more likely questions: has this tool run out,
+                # and is this a sign-in wall?
+                spent = _looks_exhausted(driver)
+                blocked = spent or _looks_signed_out(driver)
                 if blocked:
                     ui.err(blocked)
                 else:
                     ui.warn("no response scraped, but link saved")
+                failures[stage] = {
+                    "agent": agent_name, "questions": questions,
+                    "reason": blocked or "it returned nothing",
+                    "exhausted": bool(spent)}
                 emit("stage_done", {"stage": stage, "count": 0, "texts": [],
                                     "url": driver.current_url,
                                     "timed_out": timed_out,
-                                    "blocked": blocked})
+                                    "blocked": blocked,
+                                    "exhausted": bool(spent)})
             ui.info(f"   🔗  {driver.current_url}")
 
         except Exception as ex:
@@ -2260,9 +2323,94 @@ def run(routing: dict, cfg: dict, attachments=None, on_event=None,
                 all_links[stage] = url
                 ui.info(f"   🔗  {url}  (still open — the tool may finish there)")
             ui.err(f"stage {stage} failed: {ex}")
+            failures[stage] = {"agent": agent_name, "questions": questions,
+                               "reason": str(ex), "exhausted": False}
             emit("stage_error", {"stage": stage, "error": str(ex), "url": url})
 
+    if failover and failures and not stopped():
+        _retry_failed_stages(
+            failures, cfg, all_responses, all_links,
+            attachments=attachments, query=query, emit=emit,
+            should_stop=should_stop)
+
     return all_responses, all_links
+
+
+# ── when a tool cannot finish ────────────────────────────────────────────────
+
+def _retry_failed_stages(failures: dict, cfg: dict, all_responses: dict,
+                         all_links: dict, *, attachments, query, emit,
+                         should_stop) -> None:
+    """Give each empty stage to a different tool.
+
+    The failure this exists for: forty minutes into a run, the free tier on
+    whichever tool drew the heaviest stage runs out, and the customer is handed
+    a pipeline that did nine tenths of the work and produced nothing usable.
+    Another tool in the same category can almost always finish it.
+
+    **It runs after the pipeline, not inside it, and that is a real
+    limitation.** A stage that failed in the MIDDLE has already handed nothing
+    to the stages after it, so those ran on thinner context and are not re-run
+    here. The last stage — which is where a quota runs out, because that is
+    where the most has been asked — is fully recovered. Doing better means
+    retrying inline, which means restructuring a 500-line loop whose index-keyed
+    maps (machine_stages, spec_feeder, design_feeder) all shift if the stage
+    list changes underneath it.
+
+    Never raises: this is a rescue attempt, and a rescue that takes down the
+    results it was rescuing would be worse than not trying.
+    """
+    for stage, info in list(failures.items()):
+        if should_stop and should_stop():
+            return
+        # A later pass may already have filled this in.
+        if all_responses.get(stage):
+            continue
+
+        tried = [info.get("agent")]
+        for alternative in A.alternatives_for(stage, tried, cfg):
+            if should_stop and should_stop():
+                return
+            ui.rule(f"{stage.upper()}  ·  retrying with {alternative}",
+                    style="yellow")
+            ui.warn(f"   {info.get('agent')} couldn't finish: {info['reason']}")
+            emit("stage_failover", {
+                "stage": stage, "failed": info.get("agent"),
+                "agent": alternative, "reason": info["reason"],
+                "exhausted": info.get("exhausted", False)})
+            try:
+                responses, links = run(
+                    {}, cfg,
+                    attachments=attachments,
+                    custom_stages=[(stage, alternative, info["questions"])],
+                    query=query,
+                    # The file-analysis pre-stage would re-read every
+                    # attachment before the one prompt we actually want.
+                    chatgpt_analysis=False,
+                    should_stop=should_stop,
+                    # One level only. Without this a category where every tool
+                    # is having a bad afternoon retries itself forever.
+                    failover=False)
+            except Exception as e:                       # noqa: BLE001
+                ui.err(f"   {alternative} also failed: {e}")
+                continue
+
+            texts = responses.get(stage) or []
+            if texts:
+                all_responses[stage] = texts
+                if links.get(stage):
+                    all_links[stage] = links[stage]
+                ui.ok(f"   ✅  {alternative} finished the {stage} step")
+                emit("stage_recovered", {
+                    "stage": stage, "agent": alternative,
+                    "failed": info.get("agent"),
+                    "texts": texts, "url": links.get(stage, "")})
+                break
+            ui.warn(f"   {alternative} returned nothing either")
+        else:
+            emit("stage_unrecovered", {
+                "stage": stage, "failed": info.get("agent"),
+                "reason": info["reason"]})
 
 
 def open_login_tabs(urls: list[str]):
