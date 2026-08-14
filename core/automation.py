@@ -1288,6 +1288,54 @@ def _capture(driver, agent_cfg: dict) -> list[str]:
     return texts
 
 
+# Stages where "make it editable" means anything. A research answer cannot be
+# opened in Canva, and asking would just confuse the tool.
+_EDITABLE_STAGES = ("visual", "presentation", "artwork", "design")
+
+
+def _make_editable(driver, agent_cfg: dict, stage: str, query: str,
+                   responses: list) -> list:
+    """Hand the image just generated to Canva, in the same conversation.
+
+    Two prompts, not one. The first asked for the best picture the tool can
+    draw; this one asks Canva to wrap that picture in something editable.
+
+    Splitting it is the whole point. Asking for both in a single prompt makes
+    Canva COMPOSE the image — a stock template where DALL-E would have
+    rendered the scene — so the customer had to choose between a good picture
+    and an editable one. Generate first, convert second, and they get both.
+
+    Returns the responses to keep. The Canva reply is appended rather than
+    substituted: the first answer holds the image, and dropping it to keep a
+    link would lose the artwork the customer actually asked for.
+    """
+    if stage not in _EDITABLE_STAGES:
+        return responses
+    if not A.wants_canva(query):
+        return responses
+    if not responses:
+        # Nothing was made, so there is nothing to convert. Asking anyway
+        # would have Canva invent a design from the prompt alone, which is
+        # exactly the template-instead-of-artwork failure this avoids.
+        ui.warn("   nothing to make editable — skipping the Canva step")
+        return responses
+
+    ui.info("   🎨  asking Canva to make it editable…")
+    reply = _reask(driver, agent_cfg, A._CANVA_FOLLOWUP, expect="CANVA LINK:")
+    text = "\n\n".join(t for t in reply if t and t.strip()).strip()
+    if not text:
+        ui.warn("   Canva didn't answer — keeping the image on its own")
+        return responses
+    if "canva link: none" in text.lower():
+        # Said plainly rather than swallowed: the customer asked for something
+        # editable and is not getting it, and the reason is one they can fix.
+        ui.warn("   the Canva app isn't connected to this ChatGPT account — "
+                "connect it there and the design becomes editable next time")
+        return responses
+    ui.ok("   ✅  editable Canva design created")
+    return responses + [text]
+
+
 def _reask(driver, agent_cfg: dict, prompt: str, expect: str = "") -> list[str]:
     """Send one follow-up in the SAME tab and re-scrape.
 
@@ -2265,6 +2313,11 @@ def run(routing: dict, cfg: dict, attachments=None, on_event=None,
                         else:
                             ui.err("   still no scene spec — the renderer will "
                                    "have nothing to draw")
+            # The artwork exists and is good. NOW make it editable — a second
+            # prompt in the same chat rather than a different first prompt.
+            stage_responses = _make_editable(
+                driver, agent_cfg, stage, query, stage_responses)
+
             if stage_responses:
                 ui.info(f"   📥  captured {sum(len(t) for t in stage_responses)} chars")
 

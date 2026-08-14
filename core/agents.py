@@ -156,25 +156,53 @@ WAIT_CEILING = 1800       # 30 min — past this something is genuinely stuck
 # image. The "if you cannot" clause matters: without it, a ChatGPT with no
 # Canva app connected spends its reply explaining that it can't, instead of
 # producing the picture that was asked for.
+# Asked for an editable design — but the picture is still made properly first.
+#
+# This used to say "build it in Canva RATHER THAN a flat image", and the
+# comment below has always admitted what that costs: Canva composes a template
+# where DALL-E renders the scene that was described. So the customer had to
+# choose between a good picture and an editable one.
+#
+# They do not. Generate the image at full quality here, and a SECOND prompt in
+# the same chat (_CANVA_FOLLOWUP, sent by automation._make_editable) hands the
+# finished artwork to the Canva app to be made editable. Best picture and an
+# editable file, because the two steps stopped competing for one prompt.
 _CANVA_SUFFIX = (
-    "DELIVERY FORMAT — read this before you start. If the Canva app is "
-    "connected to this ChatGPT account, use it: build this as a real, "
-    "editable Canva design in my account rather than a flat exported image, "
-    "at the right size for the format asked for above. Then finish your reply "
-    "with the Canva design URL on its own line, prefixed exactly with "
-    "'CANVA LINK: '. The link is the deliverable — without it I cannot open "
-    "or edit what you made. If the Canva app is NOT connected, do not explain "
-    "that and do not ask me to connect it: just generate the image normally "
-    "and say 'CANVA LINK: none' at the end."
+    "DELIVERY FORMAT — generate the image yourself, directly, at the highest "
+    "quality you can. Do NOT route this through Canva or any other design "
+    "tool yet, even if one is connected: a template-built layout is not what "
+    "is being asked for. Return the generated image in your reply. I will ask "
+    "you to make it editable in a follow-up message once I have seen it."
+)
+
+# The second half, sent into the SAME conversation once the artwork exists.
+#
+# Addressed to the Canva app with "@canva" because that is how ChatGPT routes
+# a message to a connected app, and by this point the design it should act on
+# is the image directly above it in the thread.
+_CANVA_FOLLOWUP = (
+    "@canva can you make this design editable — import the image above into a "
+    "new Canva design in my account, at the same size, keeping the artwork as "
+    "the background so I can edit the text and layout on top of it.\n\n"
+    "Then reply with the Canva design URL on its own line, prefixed exactly "
+    "with 'CANVA LINK: '. The link is the deliverable — without it I cannot "
+    "open what you made. If the Canva app is not connected to this account, "
+    "do not explain that and do not ask me to connect it: reply with only "
+    "'CANVA LINK: none' and nothing else."
 )
 
 # The other half of the switch, and the reason it has to be said out loud.
 #
-# Routing an image through the Canva app costs picture quality. Canva composes
-# a template — stock layouts, its own type, its own arrangement — where DALL·E
-# renders the scene that was actually described. For "da Vinci sipping Wagh
-# Bakri chai" that is the whole job, and a template cannot do it. The Canva
-# route earns its keep only when the client has to EDIT the result afterwards.
+# Letting Canva COMPOSE an image costs picture quality. It builds a template —
+# stock layouts, its own type, its own arrangement — where DALL·E renders the
+# scene that was actually described. For "da Vinci sipping Wagh Bakri chai"
+# that is the whole job, and a template cannot do it.
+#
+# Which is why the editable path no longer asks Canva to compose anything: it
+# generates first and converts second. The two suffixes are now identical in
+# what they ask for, and differ only in what happens next — kept as separate
+# constants because they answer different questions, and collapsing them would
+# make the next person think the distinction had been dropped.
 #
 # Left to itself, a ChatGPT with the Canva app connected reaches for it far
 # too readily — so when the user has not asked for an editable design, saying
