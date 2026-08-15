@@ -71,6 +71,61 @@ def imap_for(address: str):
     return _IMAP_HOSTS.get(domain)
 
 
+# Mail-host suffix seen in a domain's MX record → the IMAP server that goes
+# with it. This is how a company domain gets resolved without anybody knowing
+# what IMAP is: the MX record says who actually carries the mail, whoever sold
+# them the domain name.
+_MX_IMAP = {
+    "secureserver.net": "imap.secureserver.net",     # GoDaddy Workspace
+    "outlook.com": "outlook.office365.com",          # Microsoft 365
+    "office365.com": "outlook.office365.com",
+    "google.com": "imap.gmail.com",                  # Google Workspace
+    "googlemail.com": "imap.gmail.com",
+    "zoho.com": "imap.zoho.com",
+    "zoho.in": "imap.zoho.in",
+    "zohomail.com": "imap.zoho.com",
+    "yandex.net": "imap.yandex.com",
+    "mail.ru": "imap.mail.ru",
+    "titan.email": "imap.titan.email",
+    "hostinger.com": "imap.hostinger.com",
+    "bigrock.in": "imap.bigrock.in",
+    "rediffmailpro.com": "imappro.rediffmail.com",
+}
+
+
+def mx_host(domain: str, timeout: float = 5.0) -> str:
+    """The IMAP server for `domain`, worked out from its MX records.
+
+    Returns "" when it cannot be determined — no resolver available, no MX
+    record, or a mail host nobody has mapped yet. The caller falls back to
+    guessing, so this can only ever help.
+
+    dnspython is optional on purpose. This module's contract is the stdlib and
+    no new dependencies, and the stdlib cannot query MX. So when dnspython is
+    installed the guessing gets much better, and when it is not, nothing is
+    worse than it was. It is listed in requirements.txt for exactly this.
+    """
+    try:
+        import dns.resolver                          # noqa: PLC0415
+    except Exception:
+        return ""
+    try:
+        resolver = dns.resolver.Resolver()
+        resolver.lifetime = resolver.timeout = timeout
+        answers = resolver.resolve(domain, "MX")
+        # Lowest preference first — that is the server the sender is meant to
+        # reach, and the one whose provider runs the mailbox.
+        hosts = sorted(((r.preference, str(r.exchange).rstrip(".").lower())
+                        for r in answers), key=lambda pair: pair[0])
+    except Exception:
+        return ""
+    for _preference, exchange in hosts:
+        for suffix, imap in _MX_IMAP.items():
+            if exchange == suffix or exchange.endswith("." + suffix):
+                return imap
+    return ""
+
+
 def guess_hosts(address: str) -> list[str]:
     """Host names to try for a company-domain address.
 
@@ -86,7 +141,13 @@ def guess_hosts(address: str) -> list[str]:
     domain = address.rsplit("@", 1)[-1].lower().strip()
     if not domain:
         return []
-    return [f"imap.{domain}", f"mail.{domain}", domain]
+    # The MX answer first when there is one. A company whose mail is hosted —
+    # GoDaddy, Google Workspace, Microsoft 365 — has no imap.<their-domain>
+    # at all, so the three guesses below could only ever fail for them, and
+    # that is most small manufacturers rather than an edge case.
+    hosted = mx_host(domain)
+    guesses = [f"imap.{domain}", f"mail.{domain}", domain]
+    return ([hosted] + guesses) if hosted else guesses
 
 
 def is_configured(cfg: dict) -> bool:
@@ -175,15 +236,26 @@ def verify(cfg: dict) -> str:
     return ""
 
 
-def discover(address: str, password: str, timeout: int = 20) -> tuple[dict, str]:
+def discover(address: str, password: str, timeout: int = 20,
+             host: str = "") -> tuple[dict, str]:
     """Find the settings for an address by trying the likely servers.
 
     Returns ({host, port, address, password}, "") or ({}, human error). This is
     the whole of "set up my mail" for a company domain: they type the two
     things they know and Prism works out the rest.
+
+    `host` is a server the user has typed in themselves, and it is tried
+    **first**. Without that, somebody who already knew their server — because
+    their provider's help page told them, which is the usual way out of this —
+    could type it in, press the button, and watch Prism ignore it and fail on
+    three guesses. The guesses still run afterwards, so a typo is not a dead
+    end; whatever actually answers is what gets saved.
     """
     last = ""
-    for host in guess_hosts(address):
+    typed = (host or "").strip()
+    candidates = ([typed] if typed else []) + [
+        h for h in guess_hosts(address) if h != typed]
+    for host in candidates:
         ic = {"address": address, "password": password, "host": host, "port": 993}
         try:
             conn = _connect(ic, timeout=timeout)
