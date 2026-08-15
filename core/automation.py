@@ -2162,10 +2162,16 @@ def run(routing: dict, cfg: dict, attachments=None, on_event=None,
                     except Exception as e:
                         ui.warn(f"   couldn't prepare the artwork ({e})")
                     design_assets = table
-                    listing = (_assets.manifest(table) if table else "")
+                    # manifest() answers for the empty case too, and must: a
+                    # design stage told nothing about pictures designs around
+                    # the ones it assumes are there. See assets.NO_ARTWORK.
+                    listing = _assets.manifest(table)
                     if table:
                         ui.info(f"   🖼️   {len(table)} asset(s) for the design: "
                                 + ", ".join(table))
+                    else:
+                        ui.warn("   🎨  no artwork — the design stage is being "
+                                "told to build this from type and colour alone")
                     if not studio_brand and research_stage:
                         studio_brand = _web.read_brand(
                             all_responses.get(research_stage) or [])

@@ -227,11 +227,43 @@ def collect(images: list, out_dir: str | None = None,
     return table
 
 
+# What the design stage is told when the imagery never arrived.
+#
+# Silence is not neutral here, and that was the bug. An empty asset list left
+# the prompt simply not mentioning pictures, so a model asked for a premium
+# product reel assumed the usual ones existed and wrote src='asset:art1' —
+# which renders as an empty box, or nothing at all, in every scene that used
+# it. The reel came out looking broken rather than looking spare.
+#
+# Image generation fails for ordinary reasons — a quota, a content refusal, a
+# slow render that never finished — and none of them should cost the customer
+# the whole reel. A type-and-colour reel is a legitimate design, and several of
+# the best ones are exactly that. It just has to be designed ON PURPOSE.
+NO_ARTWORK = """  (none — no imagery was generated for this reel)
+
+THERE ARE NO IMAGES. This is not an oversight and it is not a reason to stop:
+design this reel entirely from type, colour, layout and CSS.
+
+  - Do NOT reference asset:anything. There are no files behind those names,
+    and every one you write becomes an empty box on screen.
+  - Do NOT leave space for pictures that are coming later. Nothing is coming.
+  - DO carry the whole design on typography: scale, weight, hierarchy,
+    generous negative space, rules and dividers, colour fields, gradients,
+    and shapes built in CSS (borders, radii, transforms, clip-path).
+  - A spare, confident, type-led reel is a legitimate and often superior
+    design. Make it look deliberate, not like something is missing."""
+
+
 def manifest(table: dict) -> str:
     """The asset list as the design stage is told about it — names, sizes and
-    whether the background is really gone."""
+    whether the background is really gone.
+
+    An empty table returns the NO_ARTWORK instruction rather than an empty
+    string: the design stage has to be told that the pictures are not coming,
+    or it designs around ones that never arrive.
+    """
     if not table:
-        return ""
+        return NO_ARTWORK
     lines = []
     for name, a in table.items():
         if a.get("made"):
