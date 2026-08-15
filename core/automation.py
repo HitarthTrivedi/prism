@@ -825,6 +825,60 @@ def _is_natural(agent_cfg: dict) -> bool:
     return (agent_cfg or {}).get("prompt_style") == "natural"
 
 
+# How much of the user's own request travels into every stage prompt. Generous
+# on purpose: this is the one piece of text nothing else can reconstruct, and
+# truncating the sentence that says what the product DOES is exactly the
+# failure this exists to prevent.
+_MAX_INTENT_CHARS = 2500
+
+
+def _intent_block(query: str) -> str:
+    """The user's own words, verbatim, at the top of every stage prompt.
+
+    The failure this fixes, in full, because it is not obvious and it cost a
+    whole reel:
+
+    Prism expands a request into a professional task brief, and the router
+    writes each stage prompt FROM that brief. The router itself is given the
+    raw request and told it wins on scope — but the STAGE PROMPTS it produces
+    were only as good as what it chose to carry across, and the agents never
+    saw the original at all.
+
+    A customer asked for a reel about "Consiz, a mouse with a middle button
+    that summarises whatever you have selected and lets you ask questions
+    about it". The brief came back as "showcase the mouse, demonstrate its
+    features, explain its benefits" — every specific, mechanical fact gone.
+    Claude then wrote an excellent script about a generic productivity mouse,
+    because a generic productivity mouse is all it was ever told about.
+
+    Nothing downstream can recover from that. The brief is a summary, and a
+    summary that drops the one fact the whole video is about is indetectable
+    to everything after it: the words that came through read perfectly well.
+
+    So the raw request rides along, first, marked as the human's own and
+    authoritative over anything that follows. It costs a few hundred tokens a
+    stage and removes a whole class of quietly-wrong output.
+    """
+    text = (query or "").strip()
+    if not text:
+        return ""
+    if len(text) > _MAX_INTENT_CHARS:
+        text = text[:_MAX_INTENT_CHARS].rstrip() + " […]"
+    return (
+        "WHAT THE PERSON ACTUALLY ASKED FOR — in their own words:\n"
+        "---\n"
+        f"{text}\n"
+        "---\n"
+        "Everything below is Prism's engineered version of that request. It "
+        "is there to help you, but it is a SUMMARY and summaries lose things. "
+        "Where the two differ, or where the text below is vaguer about what "
+        "the thing actually does, the words above win. Specific facts above — "
+        "how a product works, what a button does, what must be avoided — must "
+        "survive into your answer even if the brief below does not repeat "
+        "them.\n\n"
+    )
+
+
 def _context_header(agent_cfg: dict, prev_stage: str) -> str:
     """The line that introduces the previous stage's output."""
     if _is_natural(agent_cfg):
@@ -1883,7 +1937,11 @@ def run(routing: dict, cfg: dict, attachments=None, on_event=None,
             # everything before it into its own answer, so the latest output
             # already carries the whole chain — re-sending every older stage
             # would only bloat and slow down the prompt.
-            context = attach_ctx if include_attachment else ""
+            # The person's own words first, before the attachments and before
+            # the previous stage's handoff. Whatever else gets crowded out of
+            # a long prompt, this must not be it.
+            context = _intent_block(query)
+            context += attach_ctx if include_attachment else ""
             if producer and pipeline_files:
                 names = ", ".join(f["name"] for f in pipeline_files)
                 context += (
