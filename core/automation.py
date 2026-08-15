@@ -846,6 +846,32 @@ _BROWSER_GONE = (
 )
 
 
+def _keep_failed_spec(sources) -> str:
+    """Write the reply that would not parse to disk, and say where.
+
+    A renderer failure is the one place where the evidence is both essential
+    and momentary: the text lives in a local variable, the run moves on, and
+    all anybody is left with is "No JSON found in the agent's reply" against a
+    ChatGPT tab that visibly contains JSON. Those two facts cannot both be
+    investigated from a log line.
+
+    Best-effort in every direction — a full disk must not turn a bad design
+    into a crash.
+    """
+    try:
+        from . import config
+        folder = os.path.join(os.path.dirname(config.CONFIG_PATH), "logs")
+        os.makedirs(folder, exist_ok=True)
+        path = os.path.join(folder, f"design-that-would-not-parse-{int(time.time())}.txt")
+        with open(path, "w", encoding="utf-8") as f:
+            for i, text in enumerate(sources, 1):
+                f.write(f"───── candidate {i} ─────\n{text}\n\n")
+        ui.warn(f"   saved what came back to {path}")
+        return path
+    except Exception:                                    # noqa: BLE001
+        return ""
+
+
 def _browser_is_gone(error: object) -> bool:
     """True when the failure is the browser itself, not the step.
 
@@ -1496,8 +1522,15 @@ def _run_studio(prior_text, attachments, cfg: dict, brand: dict | None = None):
         except Exception as e:
             why_bad = why_bad or e
     if spec is None:
+        # Keep what actually came back. Without this the one piece of evidence
+        # that could explain the failure is discarded at the moment it becomes
+        # interesting, and "No JSON found in the agent's reply" is unanswerable
+        # — the customer can see JSON on the ChatGPT page and Prism cannot,
+        # and there is no way to tell which of them is looking at the truth.
+        kept = _keep_failed_spec(sources)
         return "", (f"{why_bad or 'Nothing was written for the renderer.'} "
-                    "The art-direction stage has to return the design JSON.")
+                    "The art-direction stage has to return the design JSON."
+                    + (f" What came back was saved to {kept}" if kept else ""))
 
     imgs = [a["path"] for a in (attachments or [])
             if a.get("path", "").lower().endswith(

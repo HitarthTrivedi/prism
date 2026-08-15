@@ -32,6 +32,7 @@ from __future__ import annotations
 import json
 import math
 import os
+import re
 import shutil
 import subprocess
 
@@ -859,12 +860,49 @@ def _fix_markup_quotes(block: str) -> str:
                   lambda m: "='" + m.group(1) + "'", block)
 
 
+# A URL the chat UI turned into a clickable link, sitting inside the CSS.
+#
+# Anchored on the link TEXT starting with http, because that is the only thing
+# these UIs linkify. CSS is full of brackets and parentheses — attribute
+# selectors, url(), rgba() — and a looser pattern would happily eat them.
+_LINKIFIED = re.compile(r"\[(https?://[^\]]*)\]\([^)\s]*\)")
+
+
+def _unlink_markdown(block: str) -> str:
+    """Undo the chat window's auto-linking of URLs inside the design.
+
+    The failure, which looks like the model's fault and is not:
+
+        "css": "@import url('[https://fonts.googleapis.com/…;*{box-sizing:
+                border-box}html,body{…font-family:'DM](https://fonts.google…)
+                 Sans',sans-serif}…"
+
+    ChatGPT wrote perfectly good CSS. Its web UI then rendered the @import
+    URL as a hyperlink, and because a stylesheet URL runs right up against the
+    code after it, the anchor swallowed half the stylesheet as its link text.
+    What Prism scraped off the page was markdown, not the CSS — so the JSON
+    would not parse and the whole design was thrown away with "No JSON found
+    in the agent's reply", which is the one message guaranteed to send someone
+    looking in the wrong place.
+
+    Taking the link TEXT rather than the href is the repair. The text is the
+    literal characters the model typed; the href is the browser's percent-
+    encoded guess at where they might point, and it has `)` rewritten to %29.
+    """
+    return _LINKIFIED.sub(lambda m: m.group(1), block)
+
+
 def parse_spec(text: str) -> dict:
     """Pull the design/scene JSON out of an agent's reply — same balanced-brace
     scan as the Pillow renderer, since scrapes carry fences and preambles."""
     from . import reel as _pillow
     if not text or not text.strip():
         raise ReelError("The agent returned nothing to render.")
+    # Before the brace scan, not merely as a repair candidate afterwards: the
+    # swallowed link text carries its own unbalanced { and }, so _blocks would
+    # be counting braces that were never really there and would cut the design
+    # in the wrong place.
+    text = _unlink_markdown(text)
     spec = None
     for block in _pillow._blocks(text, "{", "}"):
         for candidate in (block, _fix_markup_quotes(block),
