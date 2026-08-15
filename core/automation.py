@@ -60,6 +60,59 @@ def _get_driver(cfg: dict):
     return _active_driver, True
 
 
+def _open_tab(driver, agent_name: str = "") -> bool:
+    """Put the next stage in a NEW tab, leaving every finished one on screen.
+
+    Each stage gets its own tab so the whole run stays readable afterwards —
+    Claude's answer still there when ChatGPT's arrives, and so on. That is the
+    point of never calling quit(), and it only works if this actually gets a
+    new tab every time.
+
+    It was `execute_script("window.open('')")`, then `sleep(1)`, then
+    `window_handles[-1]`, and that failed two ways — both silently, and both
+    ending in the same place: no new tab, so `driver.get()` navigated the tab
+    the PREVIOUS agent's answer was sitting in, and that answer was gone.
+
+      · window.open() from injected script is not a user gesture, so Chrome's
+        popup blocker is entitled to refuse it, and on a real profile with
+        stricter settings it does.
+      · Even when allowed, one second is a guess. If the handle had not
+        registered yet, handles[-1] was still the OLD tab.
+
+    switch_to.new_window() is the WebDriver command for this. It goes through
+    the driver rather than the page, so the popup blocker has no say, and it
+    returns once the tab exists rather than after a hopeful sleep.
+
+    Returns whether a new tab was actually obtained. Falling back to the old
+    trick, and then to reusing the current tab, is deliberate: losing an
+    earlier answer from the screen is bad, but refusing to run the stage at
+    all would be worse.
+    """
+    before = set(driver.window_handles)
+    try:
+        driver.switch_to.new_window("tab")
+        if set(driver.window_handles) - before:
+            return True
+    except Exception:
+        pass
+
+    try:                                # older drivers, or a refusal above
+        driver.execute_script("window.open('');")
+        for _ in range(20):             # up to ~4s, checked rather than assumed
+            time.sleep(0.2)
+            new = set(driver.window_handles) - before
+            if new:
+                driver.switch_to.window(new.pop())
+                return True
+    except Exception:
+        pass
+
+    ui.warn(f"   ⚠️   couldn't open a new tab for {agent_name or 'this step'} — "
+            f"reusing the current one, so the previous answer will be replaced. "
+            f"Its text is still saved in this run.")
+    return False
+
+
 def shutdown() -> None:
     """Close Prism's browser, if one is open.
 
@@ -2030,9 +2083,7 @@ def run(routing: dict, cfg: dict, attachments=None, on_event=None,
         timed_out = False
         try:
             if not first_tab:
-                driver.execute_script("window.open('');")
-                time.sleep(1)
-                driver.switch_to.window(driver.window_handles[-1])
+                _open_tab(driver, agent_name)
             first_tab = False
             driver.get(agent_cfg["url"])
             time.sleep(agent_cfg.get("page_wait", 4))
