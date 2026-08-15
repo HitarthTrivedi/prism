@@ -791,6 +791,59 @@ def design_instructions(brand: dict | None = None, request: str = "",
         "· Cuts: the outgoing scene has class `leaving` with `--x` 0→1, the "
         "incoming one `entering` with `--e` 0→1. Style them however you like "
         "— a fade is only the default.\n\n"
+
+        # ── how motion should FEEL ───────────────────────────────────────────
+        # Everything above this point is mechanics: fill-mode, seeking, which
+        # custom property holds what. The prompt never said what motion should
+        # DO, and it showed — scenes were authored in isolation, each animating
+        # in and out on its own, so the eye's momentum died at every cut and
+        # the result read as a stack of slides rather than a film.
+        #
+        # These laws are adapted from HyperFrames' motion doctrine
+        # (github.com/heygen-com/hyperframes, Apache 2.0). Adapted, not copied:
+        # theirs assumes GSAP, data-* timing and a ledger.json verifier, none
+        # of which exist here, and instructing a model to use machinery that is
+        # not present is worse than saying nothing. What survives the
+        # translation is the reasoning, rewritten against Prism's own contract
+        # — `--x` on the way out, `--e` on the way in, CSS only.
+        #
+        # NOT YET DONE, and the trigger for doing it (see docs/DEFERRED.md):
+        #   · Checking the seams rather than only asking — a `seams` array in
+        #     the design JSON, verified in parse_spec the way layout faults
+        #     already are. Worth building the first time a reel comes back
+        #     with the rules plainly ignored.
+        #   · Carriers across a cut: one object travelling through the seam at
+        #     matched position and velocity. Both scenes ARE on screen during
+        #     a cut, so it is possible — but it needs the same element authored
+        #     into both, and that is a lot to ask before the simpler laws are
+        #     landing reliably.
+        "HOW MOTION SHOULD FEEL — this is what separates a film from a stack "
+        "of slides:\n"
+        "· THE SEAM IS ONE MOVE. How a scene leaves decides how the next one "
+        "arrives: same axis, same direction, matched speed. If the outgoing "
+        "scene slides left, the incoming one continues left — it does not "
+        "come back from the right. Mirroring the direction across a cut is "
+        "the commonest mistake and reads as a mistake.\n"
+        "· PICK ONE CURRENT and use it for every ordinary cut. Other "
+        "directions are reserved and spending one should MEAN something: "
+        "upward for a conclusion rising above what came before, a push deeper "
+        "for staying inside the same thought, a pull back for something "
+        "bigger arriving. Never run two consecutive cuts in opposing "
+        "directions.\n"
+        "· CUT MID-MOTION on both sides. A scene that has settled to rest "
+        "before the cut, or that starts from rest after it, is a dead beat. "
+        "The outgoing element should still be travelling when it goes; the "
+        "incoming one should already be moving when it appears.\n"
+        "· MOTION PERFORMS, THEN STOPS. Nothing drifts, breathes, floats or "
+        "pulses to fill time. Every movement does a job — arrives, reacts, "
+        "hands over — and then holds still. Idle wobble is what makes a reel "
+        "look automatically generated.\n"
+        "· BE STILL BEFORE THE CLIMAX. The strongest moment lands hardest "
+        "out of quiet, not out of more movement.\n"
+        "· A change of direction needs a visible cause — an impact, a click, "
+        "a bounce — or a deliberate chapter break. An uncaused reversal is "
+        "just a wobble.\n\n"
+
         "WHAT THE RENDERER GUARANTEES, SO YOU DO NOT HAVE TO:\n"
         "the frame size, the seeking, the cuts' timing, and the encode. "
         "`.scene` is already a full-frame absolutely-positioned layer, and "
