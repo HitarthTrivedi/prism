@@ -1366,13 +1366,23 @@ def _capture(driver, agent_cfg: dict) -> list[str]:
     return texts
 
 
-# Stages where "make it editable" means anything. A research answer cannot be
-# opened in Canva, and asking would just confuse the tool.
-_EDITABLE_STAGES = ("visual", "presentation", "artwork", "design")
+# Stages where "make it editable" means anything.
+#
+# Exactly the two the registry configures a Canva suffix for, and no more.
+# This first shipped including "artwork" and "design" as well, which was
+# wrong and showed up on the first real run: the Studio pipeline's design
+# stage emits a JSON scene spec for Prism's own renderer, so the follow-up
+# asked Canva to "import the image above" when the message above was a CSS
+# blob. Canva answered "none", and the turn was pure waste on a conversation
+# that had just been asked, twice, for strict JSON.
+#
+# Both of those stages are internal plumbing of the Studio pipeline. Neither
+# is ever the thing a customer opens and edits.
+_EDITABLE_STAGES = ("visual", "presentation")
 
 
 def _make_editable(driver, agent_cfg: dict, stage: str, query: str,
-                   responses: list) -> list:
+                   responses: list, machine_shaped: bool = False) -> list:
     """Hand the image just generated to Canva, in the same conversation.
 
     Two prompts, not one. The first asked for the best picture the tool can
@@ -1388,6 +1398,12 @@ def _make_editable(driver, agent_cfg: dict, stage: str, query: str,
     link would lose the artwork the customer actually asked for.
     """
     if stage not in _EDITABLE_STAGES:
+        return responses
+    if machine_shaped:
+        # This stage's answer is parsed by Prism, not read by a person. It was
+        # just told to reply with ONLY a JSON object; adding a chat turn after
+        # that both wastes a round trip and leaves prose sitting where the
+        # parser expects to find the spec.
         return responses
     if not A.wants_canva(query):
         return responses
@@ -2398,7 +2414,8 @@ def run(routing: dict, cfg: dict, attachments=None, on_event=None,
             # The artwork exists and is good. NOW make it editable — a second
             # prompt in the same chat rather than a different first prompt.
             stage_responses = _make_editable(
-                driver, agent_cfg, stage, query, stage_responses)
+                driver, agent_cfg, stage, query, stage_responses,
+                machine_shaped=machine_shaped)
 
             if stage_responses:
                 ui.info(f"   📥  captured {sum(len(t) for t in stage_responses)} chars")
