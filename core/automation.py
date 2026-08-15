@@ -832,6 +832,30 @@ def _is_natural(agent_cfg: dict) -> bool:
 _MAX_INTENT_CHARS = 2500
 
 
+# Selenium's wordings for "there is no browser to talk to any more". Every one
+# of these means the session is dead, not that this particular step went wrong.
+_BROWSER_GONE = (
+    "no such window",
+    "target window already closed",
+    "web view not found",
+    "invalid session id",
+    "session deleted because of page crash",
+    "disconnected: not connected to devtools",
+    "chrome not reachable",
+    "browser has closed",
+)
+
+
+def _browser_is_gone(error: object) -> bool:
+    """True when the failure is the browser itself, not the step.
+
+    Matched on the message rather than the exception class because
+    undetected_chromedriver re-raises through several of Selenium's types and
+    the wording is the only thing common to all of them.
+    """
+    return any(marker in str(error).lower() for marker in _BROWSER_GONE)
+
+
 def _intent_block(query: str) -> str:
     """The user's own words, verbatim, at the top of every stage prompt.
 
@@ -2434,9 +2458,27 @@ def run(routing: dict, cfg: dict, attachments=None, on_event=None,
                 all_links[stage] = url
                 ui.info(f"   🔗  {url}  (still open — the tool may finish there)")
             ui.err(f"stage {stage} failed: {ex}")
+            emit("stage_error", {"stage": stage, "error": str(ex), "url": url})
+
+            # A closed browser is not a failed STAGE, it is a failed RUN.
+            #
+            # Every stage after this one would open the same dead session,
+            # raise the same error and take its own timeout getting there — so
+            # a run stopped at step two reports five identical failures over
+            # several minutes, and the customer has to work out which of them
+            # was the real one. Worse, the failover pass would then try each
+            # of them again on a second tool, through the same dead driver.
+            #
+            # Stop here and say so once, keeping everything already finished.
+            if _browser_is_gone(ex):
+                ui.err("   the browser window is gone — stopping here and "
+                       "keeping everything finished so far")
+                emit("browser_lost", {"stage": stage, "error": str(ex),
+                                      "done": len(all_responses)})
+                return all_responses, all_links
+
             failures[stage] = {"agent": agent_name, "questions": questions,
                                "reason": str(ex), "exhausted": False}
-            emit("stage_error", {"stage": stage, "error": str(ex), "url": url})
 
     if failover and failures and not stopped():
         _retry_failed_stages(
