@@ -2439,9 +2439,13 @@ def run(routing: dict, cfg: dict, attachments=None, on_event=None,
                         again = _reask(
                             driver, agent_cfg,
                             "That reply cannot be rendered. Send the scene "
-                            "spec itself now: reply with ONLY the JSON object, "
-                            "first character '{', last character '}', no "
-                            "preamble, no handoff, no fences.",
+                            "spec itself now: reply with ONLY the JSON "
+                            "object, wrapped in a ```json fenced code block "
+                            "and nothing else — no preamble, no handoff. "
+                            "Keep the fence: without it the chat window eats "
+                            "the asterisks in your CSS and wraps long URLs "
+                            "onto new lines, which is what broke the last "
+                            "attempt.",
                             expect='"scenes"')
                         fixed = [t for t in again if _reel.has_spec(t)]
                         if fixed:

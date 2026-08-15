@@ -1415,15 +1415,58 @@ def _blocks(text: str, open_ch: str, close_ch: str) -> list[str]:
     return list(reversed(out))
 
 
+def _escape_control_chars(block: str) -> str:
+    """Escape the raw newlines a chat window wrapped INTO a JSON string.
+
+    Diagnosed from a saved failure, and it is not the model's fault. ChatGPT
+    wrote a perfectly good stylesheet; its page then soft-wrapped the very long
+    Google Fonts URL, and the scrape turned that visual wrap into a real
+    newline sitting inside the string:
+
+        "css":"@import url('https://…&display=swap
+        ');*{box-sizing:border-box}…"
+
+    JSON forbids an unescaped control character inside a string, so the whole
+    design was thrown away over a line break that only ever existed on screen.
+
+    Walks the text tracking whether it is inside a string, so newlines BETWEEN
+    members — the ordinary pretty-printing that is perfectly legal — are left
+    exactly as they are. Only the ones trapped inside a value are escaped.
+    """
+    out, in_string, escaped = [], False, False
+    for ch in block:
+        if escaped:
+            out.append(ch)
+            escaped = False
+            continue
+        if ch == "\\":
+            out.append(ch)
+            escaped = in_string
+            continue
+        if ch == '"':
+            in_string = not in_string
+            out.append(ch)
+            continue
+        if in_string and ch in "\n\r\t":
+            out.append({"\n": "\\n", "\r": "\\r", "\t": "\\t"}[ch])
+            continue
+        out.append(ch)
+    return "".join(out)
+
+
 def _loosen(block: str) -> str:
     """Last-resort repair of the JSON faults models actually make: trailing
     commas, // comments, and curly quotes used as delimiters. Only ever tried
-    AFTER a strict parse has failed, so it can never corrupt valid JSON."""
+    AFTER a strict parse has failed, so it can never corrupt valid JSON.
+
+    Also repairs the faults the chat WINDOW makes, which is a different list
+    and took a saved failure to find — see _escape_control_chars.
+    """
     import re
     block = re.sub(r"(?m)^\s*//.*$", "", block)
     block = block.replace("“", '"').replace("”", '"')
     block = re.sub(r",\s*([}\]])", r"\1", block)
-    return block
+    return _escape_control_chars(block)
 
 
 def parse_spec(text: str) -> dict:

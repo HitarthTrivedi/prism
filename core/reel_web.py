@@ -507,7 +507,9 @@ def script_instructions() -> str:
         "OUTPUT FORMAT — THIS OVERRIDES EVERY OTHER FORMATTING INSTRUCTION "
         "YOU HAVE BEEN GIVEN, INCLUDING ANY RULE ASKING FOR A HANDOFF OR A "
         "SUMMARY. Your reply is read by a program. Reply with ONLY a JSON "
-        "object — first character '{', last '}', no prose, no fences.\n\n"
+        "object, wrapped in a ```json fenced code block and nothing else — "
+        "no prose before it, none after. The fence keeps the chat window from "
+        "reformatting what you wrote.\n\n"
         "You are writing the SCRIPT for a short vertical brand reel. Words "
         "and running order only. You do not decide how it looks: a separate "
         "art-direction pass does that, and anything you say about colour, "
@@ -703,10 +705,24 @@ def design_instructions(brand: dict | None = None, request: str = "",
     # and the token is substituted the moment before this prompt is typed.
     swatch = BRAND_TOKEN if brand is None else brand_block(brand)
     return (
+        # Fences are now REQUIRED, having been forbidden here since this was
+        # written. Diagnosed from a saved failure: asked for bare JSON, the
+        # chat window renders it as prose, and prose is markdown — so every
+        # asterisk in the stylesheet is eaten as an emphasis marker (`*{box-
+        # sizing:border-box}` arrives as ` {box-sizing:border-box}`) and a long
+        # @import URL gets soft-wrapped into a real newline inside a JSON
+        # string, which is an unescaped control character and unparseable.
+        #
+        # Inside a code block markdown processes nothing and wrapping is
+        # visual only, so both corruptions simply do not happen. The parser
+        # has always skipped fences — its own docstring says scrapes carry
+        # them — so forbidding them bought nothing and cost whole designs.
         "OUTPUT FORMAT — THIS OVERRIDES EVERY OTHER FORMATTING INSTRUCTION, "
         "INCLUDING ANY RULE ASKING FOR A HANDOFF OR A SUMMARY. Reply with "
-        "ONLY a JSON object — first character '{', last '}', no prose, no "
-        "fences.\n\n"
+        "ONLY a JSON object, wrapped in a ```json fenced code block and "
+        "nothing else — no prose before it, none after. The fence matters: "
+        "outside one, the chat window eats the asterisks in your CSS and "
+        "breaks long URLs across lines, and the design is lost.\n\n"
         "You are the ART DIRECTOR for a 1080x1920 vertical reel. The script "
         "above is final: use its words exactly, in its order, with its "
         "timings. Everything about how it LOOKS and MOVES is yours — "
