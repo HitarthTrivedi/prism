@@ -1361,14 +1361,74 @@ def _looks_signed_out(driver) -> str:
     return ""
 
 
-def _capture(driver, agent_cfg: dict) -> list[str]:
-    """Everything on the page that reads as a reply, longest captures only."""
-    from selenium.webdriver.common.by import By
+def _looks_unreadable(driver, questions, timed_out: bool = False) -> str:
+    """"" unless the page holds a real conversation we could not read.
+
+    The third case, and the one that had no message of its own. A stage that
+    captures nothing is one of four things: the tool ran out (_looks_exhausted),
+    the page is a sign-in or robot wall (_looks_signed_out), the answer was
+    still being written, or THE SITE CHANGED ITS MARKUP and our selector no
+    longer matches. The last two both landed on "it returned nothing", which
+    tells the customer only that Prism failed.
+
+    Distinguished by our own prompt being on the page: if it is, we reached the
+    tool, typed, and submitted successfully — so this is not a login problem and
+    saying so sends the customer to fix something that is not broken.
+
+    Note the length ceiling in _looks_signed_out is doing its job and is not the
+    bug: it is what stops a long conversation page being reported as a sign-in
+    wall. This function covers the case that ceiling deliberately lets through.
+    """
     try:
-        elements = driver.find_elements(
-            By.CSS_SELECTOR, agent_cfg.get("response_selector", ""))
+        body = (driver.find_element("tag name", "body").text or "")
     except Exception:
+        return ""
+    if len(body) <= 4000:
+        return ""                       # short page: the other two checks own it
+    asked = [q for q in (questions or []) if q and len(q) > 40]
+    if not any(q[:40].lower() in body.lower() for q in asked):
+        return ""                       # cannot prove we got our prompt in
+    if timed_out:
+        return ("This tool was still writing its answer when Prism stopped "
+                "waiting. The tab is still open and the answer will finish "
+                "there — give it longer in Settings, or copy it from the tab.")
+    return ("This tool answered, but Prism could not read the reply off the "
+            "page — the site has most likely changed its layout. Your prompt "
+            "went through, so the answer is in the open tab and can be copied "
+            "from there. Please report it: this needs a Prism update, and it "
+            "is not something signing in again will fix.")
+
+
+def _match(driver, selector: str) -> list:
+    from selenium.webdriver.common.by import By
+    if not selector:
         return []
+    try:
+        return driver.find_elements(By.CSS_SELECTOR, selector)
+    except Exception:
+        return []                       # invalid selector, or the page moved
+
+
+def _capture(driver, agent_cfg: dict) -> list[str]:
+    """Everything on the page that reads as a reply, longest captures only.
+
+    Falls back to the GENERIC selector when the hand-tuned one matches nothing.
+    The tuned selectors are pinned to markup we do not own: these sites roll
+    redesigns out in buckets, so the same version of Prism can be right for one
+    customer and wrong for another on the same afternoon. A tuned selector that
+    matches is always preferred — the generic one is broader and picks up more
+    noise — but matching nothing at all is the one case where broader-and-noisy
+    beats exact-and-empty, because empty is indistinguishable from failure.
+    """
+    elements = _match(driver, agent_cfg.get("response_selector", ""))
+    if not elements:
+        from . import agents as _agents
+        generic = _agents._GENERIC["response_selector"]
+        if generic != agent_cfg.get("response_selector", ""):
+            elements = _match(driver, generic)
+            if elements:
+                ui.info("   🔁  tuned selector matched nothing; "
+                        "read the reply with the generic one")
     texts = []
     for el in elements:
         try:
@@ -2489,10 +2549,12 @@ def run(routing: dict, cfg: dict, attachments=None, on_event=None,
                                     "timed_out": timed_out})
             else:
                 # Nothing came back. Before reporting that as a scrape miss,
-                # ask the two far more likely questions: has this tool run out,
-                # and is this a sign-in wall?
+                # ask the three far more likely questions: has this tool run
+                # out, is this a sign-in wall, and — if neither, and our prompt
+                # is visibly on the page — did the site change its markup?
                 spent = _looks_exhausted(driver)
-                blocked = spent or _looks_signed_out(driver)
+                blocked = (spent or _looks_signed_out(driver)
+                           or _looks_unreadable(driver, questions, timed_out))
                 if blocked:
                     ui.err(blocked)
                 else:
