@@ -621,11 +621,53 @@ AGENT_REGISTRY = {
 }
 
 
+# Selector overrides delivered by the licence server, applied on top of the
+# registry at lookup time. Empty in a fresh process and populated by
+# licensing.payload once a verified payload has been read.
+#
+# Held apart from AGENT_REGISTRY rather than merged into it, on purpose: the
+# built-in values must stay reachable and unmodified, so that clearing the
+# overrides restores the shipped behaviour exactly. A payload that turns out to
+# be wrong is then one publish away from being undone, and a customer who never
+# reaches the server is never worse off than the build they installed.
+_OVERRIDES: dict[str, dict] = {}
+
+
+def apply_overrides(mapping: dict[str, dict] | None) -> int:
+    """Replace the override set. Returns how many agents are now overridden.
+
+    Replace, not merge: the payload is the whole intended state, so an agent
+    dropped from it must revert to its built-in values rather than keep an
+    override nobody can see any more.
+    """
+    _OVERRIDES.clear()
+    for name, over in (mapping or {}).items():
+        if isinstance(name, str) and isinstance(over, dict) and over:
+            _OVERRIDES[name] = dict(over)
+    return len(_OVERRIDES)
+
+
+def overrides() -> dict[str, dict]:
+    """What is currently overridden — for diagnostics and the self-test."""
+    return {name: dict(over) for name, over in _OVERRIDES.items()}
+
+
 def resolve_agent(stage: str, name: str) -> dict | None:
-    """Return the registry entry for an agent (name is category-independent)."""
+    """Return the registry entry for an agent (name is category-independent).
+
+    The one place every stage passes through, which is why server-published
+    overrides are applied here rather than at each call site.
+    """
     if not name:
         return None
-    return AGENT_REGISTRY.get(name)
+    entry = AGENT_REGISTRY.get(name)
+    if entry is None:
+        return None
+    over = _OVERRIDES.get(name)
+    if not over:
+        return entry
+    # A copy, so an override never mutates the shipped registry.
+    return {**entry, **over}
 
 
 def alternatives_for(stage: str, tried: list | tuple = (),
