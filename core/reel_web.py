@@ -310,6 +310,81 @@ def brand_faults(spec: dict) -> list[str]:
             "in each scene, or the reel is not in their colours"]
 
 
+# `.entering` / `.leaving` carrying a transform — i.e. the whole scene moving
+# as one object. Matched on the declaration block rather than the selector
+# alone, because `.scene.entering .sheet { animation: … }` is animating a
+# CHILD and is exactly what we want.
+_WRAPPER_MOVE = re.compile(
+    r"\.(?:scene\.)?(entering|leaving)\s*\{[^}]*\banimation\s*:", re.I)
+
+# Every `animation: <name>` used inside the scene markup, so we can tell one
+# element carrying a move from every element doing the same thing at staggered
+# delays.
+_ANIM_CLASS = re.compile(r"\.([\w-]+)\s*\{\s*animation\s*:\s*([\w-]+)", re.I)
+
+
+def motion_faults(spec: dict) -> list[str]:
+    """Did the design MOVE like a film, or like a slide deck?
+
+    Two faults, both diagnosed from a real reel that followed every motion
+    law in the prompt and still came back looking like PowerPoint.
+
+    **The scene moved as a block.** `.entering{animation:pushIn}` slides the
+    entire frame in, contents and all. That satisfies "how a scene leaves
+    decides how the next arrives" in the laziest available way — and it IS a
+    slide, by definition. The rule was followed and the rule was not enough.
+
+    **Everything inside shared one animation.** Kicker, headline, support and
+    four list items all `.reveal`, all `rise`, differing only by
+    `delay1…delay5`. An identical animation on a staggered delay is a
+    PowerPoint build, not a composition: nothing leads, nothing reacts,
+    nothing is subordinate.
+
+    Checked rather than merely asked for, because asking was tried first and
+    produced the reel that prompted this. Pure string work on the spec — no
+    browser, no rendering — so it runs anywhere and is cheap to test.
+    """
+    design = spec.get("design") or {}
+    css = str(design.get("css", ""))
+    if not css.strip():
+        return []
+    out = []
+
+    if _WRAPPER_MOVE.search(css):
+        out.append(
+            "the scene wrapper itself is animated (.entering / .leaving carry "
+            "an animation), so the whole frame slides in and out as one slab "
+            "— that is a slide, not a film. Animate what is INSIDE the scene "
+            "instead, and let the elements arrive at different times and on "
+            "different paths")
+
+    # Not "is there only one animation" — measured on a real reel, that is too
+    # strict to catch anything. Four animations were declared and 25 of the 30
+    # animated elements used the same one. What makes a slide build is one
+    # animation DOMINATING, not being alone.
+    declared = {cls: anim for cls, anim in _ANIM_CLASS.findall(css)}
+    tally: dict[str, int] = {}
+    for sc in spec.get("scenes") or []:
+        for cls in re.findall(r"class\s*=\s*['\"]([^'\"]+)", str(sc.get("html", ""))):
+            for token in cls.split():
+                if token in declared:
+                    tally[declared[token]] = tally.get(declared[token], 0) + 1
+    total = sum(tally.values())
+    # Below five moving things there is no composition to get wrong, and a
+    # title card that is one line and a rule would flag every time.
+    if total >= 5:
+        name, count = max(tally.items(), key=lambda kv: kv[1])
+        if count / total >= 0.7:
+            out.append(
+                f"{count} of the {total} things that move use the same "
+                f"animation ('{name}') — {count / total:.0%} of the reel doing "
+                "one thing on staggered delays. That is a slide build. One "
+                "element should carry the move and the rest should react to it "
+                "DIFFERENTLY: a rule wipes, a panel settles, a figure counts "
+                "up, a mark snaps in on the beat the headline lands")
+    return out
+
+
 def _drop_missing(text: str) -> str:
     """Remove what points at artwork that does not exist.
 
@@ -493,6 +568,7 @@ def inspect(spec: dict, at: float = 0.75) -> list[str]:
         faults.insert(0, f'the design uses "asset:{name}", which does not '
                           f'exist — the artwork available is: {have}')
     faults[:0] = brand_faults(spec)
+    faults[:0] = motion_faults(spec)
     return faults
 
 
@@ -843,6 +919,32 @@ def design_instructions(brand: dict | None = None, request: str = "",
         "· A change of direction needs a visible cause — an impact, a click, "
         "a bounce — or a deliberate chapter break. An uncaused reversal is "
         "just a wobble.\n\n"
+
+        # ── the four that separate a composition from a slide ────────────────
+        # Added after a reel that obeyed every law above and still looked like
+        # PowerPoint. The laws describe the SEAM; these describe what happens
+        # inside a scene, which is where the slide-ness actually lives. The
+        # first two are checked by motion_faults(), not merely requested.
+        "NEVER BUILD IT LIKE A SLIDE DECK — the four ways that happens:\n"
+        "· DO NOT ANIMATE THE SCENE ITSELF. `.entering` and `.leaving` must "
+        "not carry an animation that moves the frame: sliding the whole scene "
+        "in and out as one slab IS a slide. Animate the things inside it. The "
+        "scene is a stage, not a card. (This is checked and sent back.)\n"
+        "· ELEMENTS MUST NOT ALL DO THE SAME THING. Giving every element one "
+        "animation and staggering it with delays is a PowerPoint build. One "
+        "element carries the move and everything else REACTS to it, "
+        "differently: a rule wipes, a panel settles, a figure counts up, a "
+        "mark snaps in on the beat the headline lands. (Also checked.)\n"
+        "· ONE AXIS AT A TIME. If the film's current is sideways, elements "
+        "travel sideways. A frame sliding on X while its text rises on Y is "
+        "two unrelated motions happening at once, and reads as incoherent "
+        "rather than as continuous.\n"
+        "· KEEP WHAT RECURS. If the same object appears in consecutive scenes "
+        "— a panel in the same place, a card at the same size, a mark that "
+        "belongs to the brand — it is ONE object whose CONTENTS change. Let "
+        "it stay put and rewrite what is in it. Flying in a fresh copy of "
+        "something the viewer is already looking at is the single clearest "
+        "tell that the scenes were designed separately.\n\n"
 
         "WHAT THE RENDERER GUARANTEES, SO YOU DO NOT HAVE TO:\n"
         "the frame size, the seeking, the cuts' timing, and the encode. "
