@@ -155,6 +155,27 @@ def is_configured(cfg: dict) -> bool:
     return bool(ic.get("address") and ic.get("password") and ic.get("host"))
 
 
+#: The markers that mean "the server understood us and said no". Kept as one
+#: list because explain_error() and is_auth_failure() must never disagree —
+#: one decides what the user is told, the other decides whether we try again.
+_AUTH_MARKERS = ("authenticationfailed", "invalid credentials", "login failed")
+
+
+def is_auth_failure(error: str) -> bool:
+    """True when the server REJECTED the credentials, rather than not answering.
+
+    The distinction decides whether retrying is reasonable. A network failure
+    is worth retrying — that is what a polling timer is for. A rejected
+    password is not: Gmail and Microsoft 365 throttle and then lock an account
+    on repeated failed logins, so a timer that keeps presenting a password the
+    server has already refused ends with "Prism locked me out of my email",
+    which is both true and the worst kind of support call — it is the
+    customer's own business inbox and nothing on screen says why.
+    """
+    e = (error or "").lower()
+    return any(marker in e for marker in _AUTH_MARKERS)
+
+
 def explain_error(error: str, address: str = "") -> str:
     """Turn an imaplib failure into the sentence that unblocks the user.
 
@@ -164,7 +185,7 @@ def explain_error(error: str, address: str = "") -> str:
     """
     e = (error or "").lower()
     domain = address.rsplit("@", 1)[-1].lower() if "@" in address else ""
-    if "authenticationfailed" in e or "invalid credentials" in e or "login failed" in e:
+    if is_auth_failure(e):
         if domain in ("gmail.com", "googlemail.com"):
             return ("Google rejected the sign-in. Gmail needs a 16-character "
                     "APP PASSWORD (not your Google password), created at "

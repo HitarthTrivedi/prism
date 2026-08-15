@@ -313,7 +313,22 @@ AGENT_REGISTRY = {
         "template and loses the picture they asked for",
         "Freemium", "5–20s", 120,
         textarea_selector="#prompt-textarea",
-        response_selector="[data-message-author-role='assistant']",
+        # A CHAIN, not one selector. OpenAI rolls the conversation DOM out in
+        # buckets, so two customers on the same day can see different markup:
+        # the long-standing div[data-message-author-role] and a newer
+        # li[data-message-role] form. A single matcher means _capture() finds
+        # nothing, and because _looks_like_signin() gives up on bodies over
+        # 4000 chars, a real conversation page never reaches the marker check —
+        # so the customer is told they are signed out and sent round the login
+        # loop instead of being told the page changed. This was the narrowest
+        # matcher in the file, on the default tool: narrower than the generic
+        # fallback at DEFAULTS that an unconfigured agent gets. A selector list
+        # is an OR, so extra alternatives cannot break a bucket that still
+        # matches the old form.
+        response_selector=(
+            "[data-message-author-role='assistant'], "
+            "[data-message-role='assistant'], "
+            ".markdown.prose"),
         submit_selector="button[data-testid='send-button']",
         # A switch, not an instruction. Which way it falls is decided by the
         # user's own wording at run time — see wants_canva() and the resolver
@@ -337,7 +352,10 @@ AGENT_REGISTRY = {
         "advanced coding, complex documentation, UI artifacts & long-form reasoning",
         "Freemium", "10–30s", 300,
         textarea_selector="div[contenteditable='true']",
-        response_selector=".font-claude-message, .prose, [data-is-streaming='false']",
+        # .font-claude-response is the newer class; the old one is kept ahead
+        # of it so nothing changes for a customer still served the old markup.
+        response_selector=(".font-claude-message, .font-claude-response, "
+                           ".prose, [data-is-streaming='false']"),
         submit_selector="button[aria-label='Send Message']",
     ),
     # LAZYCOOK runs its own Generate → Analyze → Optimize → Validate loop and
@@ -594,7 +612,10 @@ AGENT_REGISTRY = {
         # with extra load time since the design surface renders a canvas.
         page_wait=8,
         textarea_selector="div[contenteditable='true']",
-        response_selector=".font-claude-message, .prose, [data-is-streaming='false']",
+        # .font-claude-response is the newer class; the old one is kept ahead
+        # of it so nothing changes for a customer still served the old markup.
+        response_selector=(".font-claude-message, .font-claude-response, "
+                           ".prose, [data-is-streaming='false']"),
         submit_selector="button[aria-label='Send Message']",
     ),
 }
