@@ -104,6 +104,52 @@ html, body {{
 .scene.leaving {{ opacity: calc(1 - var(--x, 0)); }}
 .scene.entering {{ opacity: var(--e, 1); }}
 img, svg, video {{ max-width: 100%; }}
+
+/* ── the cut library ──────────────────────────────────────────────────────
+   Named transitions the design can ask for by class instead of inventing
+   motion from nothing. Adapted from HyperFrames' transition catalogue
+   (github.com/heygen-com/hyperframes, Apache 2.0) — see NOTICE.
+
+   Translated, not copied. Theirs are GSAP timelines; these are pure
+   functions of --x and --e, which the seeker sets afresh on every frame.
+   That difference matters more than it looks: an @keyframes transition is
+   placed on the SCENE's clock and has to have its duration matched to the
+   cut by hand, while these are correct at any frame by construction and
+   cannot drift out of the cut window.
+
+   --x runs 0->1 as a scene leaves, --e runs 0->1 as one arrives. The eased
+   forms below are smoothstep (3t^2 - 2t^3) — close enough to power3.inOut
+   for a half-second cut, and expressible in plain calc. */
+.scene.leaving  {{ --ease: calc(var(--x, 0) * var(--x, 0) * (3 - 2 * var(--x, 0))); }}
+.scene.entering {{ --ease: calc(var(--e, 1) * var(--e, 1) * (3 - 2 * var(--e, 1))); }}
+
+/* PUSH — the workhorse. Both scenes travel together, the new one pushing the
+   old off. Neutral forward progress; use it for ordinary beats. */
+.cut-push.leaving  {{ transform: translateX(calc(var(--ease) * -100%)); opacity: 1; }}
+.cut-push.entering {{ transform: translateX(calc((1 - var(--ease)) * 100%)); opacity: 1; }}
+.cut-push-up.leaving  {{ transform: translateY(calc(var(--ease) * -100%)); opacity: 1; }}
+.cut-push-up.entering {{ transform: translateY(calc((1 - var(--ease)) * 100%)); opacity: 1; }}
+
+/* SQUEEZE — the old frame compresses to its left edge, the new one opens out
+   from its right. Mechanical and precise; suits industrial subjects. */
+.cut-squeeze.leaving {{
+  transform: scaleX(calc(1 - var(--ease))); transform-origin: left center;
+  opacity: 1; }}
+.cut-squeeze.entering {{
+  transform: scaleX(var(--ease)); transform-origin: right center;
+  opacity: 1; }}
+
+/* ZOOM THROUGH — the old frame rushes past the camera and blurs out while the
+   new one rises from behind it. Reserve it: it reads as pushing deeper into
+   the same thought, so spending it on an ordinary beat wastes it. */
+.cut-zoom.leaving {{
+  transform: scale(calc(1 + var(--ease) * 1.5));
+  filter: blur(calc(var(--ease) * 8px));
+  opacity: calc(1 - var(--ease)); }}
+.cut-zoom.entering {{
+  transform: scale(calc(0.5 + var(--ease) * 0.5));
+  filter: blur(calc((1 - var(--ease)) * 8px));
+  opacity: var(--ease); }}
 """
 
 # Pausing every animation and setting its time by hand is the whole trick.
@@ -140,9 +186,31 @@ window.__seek = function (t) {
     }
 
     // Deterministic frames: pause every animation and place it by hand.
+    //
+    // Two clocks, and conflating them was a real bug. Everything INSIDE the
+    // scene runs on scene time — an element that rises 200ms in should be
+    // 200ms into its rise. But an animation on the scene ELEMENT while it is
+    // leaving is the transition, and the transition starts at outFrom, not at
+    // the top of the scene.
+    //
+    // Given scene time, a 900ms exit animation seeked to 2500ms is long past
+    // its end, so `.leaving{animation:slideOut 900ms both}` snapped straight
+    // to its final frame the instant the class landed. Every exit in every
+    // reel was a hard pop, and it looked like a design problem.
+    let own = [];
+    try { own = el.getAnimations(); } catch (e) {}
+    const ownSet = new Set(own);
+    const leaving = s.outFrom != null && local >= s.outFrom;
+    for (const a of own) {
+      try {
+        a.pause();
+        a.currentTime = leaving ? Math.max(0, local - s.outFrom) : local;
+      } catch (e) {}
+    }
     let anims = [];
     try { anims = el.getAnimations({ subtree: true }); } catch (e) {}
     for (const a of anims) {
+      if (ownSet.has(a)) continue;      // already placed on the other clock
       try { a.pause(); a.currentTime = local; } catch (e) {}
     }
   }
@@ -227,15 +295,29 @@ def _plan(spec: dict, fps: int):
     cut_ms = float(spec.get("design", {}).get("cut_ms", 420))
     cut_ms = max(0.0, min(1200.0, cut_ms))
 
+    # Each gap is one number shared by the two scenes either side of it: the
+    # scene before uses it to leave, the scene after uses it to arrive.
+    gaps = [min(cut_ms, durs[i] / 3, durs[i + 1] / 3) if i + 1 < len(durs)
+            else 0.0
+            for i in range(len(durs))]
+
     out, t = [], 0.0
     for i, dur in enumerate(durs):
-        overlap = 0.0
-        if i + 1 < len(durs):
-            overlap = min(cut_ms, durs[i] / 3, durs[i + 1] / 3)
+        # inLen was `gaps[i]` — the overlap with the NEXT scene rather than
+        # the previous one. Off by one, and mostly invisible because every gap
+        # is usually the same cut_ms. Not invisible on the LAST scene, which
+        # has no next and so got inLen 0: the final scene of every reel
+        # arrived with no transition at all. That scene is the endcard, so the
+        # brand moment was the one hard pop in the film.
+        #
+        # The first scene keeps a window of its own. There is nothing behind
+        # it to hand over from, but opening on a move rather than a jump is
+        # worth having and costs nothing.
+        entering = cut_ms if i == 0 else gaps[i - 1]
         out.append({"start": round(t), "dur": round(dur),
-                    "outFrom": round(dur - overlap) if overlap else None,
-                    "outLen": round(overlap), "inLen": round(overlap)})
-        t += dur - overlap
+                    "outFrom": round(dur - gaps[i]) if gaps[i] else None,
+                    "outLen": round(gaps[i]), "inLen": round(entering)})
+        t += dur - gaps[i]
     total_ms = out[-1]["start"] + out[-1]["dur"]
     return out, int(round(total_ms / 1000.0 * fps))
 
@@ -359,7 +441,13 @@ def build_html(spec: dict, fps: int = DEFAULT_FPS) -> str:
     body = []
     for i, sc in enumerate(scenes):
         html = _drop_missing(_place_assets(sc.get("html") or "", uris))
-        body.append(f'<section class="scene" id="s{i}" '
+        # A scene may name the cut it wants ("push", "squeeze", "zoom") and
+        # get it from the library in the harness. Sanitised rather than
+        # trusted: this string becomes a class attribute, and a design is
+        # written by a language model reading a customer's own words.
+        cut = re.sub(r"[^a-z0-9-]", "", str(sc.get("cut", "")).strip().lower())
+        klass = f"scene cut-{cut}" if cut else "scene"
+        body.append(f'<section class="{klass}" id="s{i}" '
                     f'data-type="{sc.get("type", "")}">{html}</section>')
 
     return (
@@ -790,7 +878,24 @@ def design_instructions(brand: dict | None = None, request: str = "",
         "if you prefer to drive something off progress directly.\n"
         "· Cuts: the outgoing scene has class `leaving` with `--x` 0→1, the "
         "incoming one `entering` with `--e` 0→1. Style them however you like "
-        "— a fade is only the default.\n\n"
+        "— a fade is only the default.\n"
+
+        # A menu, deliberately, rather than another rule. An earlier attempt at
+        # improving these reels added six prohibitions to this prompt and made
+        # the output blander: told what NOT to do, a model plays safe, and safe
+        # is what generic is made of. Named moves that already work leave it
+        # free to choose instead of invent.
+        "· Or name one and skip the work: put `\"cut\": \"push\"` on a scene "
+        "and it gets that transition, already built and already correct at "
+        "every frame. `push` — both frames travel together, the new one "
+        "pushing the old out; the neutral choice for an ordinary beat. "
+        "`push-up` — the same thing vertically. `squeeze` — the old frame "
+        "compresses to its left edge while the new one opens out from its "
+        "right; mechanical and precise, good for industrial subjects. `zoom` "
+        "— the old frame rushes past the camera and blurs while the new one "
+        "rises from behind it; it reads as pushing deeper into the same "
+        "thought, so spend it once, not on every cut. Mix them with your own "
+        "`.leaving` / `.entering` rules freely.\n\n"
         "WHAT THE RENDERER GUARANTEES, SO YOU DO NOT HAVE TO:\n"
         "the frame size, the seeking, the cuts' timing, and the encode. "
         "`.scene` is already a full-frame absolutely-positioned layer, and "
