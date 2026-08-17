@@ -1242,9 +1242,15 @@ def cmd_reel(cfg, arg: str, attachments: list):
 def _reel_designed(cfg, request, brand, images, writer_agent, director_agent):
     """/reel through Prism Studio: script, then art direction, then filmed.
 
-    Two passes on purpose. One reply asked for both the words and the look
+    The split is on purpose. One reply asked for both the words and the look
     reliably produces a design that describes itself — "clean data card",
     "logo reveal" — rather than one that exists.
+
+    Art direction is itself a conversation, not a reply: the look and a
+    storyboard, then one turn per scene. Asked for every scene at once, a
+    model spread a few thousand characters across all of them and each came
+    out at about 278 characters, which is a headline and a subhead — a slide,
+    with nothing in it to move. See reel_web.design_instructions().
     """
     import json as _json
     import time
