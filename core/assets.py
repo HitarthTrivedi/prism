@@ -214,7 +214,16 @@ def collect(images: list, out_dir: str | None = None,
     # a sprout is sparser than a wordmark, and picking by sparsity put the
     # sprout in the logo slot. The imagery stage is told to produce the mark
     # first, and the page is harvested in order, so order is the answer.
-    if logo is None:
+    #
+    # BUT only when the client attached nothing. That is the exact condition
+    # under which the imagery stage was asked for a mark at all — handed the
+    # client's own artwork it is told "NO logo, make three SUBJECT images
+    # instead", and then its first image is a photograph of the trade.
+    # Claiming the logo slot for it put a product shot on the endcard where
+    # the company's name belongs, because the design stage is told to put the
+    # logo somewhere a logo goes. Screenshots of the customer's own software
+    # are the case that exposed it: attached artwork, none of it a mark.
+    if logo is None and not any(not a["made"] for a in rest):
         made = [a for a in rest if a["made"]]
         if made:
             logo = made[0]
