@@ -1201,10 +1201,15 @@ def cmd_reel(cfg, arg: str, attachments: list):
             ui.info(f"Its tab: {links['script']}")
         return
 
-    try:
-        spec = reel.parse_spec(texts[0])
-    except reel.ReelError as e:
-        ui.err(str(e))
+    # Newest capture that parses, not the first on the page — the tab is
+    # reused between runs and also holds the prompt Prism typed, which carries
+    # an example spec inside it.
+    spec, why = reel.first_spec(texts)
+    if spec is None:
+        ui.err(str(why or "The agent returned nothing to render."))
+        kept = reel.keep_unparsed(texts)
+        if kept:
+            ui.info(f"What came back was saved to {kept}")
         if links.get("script"):
             ui.info(f"Read what it said: {links['script']}")
         return

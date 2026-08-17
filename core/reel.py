@@ -25,6 +25,7 @@ AI stage only decides what goes in it (the scene spec).
 from __future__ import annotations
 import math
 import os
+import re
 import shutil
 import subprocess
 
@@ -1469,6 +1470,77 @@ def _loosen(block: str) -> str:
     return _escape_control_chars(block)
 
 
+# A URL the chat UI turned into a clickable link, sitting inside the JSON.
+#
+# Anchored on the link TEXT starting with http, because that is the only thing
+# these UIs linkify, and a looser pattern would eat ordinary brackets.
+_LINKIFIED = re.compile(r"\[(https?://[^\]]*)\]\([^)\s]*\)")
+
+
+def _unlink_markdown(block: str) -> str:
+    """Undo the chat window's auto-linking of URLs inside a reply.
+
+    Diagnosed on the web renderer and then found to apply here too, which is
+    obvious in hindsight: it is the same chat window. A URL that runs up
+    against the text after it has the anchor swallow that text as its link
+    label, and the swallowed text brings its own unbalanced braces — so the
+    balanced-brace scan below counts braces that were never really there and
+    cuts the spec in the wrong place.
+
+    Taking the link TEXT rather than the href is the repair. The text is what
+    the model typed; the href is the browser's percent-encoded guess at where
+    it might point, with `)` rewritten as %29.
+    """
+    return _LINKIFIED.sub(lambda m: m.group(1), block)
+
+
+def keep_unparsed(sources, what: str = "scene-spec") -> str:
+    """Write a reply that would not parse to disk, and say where.
+
+    This is the one place where the evidence is both essential and momentary.
+    The text lives in a local variable, the run moves on, and all anybody is
+    left with is "No JSON scene spec found in the agent's reply" against a
+    chat tab that visibly contains JSON. Those two facts cannot both be
+    investigated from a log line, and a reel that failed this way could not be
+    diagnosed at all — the reply was already gone by the time anyone asked.
+
+    Best-effort in every direction: a full disk must not turn a bad spec into
+    a crash.
+    """
+    try:
+        import time as _time
+        from . import config
+        folder = os.path.join(os.path.dirname(config.CONFIG_PATH), "logs")
+        os.makedirs(folder, exist_ok=True)
+        path = os.path.join(
+            folder, f"{what}-that-would-not-parse-{int(_time.time())}.txt")
+        with open(path, "w", encoding="utf-8") as f:
+            for i, text in enumerate(sources, 1):
+                f.write(f"───── candidate {i} "
+                        f"({len(str(text))} chars) ─────\n{text}\n\n")
+        return path
+    except Exception:                                    # noqa: BLE001
+        return ""
+
+
+def first_spec(texts) -> tuple[dict | None, Exception | None]:
+    """The newest capture that is actually a spec, and why none was.
+
+    NEWEST first, not first-on-the-page and not longest. Chat DOM order is
+    chronological, so the reply is at the end — and the page also holds the
+    prompt Prism typed, which carries an EXAMPLE spec inside it. Taking
+    texts[0] read whatever happened to be at the top of the tab; taking the
+    longest could pick Prism's own echo of its instructions.
+    """
+    why = None
+    for text in reversed([t for t in (texts or []) if str(t).strip()]):
+        try:
+            return parse_spec(text), None
+        except Exception as e:                           # noqa: BLE001
+            why = why or e
+    return None, why
+
+
 def parse_spec(text: str) -> dict:
     """Pull the scene spec out of an agent's reply.
 
@@ -1481,6 +1553,10 @@ def parse_spec(text: str) -> dict:
     if not text or not text.strip():
         raise ReelError("The agent returned nothing to render.")
 
+    # Before the brace scan, not as a repair candidate after it: a swallowed
+    # link label carries its own unbalanced braces, so _blocks would already
+    # be counting the wrong ones.
+    text = _unlink_markdown(text)
     spec, bad_json = None, None
     for block in _blocks(text, "{", "}"):
         for candidate in (block, _loosen(block)):

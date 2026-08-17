@@ -1730,19 +1730,19 @@ def _run_local(kind: str, prior_text, attachments, cfg: dict, stage: str,
         return "", str(e)
 
     sources = [prior_text] if isinstance(prior_text, str) else list(prior_text)
-    spec, why = None, None
-    for text in sources:
-        try:
-            spec = reel.parse_spec(text)
-            break
-        except Exception as e:
-            why = why or e
+    spec, why = reel.first_spec(sources)
     if spec is None:
         # The writing stage produced prose instead of a scene spec. Say so
-        # plainly — the fix is a routing one, not something to paper over.
+        # plainly — the fix is a routing one, not something to paper over —
+        # and KEEP what came back, because it is the only thing that can
+        # explain the failure and it disappears with this local variable.
+        kept = reel.keep_unparsed(sources)
+        if kept:
+            ui.warn(f"   saved what came back to {kept}")
         return "", (f"{why or 'Nothing was written for the renderer.'} The "
                     "stage before this one has to return the JSON scene spec "
-                    "for the renderer to draw.")
+                    "for the renderer to draw."
+                    + (f" What came back was saved to {kept}" if kept else ""))
 
     # Brand colour comes from the client's own artwork when they attached
     # any — measured, not described.
