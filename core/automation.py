@@ -2517,7 +2517,9 @@ def run(routing: dict, cfg: dict, attachments=None, on_event=None,
                             assets_table=design_assets,
                             check=_web.inspect,
                             log=lambda m: ui.info(f"   {m}"),
-                            should_stop=should_stop)
+                            should_stop=should_stop,
+                            on_scene=lambda i, n: emit(
+                                "reel_scene", {"index": i, "total": n}))
                     except Exception as e:
                         # Turn one did not parse, so there is no design to
                         # build scenes against. Whatever came back is kept as

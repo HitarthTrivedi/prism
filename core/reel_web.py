@@ -1289,6 +1289,12 @@ def parse_scene(text: str) -> dict | None:
     return None
 
 
+def _first_asset(assets: str) -> str:
+    """The first name on the asset list, for the usage example."""
+    m = re.search(r"asset:([A-Za-z0-9_-]+)", assets or "")
+    return m.group(1) if m else "logo"
+
+
 def scene_instructions(idx: int, total: int, line: dict, script_scene: dict,
                        assets: str = "") -> str:
     """The prompt for ONE scene, sent in the same tab as the design.
@@ -1345,7 +1351,29 @@ def scene_instructions(idx: int, total: int, line: dict, script_scene: dict,
         "field or gradient behind, a rule or a frame, the type broken into "
         "parts that can arrive at different moments, a number that counts or "
         "a bar that draws, something small that keeps time in a corner. One "
-        "headline fading up is a slide; this is a film.\n\n"
+        "headline fading up is a slide; this is a film.\n"
+
+        # What actually separated a scene that worked from one that did not,
+        # on a reel this stage was rebuilt for. Both had the same words. The
+        # good one put the CUSTOMER'S OWN MATERIAL on screen — the real
+        # filenames out of a Gerber folder, the seven real drill sizes, one
+        # dot for each of 238 holes — and the flat one described the same
+        # facts in a sentence. Deliberately given across trades so it does
+        # not read as advice about circuit boards.
+        "BUILD IT FROM THE CUSTOMER'S OWN MATERIAL, not from adjectives. The "
+        "things they actually handle are the strongest thing you can put on "
+        "screen: the part numbers, the file names, the sizes, the grades, "
+        "the machines, the varieties, the test names, the routes. A "
+        "fabricator's real drill sizes set as chips; a seed company's actual "
+        "variety names in a column; a workshop's tolerances beside the "
+        "part they hold. If the scene names a count, consider DRAWING that "
+        "many things rather than only printing the number.\n"
+
+        "LAYERS ARE HOW A FLAT FRAME STOPS LOOKING FLAT. Something behind "
+        "(a field, a gradient, a rule system, a drawn line), the thing the "
+        "scene is about in the middle, and something small and quiet at an "
+        "edge that grounds it — a source, a unit, a count, a label. Three "
+        "depths, not one centred block.\n\n"
 
         "MOTION — the part that makes it move rather than appear:\n"
         "· Ordinary CSS @keyframes. The renderer pauses the page and sets "
@@ -1371,9 +1399,33 @@ def scene_instructions(idx: int, total: int, line: dict, script_scene: dict,
         "here can collide with another scene, and you never need a prefix.\n\n"
 
         + (("ARTWORK YOU MAY USE — this is the complete list:\n" + assets +
-            "\n\nBy name, like a URL: <img src='asset:logo' alt=''> or "
-            "background-image: url(asset:logo). No other name exists; "
-            "anything else leaves a hole in the frame.\n\n") if assets else "")
+            # Named off the real list rather than hard-coded. The example used
+            # to read `asset:logo` whether or not a logo existed, which is a
+            # picture of a mark being dangled in front of a reel that has
+            # none — and an unresolved reference leaves a hole in the frame.
+            f"\n\nBy name, like a URL: <img src='asset:{_first_asset(assets)}' "
+            f"alt=''> or background-image: url(asset:{_first_asset(assets)}). "
+            "No other name exists; anything else leaves a hole in the "
+            "frame.\n"
+
+            # This guidance used to live in the art-direction prompt, which
+            # wrote every scene. Now that prompt writes none of them, and the
+            # instruction went with it — so a reel with a perfectly good logo
+            # attached ended on a mark drawn out of CSS boxes. The last scene
+            # is where it matters, and the last scene is the one that knows
+            # it is last.
+            + ("· THE CLIENT'S OWN MARK IS AVAILABLE as `asset:logo`. This is "
+               "the last scene, which is where a logo belongs — place it, "
+               "sized in CSS rather than trusting its pixel dimensions, and "
+               "give it room. Never redraw or approximate a mark you have "
+               "been given, and never build one out of CSS shapes when the "
+               "real one is right here.\n"
+               if "asset:logo" in assets and idx == total - 1 else
+               "· `asset:logo` is the client's own mark. Use it where a mark "
+               "belongs rather than as decoration; the last scene will place "
+               "it, so it does not need to appear in every scene.\n"
+               if "asset:logo" in assets else "")
+            + "\n") if assets else "")
 
         + "REPLY WITH ONLY THIS JSON OBJECT, in a ```json fenced code block, "
         "nothing before or after it:\n"
@@ -1451,7 +1503,7 @@ def fallback_scene(script_scene: dict, seconds: float = 4.0) -> dict:
 
 def build_spec(first_reply: str, ask, script: str = "", assets: str = "",
                assets_table: dict | None = None, check=None, log=None,
-               should_stop=None) -> dict:
+               should_stop=None, on_scene=None) -> dict:
     """Run the rest of the design conversation and return the finished spec.
 
     `ask(prompt, expect) -> str` sends a follow-up in the tab the design stage
@@ -1459,6 +1511,11 @@ def build_spec(first_reply: str, ask, script: str = "", assets: str = "",
     lays a scene out in the browser and reports what is illegible. Both are
     injected rather than imported so this whole flow can be exercised without
     a browser, which is the only reason it has tests worth having.
+
+    `on_scene(index, total)` fires before each scene is asked for. It exists
+    for the desktop window: this loop takes minutes, and a dialog that says
+    "writing the words…" for six of them is indistinguishable from one that
+    has hung.
 
     Nothing here raises once turn one has parsed. A scene that will not come
     back is replaced by a plain one built from the script: a reel with one
@@ -1485,6 +1542,11 @@ def build_spec(first_reply: str, ask, script: str = "", assets: str = "",
         if should_stop and should_stop():
             say("stopped — keeping the scenes written so far")
             break
+        if on_scene:
+            try:
+                on_scene(i, total)
+            except Exception:                        # noqa: BLE001
+                pass          # a progress listener must never fail the run
         prompt = scene_instructions(i, total, board[i], lines[i], assets)
         scene = parse_scene(ask(prompt, SCENE_EXPECT) or "")
         if scene is None:
