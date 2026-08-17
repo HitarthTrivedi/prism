@@ -1274,6 +1274,11 @@ def _reel_designed(cfg, request, brand, images, writer_agent, director_agent):
              [reel_web.design_instructions(brand, request,
                                            _assets.manifest(table))]),
         ],
+        # The design stage is a conversation, not one reply: this turn is the
+        # look and the storyboard, and the scenes are asked for one at a time
+        # in the same tab. A routed run works this out from the renderer stage
+        # in its plan; this one has no renderer stage, so it says so.
+        reel_design_stage="design",
         query=f"design a reel — {request}")
 
     texts = [t for t in (responses.get("design") or []) if t.strip()]

@@ -363,7 +363,8 @@ def missing_assets(spec: dict) -> list[str]:
     have = set((spec.get("_assets") or {}).keys())
     used = set()
     blobs = [(spec.get("design") or {}).get("css", "")]
-    blobs += [sc.get("html", "") for sc in (spec.get("scenes") or [])]
+    for sc in (spec.get("scenes") or []):
+        blobs += [sc.get("html", ""), sc.get("css", "")]
     for blob in blobs:
         used.update(re.findall(r"asset:([A-Za-z0-9_-]+)", str(blob)))
     return sorted(used - have)
@@ -383,7 +384,8 @@ def brand_faults(spec: dict) -> list[str]:
     if not accent:
         return []
     blob = (str((spec.get("design") or {}).get("css", "")) + " " +
-            " ".join(str(sc.get("html", "")) for sc in spec.get("scenes") or [])
+            " ".join(str(sc.get("html", "")) + " " + str(sc.get("css", ""))
+                     for sc in spec.get("scenes") or [])
             ).lower()
     if "var(--accent" in blob.replace(" ", "") or accent in blob:
         return []
@@ -415,6 +417,182 @@ def _drop_missing(text: str) -> str:
     return text
 
 
+# ── per-scene CSS, confined to its own scene ────────────────────────────────
+# Scenes are written one at a time now, in separate replies, and a model
+# naming things in reply four cannot see what it called them in reply two.
+# Left alone they collide: everybody writes `.title`, everybody writes
+# `@keyframes rise`, and whichever scene loses the cascade silently inherits
+# another scene's type size or another scene's motion.
+#
+# Scoping is what makes writing a scene at a time safe, and it is worth more
+# than the collisions it prevents: because the scene cannot reach outside
+# itself, the prompt does not have to ask it to be careful. It may call
+# things whatever it likes.
+
+_SCENE_CLASSES = {"scene", "leaving", "entering", "on"}
+
+
+def _top_level_rules(css: str) -> list[tuple[str, str | None]]:
+    """Split CSS into (prelude, body) pairs at brace depth zero.
+
+    Written by hand rather than with a regex because the things that break a
+    regex here are all common in real stylesheets: braces inside strings,
+    `url(data:…{…})`, comments, and nested at-rules. `body` is None for a
+    statement at-rule such as `@import …;`.
+    """
+    rules: list[tuple[str, str | None]] = []
+    buf: list[str] = []
+    prelude = ""
+    depth = 0
+    quote = None
+    i, n = 0, len(css)
+    while i < n:
+        c = css[i]
+        if quote:
+            buf.append(c)
+            if c == "\\" and i + 1 < n:
+                buf.append(css[i + 1])
+                i += 2
+                continue
+            if c == quote:
+                quote = None
+            i += 1
+            continue
+        if c in "\"'":
+            quote = c
+            buf.append(c)
+            i += 1
+            continue
+        if c == "/" and i + 1 < n and css[i + 1] == "*":
+            end = css.find("*/", i + 2)
+            i = n if end < 0 else end + 2
+            continue
+        # An unquoted url() is a single token to CSS, and its contents are not
+        # CSS at all — a stray brace or semicolon in a path or a data: URI
+        # would otherwise be read as structure and cut the stylesheet in half.
+        if (c == "u" or c == "U") and css[i:i + 4].lower() == "url(":
+            end = css.find(")", i + 4)
+            end = n if end < 0 else end + 1
+            buf.append(css[i:end])
+            i = end
+            continue
+        if c == "{":
+            if depth == 0:
+                prelude = "".join(buf).strip()
+                buf = []
+            else:
+                buf.append(c)
+            depth += 1
+        elif c == "}":
+            depth -= 1
+            if depth <= 0:
+                depth = 0
+                rules.append((prelude, "".join(buf)))
+                buf, prelude = [], ""
+            else:
+                buf.append(c)
+        elif c == ";" and depth == 0:
+            stmt = "".join(buf).strip()
+            if stmt:
+                rules.append((stmt + ";", None))
+            buf = []
+        else:
+            buf.append(c)
+        i += 1
+    tail = "".join(buf).strip()
+    if tail:
+        # An unclosed rule. Kept rather than dropped: half a scene styled is
+        # better than none, and the browser is forgiving about the missing
+        # brace in a way this parser does not need to be.
+        rules.append((prelude, tail) if prelude else (tail, None))
+    return rules
+
+
+def _scope_selector(sel: str, root: str) -> str:
+    """One selector, confined to the scene element `root` (`#s3`).
+
+    Three cases, and the middle one is the one that matters. `.leaving` means
+    the scene element ITSELF, not something inside it — a scene writing its
+    own custom cut is styling its own layer. Prefixing it as a descendant
+    would silently disable every hand-written transition.
+    """
+    sel = sel.strip()
+    if not sel:
+        return ""
+    if sel.startswith(root):
+        return sel                            # already ours
+    if sel in ("html", "body", ":root", "*, *::before, *::after"):
+        return root
+    head = re.split(r"[\s>+~]", sel, maxsplit=1)[0]
+    classes = re.findall(r"\.([\w-]+)", head)
+    if classes and set(classes) <= _SCENE_CLASSES and \
+            re.fullmatch(r"(?:\.[\w-]+)+", head):
+        return root + sel                     # #s3.leaving, #s3.scene.entering
+    return f"{root} {sel}"
+
+
+_AT_NESTED = ("@media", "@supports", "@container", "@layer", "@scope")
+_AT_VERBATIM = ("@font-face", "@import", "@charset", "@namespace",
+                "@property", "@counter-style", "@font-feature-values")
+
+
+def _scope(css: str, root: str, prefix: str, renames: dict) -> str:
+    out = []
+    for prelude, body in _top_level_rules(css):
+        if body is None:
+            out.append(prelude)               # @import …; — global by nature
+            continue
+        low = prelude.lower()
+        if low.startswith("@keyframes") or low.startswith("@-webkit-keyframes"):
+            m = re.match(r"(@(?:-webkit-)?keyframes\s+)(.+)$", prelude,
+                         flags=re.I | re.S)
+            if m:
+                name = m.group(2).strip().strip("'\"")
+                renames[name] = f"{prefix}{name}"
+                prelude = m.group(1) + renames[name]
+            out.append(f"{prelude}{{{body}}}")
+            continue
+        if low.startswith(_AT_VERBATIM):
+            out.append(f"{prelude}{{{body}}}")
+            continue
+        if low.startswith(_AT_NESTED):
+            out.append(f"{prelude}{{{_scope(body, root, prefix, renames)}}}")
+            continue
+        if prelude.startswith("@"):
+            out.append(f"{prelude}{{{body}}}")
+            continue
+        scoped = ", ".join(p for p in
+                           (_scope_selector(s, root) for s in prelude.split(","))
+                           if p)
+        out.append(f"{scoped or root}{{{body}}}")
+    return "".join(out)
+
+
+def scope_css(css: str, idx: int) -> str:
+    """A scene's own stylesheet, unable to reach any other scene."""
+    css = str(css or "").strip()
+    if not css:
+        return ""
+    root, prefix = f"#s{idx}", f"s{idx}-"
+    renames: dict[str, str] = {}
+    out = _scope(css, root, prefix, renames)
+    if renames:
+        # The keyframes were renamed, so every reference to them has to move
+        # too. Restricted to animation declarations on purpose: a scene may
+        # well have a CLASS called `rise` alongside its `@keyframes rise`, and
+        # renaming that would break the markup.
+        def fix(m):
+            value = m.group(2)
+            for old, new in renames.items():
+                value = re.sub(rf"(?<![\w-]){re.escape(old)}(?![\w-])", new,
+                               value)
+            return m.group(1) + value
+
+        out = re.sub(r"(animation(?:-name)?\s*:\s*)([^;{}]*)", fix, out,
+                     flags=re.I)
+    return out
+
+
 def build_html(spec: dict, fps: int = DEFAULT_FPS) -> str:
     """The whole reel as one self-contained page.
 
@@ -438,7 +616,7 @@ def build_html(spec: dict, fps: int = DEFAULT_FPS) -> str:
                          if isinstance(v, str) and v.strip())
 
     uris = _asset_uris(spec.get("_assets") or {})
-    body = []
+    body, scene_css = [], []
     for i, sc in enumerate(scenes):
         html = _drop_missing(_place_assets(sc.get("html") or "", uris))
         # A scene may name the cut it wants ("push", "squeeze", "zoom") and
@@ -449,6 +627,12 @@ def build_html(spec: dict, fps: int = DEFAULT_FPS) -> str:
         klass = f"scene cut-{cut}" if cut else "scene"
         body.append(f'<section class="{klass}" id="s{i}" '
                     f'data-type="{sc.get("type", "")}">{html}</section>')
+        # A scene written on its own turn brings its own stylesheet. Scoped
+        # here rather than trusted to be careful — see scope_css.
+        own = scope_css(_drop_missing(_place_assets(sc.get("css") or "", uris)),
+                        i)
+        if own:
+            scene_css.append(own)
 
     return (
         "<!doctype html><html><head><meta charset='utf-8'>"
@@ -456,6 +640,7 @@ def build_html(spec: dict, fps: int = DEFAULT_FPS) -> str:
         f"<style>{_HARNESS_CSS}</style>"
         f"<style>:root{{{root_vars}}}</style>"
         f"<style>{_drop_missing(_place_assets(design.get('css', ''), uris))}</style>"
+        f"<style>{''.join(scene_css)}</style>"
         "</head><body>"
         f"<div id='stage'>{''.join(body)}</div>"
         f"<script>{_HARNESS_JS % json.dumps(plan)}</script>"
@@ -787,8 +972,21 @@ def imagery_instructions(request: str, has_own_artwork: bool = False,
 
 def design_instructions(brand: dict | None = None, request: str = "",
                         assets: str = "") -> str:
-    """The art-direction pass. This is the one that makes two clients' reels
-    different films rather than one template with new words."""
+    """The art-direction pass — the LOOK and the STORYBOARD, no scenes yet.
+
+    This used to ask for the whole reel in one reply, and that single fact was
+    what made every reel look like a slide deck. Measured against a reel built
+    by hand with a coding agent: 20,300 characters of markup and motion per
+    scene there, 278 characters per scene here. Not a taste gap — a budget
+    one. A model asked for seven scenes in one JSON object spreads a few
+    thousand characters across all of them, and 278 characters holds a
+    headline and a subhead. That IS a slide; there is nothing in it to move.
+
+    So the design stage is a conversation now. This prompt is turn one: the
+    palette, the type, the shared stylesheet, and a storyboard giving every
+    scene a distinct job. Each scene is then written on its own turn by
+    scene_instructions(), with the whole reply to spend on one scene.
+    """
     # None means "not known yet" — the research stage supplies it at run time
     # and the token is substituted the moment before this prompt is typed.
     swatch = BRAND_TOKEN if brand is None else brand_block(brand)
@@ -844,25 +1042,35 @@ def design_instructions(brand: dict | None = None, request: str = "",
            "deliberate. Do not reference asset:anything; every such reference "
            "resolves to nothing and leaves a hole. Do not draw a logo out of "
            "CSS boxes either — set the company name in good type instead.\n\n")
-        + '{\n'
+        + "THIS REPLY IS THE LOOK AND THE PLAN. NOT THE SCENES.\n"
+        "You will be asked for the scenes one at a time, straight after this, "
+        "in this same conversation — a whole reply for each one. So do not "
+        "write any scene markup now, and do not compress the plan: the "
+        "storyboard below is the brief you will be building from, and it is "
+        "worth being specific in.\n\n"
+        '{\n'
         '  "design": {\n'
         '    "name": "one line describing the look you chose",\n'
         '    "google_fonts": ["Fraunces:opsz,wght@9..144,700", "Inter:wght@400;600"],\n'
         '    "cut_ms": 500,\n'
-        '    "css": "…every rule the reel needs…"\n'
+        '    "css": "…the SHARED stylesheet: :root variables, the background, '
+        'the type scale, and any helper class more than one scene will use…"\n'
         '  },\n'
-        '  "scenes": [\n'
-        '    {"type": "hook", "seconds": 4.5,\n'
-        '     "html": "<div class=\'grow\'><div class=\'kicker\'>FY 2026</div>'
-        '<h1>A season that held its promise.</h1></div>"}\n'
+        '  "storyboard": [\n'
+        '    {"scene": 1, "job": "what this scene is FOR in the argument",\n'
+        '     "look": "what is on screen and how it is composed — where the '
+        'eye lands, what is big, what is edge-to-edge, what is only a rule or '
+        'a field of colour",\n'
+        '     "motion": "what moves, in what order, from where — and what '
+        'stays still so the moving thing reads",\n'
+        '     "cut": "push"}\n'
         '  ]\n'
         '}\n\n'
-        "HTML ATTRIBUTES MUST USE SINGLE QUOTES — <div class='content'> and "
-        "<img src='asset:logo' alt=''>. Your markup lives inside a JSON "
-        "string, so a double quote in it has to be escaped, and an unescaped "
-        "one makes the whole reply unparseable. Single quotes are valid HTML "
-        "and sidestep the problem entirely. This is the single most common "
-        "way this stage fails.\n\n"
+        "ONE STORYBOARD ROW PER SCENE IN THE SCRIPT, in the script's order. "
+        "Give each one a DIFFERENT job and a different composition. Seven "
+        "scenes that are all a centred headline over the same background is "
+        "the failure this stage exists to prevent — vary the scale, the "
+        "alignment, the crop, what the frame is mostly made of.\n\n"
         "HOW MOTION WORKS — read this, it is the one unusual part:\n"
         "· Write ordinary CSS @keyframes and animation declarations. The "
         "renderer PAUSES the page and sets each animation's time by hand for "
@@ -915,6 +1123,370 @@ def design_instructions(brand: dict | None = None, request: str = "",
     )
 
 
+# ── the scene-at-a-time conversation ────────────────────────────────────────
+# Turn one is design_instructions() above. Everything from here down runs the
+# rest of it: one turn per scene, each with the whole reply to spend, each
+# laid out and checked before the next is asked for.
+
+SCENE_EXPECT = '"html"'
+
+
+def _json_objects(text: str):
+    """Every balanced {...} in a reply, parsed if it parses.
+
+    The same repairs parse_spec makes, in the same order: chat windows linkify
+    URLs inside CSS, and art directors write HTML attributes in double quotes
+    inside a JSON string. Both lose an otherwise perfect reply over
+    punctuation.
+    """
+    from . import reel as _pillow
+    if not text or not text.strip():
+        return
+    for block in _pillow._blocks(_unlink_markdown(text), "{", "}"):
+        for candidate in (block, _fix_markup_quotes(block),
+                          _pillow._loosen(block),
+                          _fix_markup_quotes(_pillow._loosen(block))):
+            try:
+                got = json.loads(candidate)
+            except Exception:
+                continue
+            if isinstance(got, dict):
+                yield got
+                break
+
+
+def read_script(script_text: str) -> list[dict]:
+    """The script stage's scenes, as written. Empty if it cannot be read.
+
+    Used for two things: how many scenes there are, and what words each one
+    must carry. The script is final by the time this runs, so a scene prompt
+    quotes it rather than inviting the art director to reinterpret it.
+    """
+    for got in _json_objects(script_text or ""):
+        scenes = got.get("scenes")
+        if isinstance(scenes, list) and scenes:
+            return [s for s in scenes if isinstance(s, dict)]
+    return []
+
+
+def parse_design(text: str) -> tuple[dict, list[dict]]:
+    """Turn one's reply: (design, storyboard).
+
+    A reply that carries scenes as well is not an error — some models answer
+    the whole brief however it is put. The scenes are ignored, but their
+    presence is a perfectly good storyboard if none was written.
+    """
+    design, board = {}, []
+    for got in _json_objects(text):
+        d = got.get("design")
+        if isinstance(d, dict) and not design:
+            design = d
+        rows = got.get("storyboard")
+        if isinstance(rows, list) and not board:
+            board = [r for r in rows if isinstance(r, dict)]
+        if not board and isinstance(got.get("scenes"), list):
+            board = [{"job": "", "look": "", "motion": "",
+                      "cut": str(s.get("cut", ""))}
+                     for s in got["scenes"] if isinstance(s, dict)]
+        if design and board:
+            break
+    if not design:
+        raise ReelError("The art-direction stage returned no design.")
+    design.setdefault("css", "")
+    return design, board
+
+
+def parse_scene(text: str) -> dict | None:
+    """One scene's reply. None if there is no markup in it."""
+    for got in _json_objects(text):
+        # A model sometimes wraps the scene in the shape it was shown first.
+        if isinstance(got.get("scenes"), list) and got["scenes"]:
+            inner = got["scenes"][0]
+            if isinstance(inner, dict) and str(inner.get("html", "")).strip():
+                got = inner
+        if not str(got.get("html", "")).strip():
+            continue
+        out = {"html": str(got["html"])}
+        if str(got.get("css", "")).strip():
+            out["css"] = str(got["css"])
+        for key in ("cut", "type"):
+            if str(got.get(key, "")).strip():
+                out[key] = str(got[key]).strip()
+        try:
+            out["seconds"] = float(got["seconds"])
+        except (KeyError, TypeError, ValueError):
+            pass
+        return out
+    return None
+
+
+def scene_instructions(idx: int, total: int, line: dict, script_scene: dict,
+                       assets: str = "") -> str:
+    """The prompt for ONE scene, sent in the same tab as the design.
+
+    Short on purpose. The palette, the type scale and the storyboard are all
+    further up this same conversation — repeating them would spend the budget
+    this whole change exists to create.
+    """
+    line = line or {}
+    script_scene = script_scene or {}
+    words = []
+    for key, label in (("kicker", "KICKER"), ("headline", "HEADLINE"),
+                       ("support", "SUPPORT"), ("note", "NOTE"),
+                       ("contact", "CONTACT")):
+        val = str(script_scene.get(key, "")).strip()
+        if val:
+            words.append(f"  {label}: {val}")
+    for key in ("items", "points"):
+        val = script_scene.get(key)
+        if isinstance(val, list) and val:
+            words.append(f"  {key.upper()}: {json.dumps(val, ensure_ascii=False)}")
+
+    try:
+        seconds = float(script_scene.get("seconds", 4.5))
+    except (TypeError, ValueError):
+        seconds = 4.5
+    cut = str(line.get("cut", "")).strip()
+    role = str(script_scene.get("role", "")).strip()
+
+    plan = []
+    for key in ("job", "look", "motion"):
+        val = str(line.get(key, "")).strip()
+        if val:
+            plan.append(f"  {key.upper()}: {val}")
+
+    return (
+        f"SCENE {idx + 1} OF {total}"
+        + (f" — role: {role}" if role else "") + f", {seconds:g} seconds.\n\n"
+        + ("YOUR OWN STORYBOARD FOR IT:\n" + "\n".join(plan) + "\n\n"
+           if plan else "")
+        + ("THE WORDS, EXACTLY AS THE SCRIPT WROTE THEM — every one of these "
+           "has to appear on screen:\n" + "\n".join(words) + "\n\n"
+           if words else
+           "This scene carries no text of its own — it is made of shape, "
+           "colour and movement.\n\n")
+
+        # This paragraph is the entire point of the rewrite. The old stage
+        # asked for every scene in one reply and got 278 characters each,
+        # which is a headline and a subhead — a slide, with nothing in it to
+        # move. A number is given because "be more detailed" is not
+        # actionable and "12 to 30 elements" is.
+        + "THIS WHOLE REPLY IS ONE SCENE. Spend it. A designed scene at this "
+        "size is 12 to 30 elements and four or more separate movements — a "
+        "field or gradient behind, a rule or a frame, the type broken into "
+        "parts that can arrive at different moments, a number that counts or "
+        "a bar that draws, something small that keeps time in a corner. One "
+        "headline fading up is a slide; this is a film.\n\n"
+
+        "MOTION — the part that makes it move rather than appear:\n"
+        "· Ordinary CSS @keyframes. The renderer pauses the page and sets "
+        "every animation's time by hand, so it films identically every run.\n"
+        "· Every animation MUST end in `both` "
+        "(`animation: rise 800ms cubic-bezier(.16,1,.3,1) both`) or it snaps "
+        "when the frame is seeked.\n"
+        "· Time restarts at 0 for this scene. Stagger arrivals with "
+        "`animation-delay` — things that arrive together read as one block, "
+        "things that arrive 80-120ms apart read as choreography.\n"
+        "· Something should still be moving when the scene hands over. A "
+        "scene that finishes its motion and then sits there for two seconds "
+        "is where 'slide deck' comes from — let a slow drift, a scale, or a "
+        "counter run the full "
+        f"{seconds:g} seconds.\n"
+        "· No transitions, no JavaScript, no :hover — none of it is filmed.\n"
+        "· `--p` (0→1 through the scene) and `--ms` are set on the scene "
+        "element every frame if you would rather drive something directly.\n\n"
+
+        "YOUR CSS IS SCOPED TO THIS SCENE AUTOMATICALLY — every selector and "
+        "every @keyframes name is rewritten to this scene alone before the "
+        "page is built. Name things whatever is clearest; nothing you write "
+        "here can collide with another scene, and you never need a prefix.\n\n"
+
+        + (("ARTWORK YOU MAY USE — this is the complete list:\n" + assets +
+            "\n\nBy name, like a URL: <img src='asset:logo' alt=''> or "
+            "background-image: url(asset:logo). No other name exists; "
+            "anything else leaves a hole in the frame.\n\n") if assets else "")
+
+        + "REPLY WITH ONLY THIS JSON OBJECT, in a ```json fenced code block, "
+        "nothing before or after it:\n"
+        '{\n'
+        f'  "seconds": {seconds:g},\n'
+        + (f'  "cut": "{cut}",\n' if cut else
+           '  "cut": "push",\n')
+        + '  "css": "…this scene\'s rules and @keyframes…",\n'
+        '  "html": "<div class=\'…\'>…</div>"\n'
+        '}\n\n'
+        "HTML ATTRIBUTES MUST USE SINGLE QUOTES — <div class='wrap'>. Your "
+        "markup lives inside a JSON string, and an unescaped double quote "
+        "makes the whole reply unparseable. This is the most common way this "
+        "step fails.\n\n"
+        "Keep every box inside 1080x1920 with 90px/130px margins, and no "
+        f"text under {T_LABEL}px — headlines want {T_HEADLINE}px+, supporting "
+        f"text {T_SUPPORT}px+. The page is measured before it is filmed."
+    )
+
+
+def fallback_scene(script_scene: dict, seconds: float = 4.0) -> dict:
+    """A plain, legible scene, built from the script when a turn comes back
+    with nothing usable.
+
+    Deliberately modest — it exists so that one failed turn costs one dull
+    scene rather than the whole reel. It uses the design's own variables, so
+    it is at least in the right colours, and its @keyframes are scoped like
+    any other scene's and cannot collide.
+    """
+    from html import escape
+    ss = script_scene or {}
+    try:
+        seconds = float(ss.get("seconds", seconds))
+    except (TypeError, ValueError):
+        pass
+    bits = []
+    for key, cls in (("kicker", "fb-k"), ("headline", "fb-h"),
+                     ("support", "fb-s"), ("note", "fb-n")):
+        val = str(ss.get(key, "")).strip()
+        if val:
+            bits.append(f"<div class='{cls}'>{escape(val)}</div>")
+    items = ss.get("items")
+    if isinstance(items, list) and items:
+        rows = "".join(f"<li>{escape(str(i))}</li>" for i in items[:4])
+        bits.append(f"<ul class='fb-l'>{rows}</ul>")
+    if not bits:
+        bits.append("<div class='fb-h'>&nbsp;</div>")
+    return {
+        "seconds": max(1.5, seconds),
+        "cut": "push",
+        "css": (
+            ".fb{position:absolute;inset:var(--safe-y) var(--safe-x);"
+            "display:flex;flex-direction:column;justify-content:center;"
+            "gap:30px}"
+            ".fb>*{animation:fb-in 800ms cubic-bezier(.16,1,.3,1) both}"
+            ".fb>*:nth-child(2){animation-delay:110ms}"
+            ".fb>*:nth-child(3){animation-delay:220ms}"
+            ".fb>*:nth-child(4){animation-delay:330ms}"
+            ".fb-k{font-size:38px;letter-spacing:.18em;text-transform:uppercase;"
+            "color:var(--accent,#7a7a7a)}"
+            ".fb-h{font-size:96px;line-height:1.05;font-weight:800;"
+            "color:var(--ink,#111)}"
+            ".fb-s{font-size:50px;line-height:1.3;color:var(--ink,#333);"
+            "opacity:.82}"
+            ".fb-n{font-size:34px;color:var(--ink,#555);opacity:.6}"
+            ".fb-l{list-style:none;padding:0;margin:0;font-size:56px;"
+            "line-height:1.5;color:var(--ink,#111)}"
+            "@keyframes fb-in{from{opacity:0;transform:translateY(44px)}"
+            "to{opacity:1;transform:none}}"
+        ),
+        "type": str(ss.get("role", "")),
+        "html": f"<div class='fb'>{''.join(bits)}</div>",
+    }
+
+
+def build_spec(first_reply: str, ask, script: str = "", assets: str = "",
+               assets_table: dict | None = None, check=None, log=None,
+               should_stop=None) -> dict:
+    """Run the rest of the design conversation and return the finished spec.
+
+    `ask(prompt, expect) -> str` sends a follow-up in the tab the design stage
+    is already sitting in and returns the reply. `check(spec) -> list[str]`
+    lays a scene out in the browser and reports what is illegible. Both are
+    injected rather than imported so this whole flow can be exercised without
+    a browser, which is the only reason it has tests worth having.
+
+    Nothing here raises once turn one has parsed. A scene that will not come
+    back is replaced by a plain one built from the script: a reel with one
+    dull scene ships, and a reel with a hole in it does not.
+    """
+    def say(msg):
+        if log:
+            log(msg)
+
+    design, board = parse_design(first_reply)
+    lines = read_script(script)
+    total = len(lines) or len(board)
+    if not total:
+        raise ReelError("Neither the script nor the storyboard names any "
+                        "scenes — there is nothing to build.")
+    if len(board) < total:
+        board = board + [{}] * (total - len(board))
+    if len(lines) < total:
+        lines = lines + [{}] * (total - len(lines))
+
+    say(f"storyboard: {total} scene(s) — writing them one at a time")
+    scenes: list[dict] = []
+    for i in range(total):
+        if should_stop and should_stop():
+            say("stopped — keeping the scenes written so far")
+            break
+        prompt = scene_instructions(i, total, board[i], lines[i], assets)
+        scene = parse_scene(ask(prompt, SCENE_EXPECT) or "")
+        if scene is None:
+            # One retry, and a blunter ask. Almost always prose where JSON was
+            # wanted, which a second, shorter prompt reliably fixes.
+            scene = parse_scene(ask(
+                f"Send scene {i + 1} again as JSON only — first character "
+                '\'{\', last \'}\', keys "seconds", "cut", "css", "html", '
+                "wrapped in a ```json fenced block. Nothing before or after.",
+                SCENE_EXPECT) or "")
+        if scene is None:
+            say(f"scene {i + 1} never came back as JSON — using a plain one")
+            scenes.append(fallback_scene(lines[i]))
+            continue
+
+        scene.setdefault("seconds", lines[i].get("seconds", 4.5))
+        if not scene.get("cut") and board[i].get("cut"):
+            scene["cut"] = str(board[i]["cut"])
+        scene.setdefault("type", str(lines[i].get("role", "")))
+
+        # Laid out NOW, while the conversation is still on this scene. The
+        # old stage checked all seven at the end, so a fault came back as
+        # "scene 3's headline is off the frame" against a reply the model had
+        # long since moved on from. Asked here, it is simply "this one".
+        if check:
+            try:
+                faults = check({"design": design, "scenes": [scene],
+                                "_assets": assets_table or {}})
+            except Exception as e:
+                say(f"couldn't lay scene {i + 1} out ({e})")
+                faults = []
+            if faults:
+                say(f"scene {i + 1} has {len(faults)} layout problem(s) — "
+                    "sending them back")
+                fixed = parse_scene(ask(
+                    f"Scene {i + 1} was laid out at 1080x1920 and these are "
+                    "wrong:\n\n"
+                    + "\n".join(f"{n}. {x}" for n, x in enumerate(faults[:8], 1))
+                    + "\n\nSend the corrected scene: ONLY the JSON object, "
+                      "same keys, in a ```json fenced block.",
+                    SCENE_EXPECT) or "")
+                if fixed:
+                    fixed.setdefault("seconds", scene["seconds"])
+                    fixed.setdefault("cut", scene.get("cut", ""))
+                    fixed.setdefault("type", scene.get("type", ""))
+                    try:
+                        left = check({"design": design, "scenes": [fixed],
+                                      "_assets": assets_table or {}})
+                    except Exception:
+                        left = []
+                    # Kept only if genuinely cleaner. A "fix" that trades four
+                    # faults for five is not a fix, and the first attempt at
+                    # least had the composition the storyboard asked for.
+                    if len(left) < len(faults):
+                        scene = fixed
+                        say(f"   fixed — {len(faults)} down to {len(left)}")
+                    else:
+                        say("   the correction was no better — keeping the "
+                            "first")
+        scenes.append(scene)
+        say(f"scene {i + 1}/{total} written — {len(scene.get('html', ''))} "
+            f"chars of markup, {len(scene.get('css', ''))} of CSS")
+
+    if not scenes:
+        raise ReelError("No scenes were written.")
+    spec = {"design": design, "scenes": scenes}
+    if assets_table:
+        spec["_assets"] = assets_table
+    return spec
+
+
 def script_drift(spec: dict, script_text: str) -> list[str]:
     """Lines the script wrote that the design did not carry over.
 
@@ -923,25 +1495,14 @@ def script_drift(spec: dict, script_text: str) -> list[str]:
     legitimately splits a headline across elements, so this is a flag for a
     person, not a rule for a machine.
     """
-    import json as _json
     import re
     if not script_text.strip():
         return []
     try:
-        from . import reel as _pillow
-        blocks = _pillow._blocks(script_text, "{", "}")
-        script = None
-        for b in blocks:
-            try:
-                got = _json.loads(b)
-            except Exception:
-                continue
-            if isinstance(got, dict) and got.get("scenes"):
-                script = got
-                break
-        if not script:
-            return []
+        script = {"scenes": read_script(script_text)}
     except Exception:
+        return []
+    if not script["scenes"]:
         return []
 
     page = " ".join(str(sc.get("html", "")) for sc in (spec.get("scenes") or []))

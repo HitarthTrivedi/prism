@@ -1569,13 +1569,18 @@ def _make_editable(driver, agent_cfg: dict, stage: str, query: str,
     return responses + [text]
 
 
-def _reask(driver, agent_cfg: dict, prompt: str, expect: str = "") -> list[str]:
+def _reask(driver, agent_cfg: dict, prompt: str, expect: str = "",
+           wait: int = 0) -> list[str]:
     """Send one follow-up in the SAME tab and re-scrape.
 
     Used when a stage answered but not in the shape the next stage needs. The
     chat still holds everything it just wrote, so a one-line correction is far
     cheaper — and far likelier to work — than failing the run or starting the
-    stage over."""
+    stage over.
+
+    `wait` overrides the agent's own budget. A one-line correction settles in
+    seconds; a whole reel scene is several thousand characters of markup and
+    CSS and does not, and the default 60s cut them off mid-stylesheet."""
     from selenium.webdriver.common.by import By
     from selenium.webdriver.common.keys import Keys
     from selenium.webdriver.support.ui import WebDriverWait
@@ -1598,7 +1603,8 @@ def _reask(driver, agent_cfg: dict, prompt: str, expect: str = "") -> list[str]:
                 pass
         if not clicked:
             box.send_keys(Keys.ENTER)
-        _smart_wait(driver, agent_cfg, agent_cfg.get("wait_time", 60), expect=expect)
+        _smart_wait(driver, agent_cfg,
+                    wait or agent_cfg.get("wait_time", 60), expect=expect)
         return _capture(driver, agent_cfg)
     except Exception as e:
         ui.err(f"   follow-up failed: {e}")
@@ -1772,7 +1778,8 @@ def _run_local(kind: str, prior_text, attachments, cfg: dict, stage: str,
 def run(routing: dict, cfg: dict, attachments=None, on_event=None,
         query: str = "", chatgpt_analysis: bool = True,
         custom_stages: list[tuple[str, str, list[str]]] | None = None,
-        should_stop=None, failover: bool = True):
+        should_stop=None, failover: bool = True,
+        reel_design_stage: str = ""):
     """Execute the pipeline. Returns (responses, links).
 
     attachments: list of records from core.files.attach() — uploaded to each
@@ -1790,6 +1797,12 @@ def run(routing: dict, cfg: dict, attachments=None, on_event=None,
                  again). Stage labels only need to be unique WITHIN this list
                  (they key the responses/links dicts and drive the next-stage
                  handoff); they don't need to match a real category name.
+    reel_design_stage: the label of a stage that art-directs a reel, when the
+                 caller built the stages itself. That stage's reply is turn one
+                 of a conversation — the look and the storyboard — and the
+                 scenes are then asked for one at a time in the same tab. A
+                 routed run finds this stage on its own; only a caller passing
+                 `custom_stages` has to name it.
     on_event(kind, payload) is an optional callback for live UI updates.
     should_stop() is an optional predicate polled between and during stages.
                  A routed run drives a browser for minutes at a time, so a
@@ -1981,6 +1994,15 @@ def run(routing: dict, cfg: dict, attachments=None, on_event=None,
             machine_stages[design_feeder] = json_only
             ui.info(f"🎬  {stages[studio_at][1]} films the page — {an} writes "
                     f"the script, {director} art-directs it")
+
+    # A caller that built its own stages (the CLI's /studio) still gets the
+    # scene-at-a-time conversation — it names the art-direction stage rather
+    # than having it inferred from a renderer that isn't in its list.
+    if design_feeder is None and reel_design_stage:
+        design_feeder = next((i for i, (st, _, _) in enumerate(stages)
+                              if st == reel_design_stage), None)
+        if design_feeder:
+            script_stage = script_stage or stages[design_feeder - 1][0]
 
     local_reel_at = next((i for i, (_, an, _) in enumerate(stages)
                           if (A.resolve_agent("", an) or {}).get("local") == "reel"),
@@ -2263,6 +2285,7 @@ def run(routing: dict, cfg: dict, attachments=None, on_event=None,
                     # yet — and the SCRIPT, because the relay only forwards
                     # the stage immediately before, which is now the image
                     # maker's chatter rather than the words of the reel.
+                    from . import reel_web as _web
                     made = {f["path"] for f in pipeline_files}
                     table = {}
                     try:
@@ -2436,64 +2459,67 @@ def run(routing: dict, cfg: dict, attachments=None, on_event=None,
                 else:
                     stage_responses = texts[-len(questions):]
 
-                # The art director's page is laid out in a real browser before
-                # anything is filmed. Text off the frame or too small to read
-                # is not a matter of opinion, so it goes straight back with
-                # the offending strings quoted.
+                # THE REST OF THE DESIGN CONVERSATION.
+                #
+                # What came back is turn one — the look and the storyboard.
+                # Every scene is now asked for on its own turn, in this same
+                # tab, and laid out in a real browser before the next one is
+                # asked for. Two things this buys, and the first is the whole
+                # reason for it:
+                #
+                #   · budget. Asked for a whole reel in one reply, a model
+                #     spread a few thousand characters over seven scenes and
+                #     each one came out at ~278 characters, which is a
+                #     headline and a subhead. That is a slide, and no prompt
+                #     about motion can fix it because there is nothing in it
+                #     to move. A scene with a whole reply to itself gets 20x
+                #     the room.
+                #   · correction that lands. A fault used to come back as
+                #     "scene 3's headline is off the frame" against a reply
+                #     the model had long since moved past. Now it is simply
+                #     "this one", while the scene is still the subject.
                 if stage_idx == design_feeder and texts:
-                    from . import reel_web as _web
-                    for attempt in range(2):
-                        try:
-                            cand = _web.parse_spec(texts[-1])
-                            # The design is judged against the SAME artwork it
-                            # was offered. Without this the checker sees a spec
-                            # with no assets at all, calls every correct
-                            # reference a hole, and talks the art director out
-                            # of the one picture it had.
-                            cand["_assets"] = design_assets
-                        except Exception as e:
-                            faults = [str(e)]
-                            cand = None
-                        else:
-                            stage_responses = [texts[-1]]
-                            try:
-                                faults = _web.inspect(cand)
-                            except Exception as e:
-                                ui.warn(f"   couldn't lay the design out ({e})")
-                                faults = []
-                        if not faults:
-                            if cand is not None:
-                                ui.ok("   design lays out clean at 1080x1920")
-                                # Told not to change a word is not the same as
-                                # prevented. Flagged, not blocked: a design may
-                                # legitimately split a headline across elements.
-                                script_txt = "\n".join(
-                                    all_responses.get(script_stage) or [])
-                                for line in _web.script_drift(cand, script_txt)[:4]:
-                                    ui.warn(f'   the design dropped or reworded: '
-                                            f'"{line}"')
-                            break
-                        if attempt:
-                            ui.err("   still not laying out — filming it "
-                                   "anyway, check the result")
-                            break
-                        ui.warn(f"the design has {len(faults)} layout "
-                                "problem(s) — sending them back")
-                        for f in faults[:5]:
-                            ui.info(f"   · {f}")
-                        again = _reask(
-                            driver, agent_cfg,
-                            "Your design was laid out at 1080x1920 and these "
-                            "are wrong:\n\n"
-                            + "\n".join(f"{n}. {x}" for n, x
-                                        in enumerate(faults[:10], 1))
-                            + "\n\nFix the CSS and send the corrected design: "
-                              "ONLY the JSON object, first character '{', "
-                              "last '}'.",
-                            expect='"css"')
-                        if not again:
-                            break
-                        texts = again
+                    # A scene is several thousand characters of markup and
+                    # CSS. The agent's ordinary budget is sized for an answer,
+                    # not for that, and cutting one off mid-stylesheet costs
+                    # the whole scene.
+                    scene_wait = max(int(agent_cfg.get("wait_time", 60)), 180)
+
+                    def _ask(prompt, expect=_web.SCENE_EXPECT):
+                        got = _reask(driver, agent_cfg, prompt, expect=expect,
+                                     wait=scene_wait)
+                        return got[-1] if got else ""
+
+                    script_txt = "\n".join(all_responses.get(script_stage) or [])
+                    try:
+                        spec = _web.build_spec(
+                            texts[-1], _ask,
+                            script=script_txt, assets=listing,
+                            assets_table=design_assets,
+                            check=_web.inspect,
+                            log=lambda m: ui.info(f"   {m}"),
+                            should_stop=should_stop)
+                    except Exception as e:
+                        # Turn one did not parse, so there is no design to
+                        # build scenes against. Whatever came back is kept as
+                        # it is: it may still be a whole single-reply design
+                        # from a model that answered the old way, and the
+                        # renderer will happily parse that.
+                        ui.err(f"   {e}")
+                        kept = _keep_failed_spec(texts)
+                        if kept:
+                            ui.info(f"   what came back was saved to {kept}")
+                    else:
+                        import json as _json
+                        ui.ok(f"   {len(spec['scenes'])} scene(s) written and "
+                              "laid out clean at 1080x1920")
+                        # Told not to change a word is not the same as
+                        # prevented. Flagged, not blocked: a design may
+                        # legitimately split a headline across elements.
+                        for line in _web.script_drift(spec, script_txt)[:4]:
+                            ui.warn(f'   the design dropped or reworded: '
+                                    f'"{line}"')
+                        stage_responses = [_json.dumps(spec, ensure_ascii=False)]
 
                 # This stage feeds a renderer, so "it answered" isn't enough —
                 # it has to have answered in JSON. Prefer a capture that

@@ -362,7 +362,8 @@ for it, because it is a screen you leave open rather than a prompt you type.
 | File | Role |
 |---|---|
 | `core/boq.py` | Bill of quantities from a DXF drawing or a written spec. Counts and measures; never prices |
-| `core/reel.py` · `core/reel_web.py` | Short videos: Pillow draws the frames, FFmpeg encodes them |
+| `core/reel.py` | Short videos drawn in Pillow — one look, every client |
+| `core/reel_web.py` | Prism Studio: the frames are a real web page filmed in a paused Chromium. The design stage is a conversation — one turn for the look and a storyboard, then **one turn per scene**, each laid out and corrected before the next. `scope_css()` confines a scene's stylesheet to that scene so scenes written in separate replies cannot collide |
 | `core/ffmpeg.py` | Finds FFmpeg — `PRISM_FFMPEG`, then the copy bundled with Prism, then one downloaded earlier, then `PATH`. Can fetch it, verifying against the digest PyPI publishes for that exact wheel before unpacking |
 | `core/mailer.py` | SMTP sending, one message per recipient |
 | `core/assets.py` | brand assets for generated media |
