@@ -731,25 +731,52 @@ def scene_hub(d, b, s, f):
 
 
 def scene_endcard(d, b, s, f):
-    """Final frame: mark, name, tagline, one line of contact. Nothing else."""
+    """Final frame: mark, name, tagline, one line of contact. Nothing else.
+
+    Every position here used to be a hard-coded y, chosen for a two-line
+    tagline with a contact under it. Anything else sat wherever those numbers
+    left it, and even the case they were chosen for was not centred: measured
+    on a real reel the whole block ran y=441 to y=1270, leaving 441px above it
+    and 650px below. It read as bottom-heavy — a big dead zone under the
+    brand, on the one frame a viewer looks at longest.
+
+    The gaps between the parts are still fixed, because they are a designed
+    rhythm. What is computed is where the block as a whole starts, from what
+    is actually in it.
+    """
+    lines = s.get("tagline_lines", [])
+    # The mark's ink reaches ~30px above its origin (dot_max is a radius).
+    mark_top = 470 - 30
+    if s.get("contact"):
+        block_bottom = 1230 + 40
+    elif lines:
+        block_bottom = 1030 + max(0, len(lines) - 1) * 58 + 50
+    else:
+        block_bottom = 900 + 96
+    shift = int((H - (block_bottom - mark_top)) / 2 - mark_top)
+
     prog = ease(f / 32)
-    dotted_wave(d, b, W // 2 - 216, 470, rows=8, cols=13, cell=36, dot_max=17,
-                progress=prog)
+    dotted_wave(d, b, W // 2 - 216, 470 + shift, rows=8, cols=13, cell=36,
+                dot_max=17, progress=prog)
     a = fade_in(f, 22)
     if a > 0:
         dy = rise(f, 22)
-        d.text((W // 2, 900 + dy), s.get("name", ""), font=_font("bold", 96),
+        d.text((W // 2, 900 + shift + dy), s.get("name", ""),
+               font=_fit(d, s.get("name", ""), "bold", 96, W - SAFE_X * 2,
+                         T_SUPPORT),
                fill=blend(b.ink, b.bg, a), anchor="ma")
     a2 = fade_in(f, 38)
     if a2 > 0:
         dy = rise(f, 38)
-        for i, ln in enumerate(s.get("tagline_lines", [])):
-            d.text((W // 2, 1030 + i * 58 + dy), ln, font=_font("bold", 46),
+        for i, ln in enumerate(lines):
+            d.text((W // 2, 1030 + shift + i * 58 + dy), ln,
+                   font=_fit(d, ln, "bold", 46, W - SAFE_X * 2, T_LABEL),
                    fill=blend(b.accent, b.bg, a2), anchor="ma")
     a3 = fade_in(f, 56)
     if a3 > 0 and s.get("contact"):
-        d.text((W // 2, 1230 + rise(f, 56)), s["contact"],
-               font=_font("regular", T_LABEL + 2), fill=blend(b.grey, b.bg, a3), anchor="ma")
+        d.text((W // 2, 1230 + shift + rise(f, 56)), s["contact"],
+               font=_font("regular", T_LABEL + 2), fill=blend(b.grey, b.bg, a3),
+               anchor="ma")
 
 
 def _fit(d, s: str, weight: str, size: int, max_width: int, floor: int = 22):
@@ -787,6 +814,18 @@ def scene_trend(d, b, s, f):
     pts = _series(s)
     x0, x1 = SAFE_X + 30, W - SAFE_X - 30
     top, bottom = 720, 1240
+    if s.get("subheading"):
+        # Each point's value sits in a chip 70px ABOVE it, and the chip is
+        # filled with the background so a climbing series cannot be read
+        # through its own numbers. The highest point sits at `top` — so with
+        # the chart starting at 720 that chip lands at 598-658, straight
+        # through a subheading drawn at 610, and paints out however much of
+        # it the chip covers. On a real reel it rendered as
+        # "25 min s spent reading one folder": the chip had eaten "Minute".
+        #
+        # The chart moves rather than the subheading, because the subheading
+        # belongs with the heading above it and the chart has the room.
+        top = 800
 
     a = fade_in(f, 2)
     if a > 0 and heading:
