@@ -1137,6 +1137,34 @@ def spec_instructions() -> str:
         "  · four things converging on one offer         → hub\n"
         "  · the company introducing itself              → brand\n"
         "  · the last scene, always                      → endcard\n\n"
+
+        # A worked running order, because the list above was not enough on its
+        # own. Two real reels from this same prompt: the one that worked had
+        # ONE text scene out of seven, the one that failed had four out of six
+        # — and nothing else about them differed. `statement` is the easiest
+        # scene to write, so it wins by default unless something shows what
+        # winning looks like.
+        "THE SHAPE THAT WORKS — one real reel, seven scenes:\n"
+        "  1. statement  three one-word lines, then a tail that says what "
+        "they add up to\n"
+        "  2. brand      the company, its line, and the four things it is "
+        "made of\n"
+        "  3. pillar     the first capability, with its three pieces of kit\n"
+        "  4. pillar     the second\n"
+        "  5. pillar     the third\n"
+        "  6. hub        all four coming back together as one offer\n"
+        "  7. endcard    the name and where to find them\n"
+        "ONE scene of words, then six the renderer DRAWS. That ratio is the "
+        "whole difference between a reel and a post someone screenshotted.\n\n"
+
+        "SO: AT MOST TWO text-only scenes ('statement' and 'list') in the "
+        "whole reel, never two in a row, and at least two scenes built from "
+        "'figure', 'trend', 'pillar', 'hub' or 'brand'. This is checked "
+        "before anything is drawn and sent back if it is wrong. If a point "
+        "feels like it has to be a sentence, it is usually three pieces of "
+        "kit ('pillar'), one number ('figure'), or four things converging "
+        "('hub') — say it that way instead.\n\n"
+
         "PACING — a viewer reads three words in under two seconds:\n"
         "  statement 3–6s · figure 4–6.5s · trend 5–8s · list 4–7s\n"
         "  pillar 3–6s · hub 4–7s · brand 4–6s · endcard 3–5s\n"
@@ -1251,6 +1279,16 @@ SCENE_SECONDS = {
 }
 REEL_SECONDS = (18.0, 40.0)
 
+# Scenes that are words on a background, and scenes this renderer builds a
+# PICTURE for — an icon triad, a four-node hub, a bar chart, a stat card.
+#
+# The distinction is not stylistic. `statement` and `list` set type and stop;
+# everything in _DRAWN puts geometry on the screen that a viewer reads as
+# information rather than as reading. `endcard` is in neither on purpose: it
+# is the ending, and every reel has exactly one.
+_TEXT_ONLY = ("statement", "list")
+_DRAWN = ("figure", "trend", "pillar", "hub", "brand")
+
 # Words that describe a video instead of being one. Every one of these has
 # turned up in a real spec, drawn literally on screen: "Animated trend: …",
 # "clean data card", "logo reveal with gentle leaf-inspired motion".
@@ -1319,6 +1357,45 @@ def lint_spec(spec: dict) -> list[str]:
     if scenes and scenes[-1].get("type") != "endcard":
         out.append("The last scene should be an 'endcard' so the reel ends on "
                    "the company name, not mid-thought.")
+
+    # THE MIX, which is what separates a reel from a wall of text.
+    #
+    # Measured on two real reels drawn by this same renderer from this same
+    # prompt. The one the customer called the best they had: seven scenes,
+    # ONE of them text-only — statement, brand, pillar, pillar, pillar, hub,
+    # endcard. The one they called the worst: six scenes, FOUR of them
+    # text-only — statement, statement, list, statement, pillar, endcard.
+    #
+    # Nothing else differed. The prompt already says "pick by what you are
+    # saying, not by habit", and habit still won, because `statement` is the
+    # easiest scene to write and the renderer will accept any number of them.
+    # A model asked to describe a business writes prose unless something
+    # counts.
+    kinds = [sc.get("type", "") for sc in scenes]
+    talkers = [k for k in kinds if k in _TEXT_ONLY]
+    drawn = [k for k in kinds if k in _DRAWN]
+    if len(talkers) > 2:
+        out.append(
+            f"{len(talkers)} of the {len(scenes)} scenes are text-only "
+            f"({', '.join(talkers)}) — that is a wall of text, not a reel. "
+            "Keep at most two and turn the rest into scenes this renderer "
+            "DRAWS: 'figure' for a single number, 'trend' for numbers that "
+            "move, 'pillar' for three capabilities, 'hub' for four things "
+            "converging, 'brand' for what the company is made of.")
+    if scenes and len(drawn) < 2:
+        out.append(
+            "Only "
+            + (f"{len(drawn)} scene is" if len(drawn) == 1 else "no scenes are")
+            + " drawn as a diagram. A reel that is all words could have been "
+            "a post. Build at least two scenes from 'figure', 'trend', "
+            "'pillar', 'hub' or 'brand'.")
+    for i in range(1, len(kinds)):
+        if kinds[i] == kinds[i - 1] == "statement":
+            out.append(
+                f"Scenes {i} and {i + 1} are both 'statement' — two text "
+                "screens in a row read as one long screen. Put a drawn scene "
+                "between them, or merge them.")
+            break
 
     for i, sc in enumerate(scenes, 1):
         kind = sc.get("type", "")
