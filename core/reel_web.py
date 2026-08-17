@@ -913,8 +913,56 @@ def read_brand(texts) -> dict:
     return out
 
 
+PICTURE_LINE = re.compile(
+    r"^\s*PICTURE\s+([A-Za-z0-9_-]+)\s*:\s*(.+?)\s*$", re.M)
+
+
+def read_pictures(texts) -> dict[str, str]:
+    """What the imagery stage said about the pictures the CLIENT attached.
+
+    The customer types "make a reel, here are two screenshots" and nothing
+    else — which is the whole point of the product — so nobody ever tells the
+    art director that one of them is a home screen with an Add folder button
+    and the other is a plan with a tool beside every step. The design stage
+    then places them as decoration, because decoration is all it knows they
+    are.
+
+    The imagery stage is already ChatGPT, already in the pipeline whenever
+    artwork exists, and can see. Asking it while it is there costs nothing.
+    """
+    blob = "\n".join(t for t in (texts if isinstance(texts, (list, tuple))
+                                 else [texts]) if t)
+    out = {}
+    for name, said in PICTURE_LINE.findall(blob):
+        said = said.strip().strip("*").strip()
+        # Two ways this comes back empty and both must be caught. NONE is what
+        # the stage was TOLD to write when it cannot see a file; the example
+        # echoed back is what a model writes when it is padding. A wrong
+        # description is worse than none, because the art director will build
+        # a scene around it.
+        if not said or said.upper().startswith("NONE"):
+            continue
+        if said.lower().startswith(("what it shows", "what is in it", "<", "…",
+                                    "...")):
+            continue
+        out[name] = said[:400]
+    return out
+
+
+def describe_pictures(listing: str, notes: dict) -> str:
+    """Fold those descriptions into the asset list the design stage reads."""
+    if not notes or not listing.strip():
+        return listing
+    out = []
+    for line in listing.split("\n"):
+        m = re.match(r"\s*asset:([A-Za-z0-9_-]+)\b", line)
+        said = notes.get(m.group(1)) if m else None
+        out.append(f"{line}\n      ↳ {said}" if said else line)
+    return "\n".join(out)
+
+
 def imagery_instructions(request: str, has_own_artwork: bool = False,
-                         research: str = "") -> str:
+                         research: str = "", attached=()) -> str:
     """The stage that MAKES the pictures when the client supplied none.
 
     Most jobs arrive with nothing attached — a company name and a sentence.
@@ -967,6 +1015,27 @@ def imagery_instructions(request: str, has_own_artwork: bool = False,
         "saying what it is — nothing else. The images themselves are "
         "collected from this page automatically; do not describe how they "
         "should be used."
+
+        # Asked here because this stage can SEE and is already running. The
+        # customer's own words are usually "make a reel, here are two
+        # screenshots" — so without this nobody ever tells the art director
+        # what is in them, and it places them as decoration because
+        # decoration is all it knows they are.
+        + (("\n\nONE MORE THING, AND IT IS SEPARATE FROM THE IMAGES YOU JUST "
+            "MADE.\nThe files attached to this message are the CLIENT'S OWN "
+            "pictures. Look at each one and, after your lines above, add "
+            "exactly one line per attached file in this form, and nothing "
+            "after them:\n"
+            + "\n".join(f"PICTURE {n}: <what is in it, in a few words> — "
+                        f"<the ONE part of it worth cropping to and why>"
+                        for n in attached) +
+            "\n\nThey are in that order, top to bottom, as attached. Say what "
+            "is actually visible — a screen, a machine, a product, a "
+            "certificate — and name the single region that carries the point, "
+            "because the frame is tall and narrow and the whole picture will "
+            "not fit into it legibly. If a file is not a picture at all, or "
+            "you cannot see it, write NONE after its label rather than "
+            "guessing.") if attached else "")
     )
 
 

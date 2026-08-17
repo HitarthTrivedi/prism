@@ -273,7 +273,7 @@ def manifest(table: dict) -> str:
     """
     if not table:
         return NO_ARTWORK
-    lines = []
+    lines, wide = [], []
     for name, a in table.items():
         if a.get("made"):
             what = ("a mark generated for this reel" if a["kind"] == "logo"
@@ -283,4 +283,28 @@ def manifest(table: dict) -> str:
                     if a["kind"] == "logo" else "artwork the client supplied")
         cut = "transparent PNG" if a["alpha"] else "opaque, has its own background"
         lines.append(f'  asset:{name} — {a["w"]}x{a["h"]}, {cut} — {what}')
+        # A LANDSCAPE picture in a PORTRAIT frame. Made to be flagged because
+        # the customer types "make a reel, here are two screenshots" and
+        # nothing else — so the advice that would otherwise have to be in
+        # their prompt has to come from here instead.
+        if a["kind"] != "logo" and a["w"] > a["h"] * 1.2:
+            wide.append(f"asset:{name}")
+    if wide:
+        lines.append(
+            "\nTHESE ARE WIDER THAN THEY ARE TALL — " + ", ".join(wide) +
+            " — and the frame is 1080 wide by 1920 tall. Fitted whole into it "
+            "they end up a band across the middle a few hundred pixels high, "
+            "and any writing inside them becomes unreadable. That is the "
+            "commonest way an attached picture ruins a reel.\n"
+            "CROP INSTEAD OF SHRINKING. Pick the part of the picture that "
+            "carries the point — the one panel, the one row, the one control "
+            "— and show that part large enough to read, letting the rest fall "
+            "outside the frame. `object-fit: cover` with `object-position`, a "
+            "`clip-path`, or a wrapper with `overflow: hidden` and the image "
+            "scaled up inside it all do this. Filling the frame edge to edge "
+            "with a detail is a composition; a small rectangle floating in the "
+            "middle is not.\n"
+            "A picture may also be MOVED across the cut — held still and then "
+            "drifted, or a crop that opens outward — which is worth more than "
+            "showing all of it at once.")
     return "\n".join(lines)
