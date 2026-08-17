@@ -605,20 +605,38 @@ def scene_statement(d, b, s, f):
     """Big type, one idea per line, revealed line by line."""
     blueprint_grid(d, b, 0.5, offset=int(f * 0.4))
     lines = s.get("lines", [])
-    bf = _font("bold", 100)
     y = H // 2 - (len(lines) * 118 + 90) // 2
+    # Nothing here was measured against the frame, so anything longer than the
+    # examples ran off the right edge and was CLIPPED — silently, because
+    # Pillow draws past the canvas without complaining. A three-word line fits
+    # and a sentence does not, and the sentence is what a model writes.
+    #
+    # Two different repairs on purpose. A line is one idea and must stay on
+    # one line, so it SHRINKS to fit; the tail is a sentence, so it WRAPS,
+    # exactly as the same field already does in scene_list.
     for i, ln in enumerate(lines):
         a = fade_in(f, i * 12)
         if a <= 0:
             continue
-        d.text((SAFE_X, y + i * 118 + rise(f, i * 12)), ln, font=bf,
+        # Floor at the video minimum rather than at a comfortable headline
+        # size: a comfortable floor means the line stops shrinking and then
+        # runs off the frame. This is the second line of defence, not the
+        # first — lint_spec rejects a statement line over 24 characters and
+        # sends it back before anything is drawn, and 24 is well clear of the
+        # ~30 where the floor is reached. Past about forty characters even
+        # this cannot save it, which is precisely why the check upstream
+        # exists.
+        d.text((SAFE_X, y + i * 118 + rise(f, i * 12)), ln,
+               font=_fit(d, ln, "bold", 100, W - SAFE_X * 2, T_LABEL),
                fill=blend(b.ink, b.bg, a))
     tail = s.get("tail")
     if tail:
         a = fade_in(f, len(lines) * 12 + 10)
         if a > 0:
-            d.text((SAFE_X, y + len(lines) * 118 + 40 + rise(f, len(lines) * 12 + 10)),
-                   tail, font=_font("regular", T_SUPPORT), fill=blend(b.grey, b.bg, a))
+            text(d, (SAFE_X,
+                     y + len(lines) * 118 + 40 + rise(f, len(lines) * 12 + 10)),
+                 tail, _font("regular", T_SUPPORT), blend(b.grey, b.bg, a),
+                 max_width=W - SAFE_X * 2, line_gap=10)
 
 
 def scene_brand(d, b, s, f):
@@ -1138,32 +1156,49 @@ def spec_instructions() -> str:
         "  · the company introducing itself              → brand\n"
         "  · the last scene, always                      → endcard\n\n"
 
-        # A worked running order, because the list above was not enough on its
-        # own. Two real reels from this same prompt: the one that worked had
-        # ONE text scene out of seven, the one that failed had four out of six
-        # — and nothing else about them differed. `statement` is the easiest
-        # scene to write, so it wins by default unless something shows what
-        # winning looks like.
-        "THE SHAPE THAT WORKS — one real reel, seven scenes:\n"
-        "  1. statement  three one-word lines, then a tail that says what "
-        "they add up to\n"
-        "  2. brand      the company, its line, and the four things it is "
-        "made of\n"
-        "  3. pillar     the first capability, with its three pieces of kit\n"
-        "  4. pillar     the second\n"
-        "  5. pillar     the third\n"
-        "  6. hub        all four coming back together as one offer\n"
-        "  7. endcard    the name and where to find them\n"
-        "ONE scene of words, then six the renderer DRAWS. That ratio is the "
-        "whole difference between a reel and a post someone screenshotted.\n\n"
-
-        "SO: AT MOST TWO text-only scenes ('statement' and 'list') in the "
-        "whole reel, never two in a row, and at least two scenes built from "
+        # The RATIO, and deliberately not a running order.
+        #
+        # Two real reels from this same prompt: the one that worked had ONE
+        # text scene out of seven, the one that failed had four out of six.
+        # Nothing else about them differed, so the ratio is the lesson.
+        #
+        # A worked example WAS given here — the good reel's actual order,
+        # statement/brand/pillar/pillar/pillar/hub/endcard — and it was copied
+        # straight onto an unrelated business the same day, which is a worse
+        # failure than the one it fixed. One template for every client is what
+        # this whole renderer is trying not to be. So the constraint is stated
+        # as a count, and the shapes below are several, contradictory, and
+        # chosen by what the story is.
+        "HOW MUCH OF IT MAY BE WORDS:\n"
+        "At most TWO text-only scenes ('statement', 'list') in the whole "
+        "reel, never two in a row, and at least two scenes built from "
         "'figure', 'trend', 'pillar', 'hub' or 'brand'. This is checked "
-        "before anything is drawn and sent back if it is wrong. If a point "
-        "feels like it has to be a sentence, it is usually three pieces of "
-        "kit ('pillar'), one number ('figure'), or four things converging "
-        "('hub') — say it that way instead.\n\n"
+        "before anything is drawn and sent back if it is wrong. A reel that "
+        "is mostly sentences could have been a post — the renderer draws "
+        "diagrams, and that is the only reason to make a video of it.\n"
+        "If a point feels like it has to be a sentence, it is usually three "
+        "pieces of kit ('pillar'), one number ('figure'), four things "
+        "converging ('hub'), or a number that moved ('trend'). Say it that "
+        "way instead.\n\n"
+
+        "THE RUNNING ORDER IS YOURS, AND IT SHOULD NOT LOOK LIKE ANYONE "
+        "ELSE'S. Build it from what this business actually has to say. Some "
+        "shapes that fit different stories:\n"
+        "  · a firm with three divisions  — statement, brand, pillar, "
+        "pillar, pillar, hub, endcard\n"
+        "  · a year of results            — figure, trend, statement, "
+        "figure, endcard\n"
+        "  · one product, done properly   — statement, figure, pillar, "
+        "figure, brand, endcard\n"
+        "  · a supplier list or a network — brand, list, hub, figure, "
+        "endcard\n"
+        "  · something measured           — figure, pillar, figure, trend, "
+        "endcard\n"
+        "These are examples of DIFFERENT, not a menu to pick from. A "
+        "machining shop and a pathology lab should not come out as the same "
+        "seven scenes with the words changed. Repeat a scene type when the "
+        "story genuinely repeats — three divisions really is three pillars — "
+        "and not otherwise.\n\n"
 
         "PACING — a viewer reads three words in under two seconds:\n"
         "  statement 3–6s · figure 4–6.5s · trend 5–8s · list 4–7s\n"
@@ -1438,6 +1473,20 @@ def lint_spec(spec: dict) -> list[str]:
                        "— keep it under 90.")
         if kind == "statement" and len(sc.get("lines") or []) > 3:
             out.append(f"{where}: more than 3 lines. Split it into two scenes.")
+        if kind == "statement":
+            # A statement line is set at 100px bold. Around 24 characters is
+            # what that size holds across a 1080 frame; past it the line
+            # shrinks, and a "headline" small enough to fit forty characters
+            # is not a headline any more. The good reel's lines were single
+            # words — "Servers." "Networks." "Security."
+            for ln in (sc.get("lines") or []):
+                if len(str(ln)) > 24:
+                    out.append(
+                        f'{where}: the line "{str(ln)[:30]}…" is '
+                        f"{len(str(ln))} characters. A statement line is set "
+                        "huge, so keep each one under 24 — one or two words. "
+                        "Put the sentence in 'tail', which is smaller and "
+                        "wraps.")
         if kind == "pillar" and len(sc.get("icons") or []) != 3:
             out.append(f"{where}: 'pillar' needs exactly 3 icons.")
         if kind == "hub" and len(sc.get("nodes") or []) != 4:
