@@ -260,6 +260,11 @@ class GerberLayer:
         self.flashes: list[tuple[int, tuple]] = []
         self.regions: list[tuple[list[tuple], bool]] = []    # (points, dark)
         self.dark_flags: list[bool] = []
+        # Gerber is a sequence of paint operations, not two sets to be
+        # unioned and subtracted. Order is kept here because a file that
+        # goes dark → clear → dark (and real ones do) means the last dark
+        # object PUTS BACK copper the clear one removed.
+        self.ops: list[tuple[str, object, bool]] = []
         self.has_step_repeat = False
         self.macro_flashes = 0
         self.warnings: list[str] = []
@@ -316,6 +321,12 @@ def parse_gerber(path: str) -> GerberLayer:
 
     x = y = 0.0
     dcode: int | None = None
+    # D01/D02/D03 are MODAL: a coordinate line carrying no D-code repeats
+    # the last operation. Older CAM tools lean on this heavily — one real
+    # 2013 job writes 4332 of its 4336 region points that way, so a parser
+    # that only acts on an explicit D01 sees 158 objects out of 470 and
+    # measures the clearance of a board it has mostly not read.
+    dop: str | None = None
     interp = 1                  # 1 linear, 2 CW arc, 3 CCW arc
     quadrant = 75               # G74 single / G75 multi
     dark = True                 # LPD; LPC subtracts
@@ -338,6 +349,7 @@ def parse_gerber(path: str) -> GerberLayer:
         if line == "G37*":
             if len(region_pts) >= 3:
                 layer.regions.append((region_pts, dark))
+                layer.ops.append(("region", region_pts, dark))
             in_region, region_pts = False, []
             continue
         if line == "G74*":
@@ -357,6 +369,10 @@ def parse_gerber(path: str) -> GerberLayer:
         if not op:
             continue
         g, xs, ys, is_, js, d = op.groups()
+        if d is None and (xs or ys):
+            d = dop                      # modal: repeat the last operation
+        elif d in ("01", "02", "03"):
+            dop = d
         if g is not None:
             gi = int(g)
             if gi in (1,):
@@ -388,11 +404,13 @@ def parse_gerber(path: str) -> GerberLayer:
                     if dcode is not None:
                         layer.draws.append((dcode, prev, pt))
                         layer.dark_flags.append(dark)
+                        layer.ops.append(("draw", (dcode, prev, pt), dark))
                     prev = pt
         elif d == "02":
             if in_region:
                 if len(region_pts) >= 3:
                     layer.regions.append((region_pts, dark))
+                    layer.ops.append(("region", region_pts, dark))
                 region_pts = [(nx, ny)]
         elif d == "03":
             if dcode is not None:
@@ -400,10 +418,12 @@ def parse_gerber(path: str) -> GerberLayer:
                 if shape not in ("C", "R", "O", "P"):
                     layer.macro_flashes += 1
                 layer.flashes.append((dcode, (nx, ny)))
+                layer.ops.append(("flash", (dcode, (nx, ny)), dark))
         x, y = nx, ny
 
     if in_region and len(region_pts) >= 3:
         layer.regions.append((region_pts, dark))
+        layer.ops.append(("region", region_pts, dark))
     if layer.macro_flashes:
         layer.warnings.append(
             f"{layer.name}: {layer.macro_flashes} flash(es) use an aperture "
@@ -492,47 +512,72 @@ def aperture_shape(shape: str, params: list[float], at=(0.0, 0.0)):
 def layer_copper(layer: GerberLayer):
     """The layer's real copper, as one shapely geometry.
 
-    Clear-polarity (LPC) shapes are subtracted in the order they appear.
-    That is not an optional refinement: a ground plane is one big dark
-    region with its clearances knocked out in clear polarity, and treating
-    those as copper merges every net on the board into a single island —
-    minimum spacing then comes back as "no neighbours found".
+    Replayed as a SEQUENCE, in the order the file paints it. Clear-polarity
+    (%LPC) objects subtract; dark ones add. That order is not a refinement —
+    a real 2013 job goes dark → clear → dark, so unioning every dark object
+    and then subtracting every clear one erases copper the file explicitly
+    puts back. It showed up as an independent raster measurement finding
+    gaps on that board that the polygon measurement could not see.
+
+    A plane is one dark region with its clearances knocked out in clear
+    polarity, so ignoring polarity altogether merges every net on the board
+    into a single island and spacing comes back as "nothing to measure".
     """
     if not HAVE_SHAPELY:
         raise GerberError(
             "Measuring track spacing needs shapely — `pip install shapely`. "
             "Size, track width and drill counts work without it.")
-    dark_parts, clear_parts = [], []
-    for (dcode, a, b), is_dark in zip(layer.draws, layer.dark_flags):
-        shape, params = layer.apertures.get(dcode, (None, []))
-        if not params:
-            continue
-        if shape == "C":
-            geom = LineString([a, b]).buffer(params[0] / 2, 8)
-        elif shape in ("R", "O"):
-            geom = LineString([a, b]).buffer(min(params) / 2, 8, cap_style=3)
-        else:
-            continue
-        (dark_parts if is_dark else clear_parts).append(geom)
-    for dcode, at in layer.flashes:
-        shape, params = layer.apertures.get(dcode, (None, []))
-        geom = aperture_shape(shape, params, at)
-        if geom is not None:
-            dark_parts.append(geom)
-    for pts, is_dark in layer.regions:
+
+    def geom_for(kind, payload):
+        if kind == "draw":
+            dcode, a, b = payload
+            shape, params = layer.apertures.get(dcode, (None, []))
+            if not params:
+                return None
+            if shape == "C":
+                return LineString([a, b]).buffer(params[0] / 2, 8)
+            if shape in ("R", "O"):
+                return LineString([a, b]).buffer(min(params) / 2, 8, cap_style=3)
+            return None
+        if kind == "flash":
+            dcode, at = payload
+            shape, params = layer.apertures.get(dcode, (None, []))
+            return aperture_shape(shape, params, at) if params else None
         try:
-            poly = Polygon(pts)
+            poly = Polygon(payload)
             if not poly.is_valid:
                 poly = poly.buffer(0)
-            if not poly.is_empty:
-                (dark_parts if is_dark else clear_parts).append(poly)
+            return None if poly.is_empty else poly
         except Exception:
+            return None
+
+    copper = None
+    run: list = []
+    run_dark = True
+    seen_any = False
+
+    def flush(target):
+        if not run:
+            return target
+        merged = unary_union(run)
+        if target is None:
+            return merged if run_dark else None
+        return target.union(merged) if run_dark else target.difference(merged)
+
+    for kind, payload, is_dark in layer.ops:
+        g = geom_for(kind, payload)
+        if g is None:
             continue
-    if not dark_parts:
+        seen_any = seen_any or is_dark
+        if is_dark != run_dark and run:
+            copper = flush(copper)
+            run = []
+        run_dark = is_dark
+        run.append(g)
+    copper = flush(copper)
+
+    if copper is None or copper.is_empty or not seen_any:
         raise GerberError(f"{layer.name}: no drawable copper found.")
-    copper = unary_union(dark_parts)
-    if clear_parts:
-        copper = copper.difference(unary_union(clear_parts))
     return copper
 
 
