@@ -232,6 +232,13 @@ HELP = """
                 an agent formats them into a professional BOQ document —
                 /attach a template alongside the drawing to match its exact
                 columns/structure instead of a generic layout
+  [teal]/gerber <folder|zip|rar> [what to write][/teal]  read a PCB job and
+                measure what a fab asks for — board size, min track width, min
+                track spacing, min drill, hole count — from the real geometry.
+                No AI ever sees a Gerber; the design never leaves this machine.
+                Cross-checked against the job's own CAM report where one
+                exists, and saved as an auditable CSV. Add an instruction to
+                have an agent write the reply FROM THE NUMBERS ONLY
   [teal]/reel <what it's about>[/teal]  a finished vertical reel, rendered on this
                 machine — no account, no upload, no watermark. /attach the
                 client's logo or artwork and their real colours are measured
@@ -1100,6 +1107,106 @@ def cmd_boq(cfg, arg: str, attachments: list):
     ui.ok(f"Run saved → {saved}")
 
 
+def cmd_gerber(cfg, arg: str, attachments: list):
+    """/gerber <folder|zip|rar|files…> [what to write] — measure a PCB job.
+
+    The five numbers a fab asks for — board size, minimum track width,
+    minimum track spacing, minimum drill, hole count — measured from the
+    real geometry by core.gerber. No AI ever sees a Gerber file: the design
+    is the customer's intellectual property and it never leaves this machine.
+    An agent is only offered the MEASURED NUMBERS afterward, to write the
+    reply or the quotation.
+    """
+    from core import gerber as G
+
+    arg = arg.strip()
+    targets: list[str] = []
+    context = ""
+    if arg:
+        # Everything up to the last path-like token is the job; the rest is
+        # the covering instruction ("reply to them with a price").
+        head = arg
+        while head:
+            cand = os.path.expanduser(head.strip().strip('"').strip("'"))
+            if os.path.exists(cand):
+                targets.append(cand)
+                context = arg[len(head):].strip()
+                break
+            if " " not in head:
+                break
+            head = head.rsplit(" ", 1)[0]
+        if not targets:
+            context = arg
+    if not targets:
+        targets = [a["path"] for a in attachments
+                   if os.path.splitext(a["path"])[1].lower() in
+                   (".zip", ".rar") or os.path.isdir(a["path"])] or \
+                  [a["path"] for a in attachments]
+    if not targets:
+        ui.warn("Point Prism at the job.\n"
+                "  /gerber ~/Downloads/job_folder\n"
+                "  /gerber ~/Downloads/gerbers.zip reply with our price\n"
+                "  (or /attach the zip, then /gerber)")
+        return
+
+    try:
+        paths = G.gather(targets)
+    except G.GerberError as e:
+        ui.err(str(e))
+        return
+    if not paths:
+        ui.err("Nothing readable in there.")
+        return
+
+    ui.info(f"📐  measuring {len(paths)} file(s) — the design never leaves this "
+            "machine; no AI sees a Gerber.")
+    try:
+        job = G.analyse(paths)
+    except G.GerberError as e:
+        ui.err(str(e))
+        return
+
+    ui.panel(G.files_text(job), title="📁  What is in this job", style="teal")
+    ui.panel(G.answers_text(job), title="📐  The five numbers (measured, not guessed)",
+             style="teal")
+    ui.panel(G.summary_text(job), title="🔬  The workings behind them", style="pink")
+    ui.panel(G.crosscheck_text(G.crosscheck(job)),
+             title="✓  Checked against the job's own CAM report", style="teal")
+    for w in job["warnings"]:
+        ui.warn(w)
+
+    import time
+    os.makedirs(C.RUNS_DIR, exist_ok=True)
+    csv_path = os.path.join(C.RUNS_DIR, f"gerber_{int(time.time())}.csv")
+    G.write_report_csv(job, csv_path)
+    ui.ok(f"Auditable figures saved → {csv_path}")
+
+    if not context:
+        ui.info("Add an instruction to have an agent write this up, e.g.\n"
+                "  /gerber <path> reply to the customer with our price for 500 pieces")
+        return
+
+    a = job["answers"]
+    brief = (
+        f"{context}\n\n"
+        "These figures were MEASURED from the customer's Gerber files by "
+        "Prism, on our own machine. Use them exactly as given — do not "
+        "recalculate, round differently, or invent any number that is not "
+        "here. The Gerber files themselves are confidential and are NOT "
+        "attached.\n\n"
+        f"  PCB size            {a['pcb_size']}\n"
+        f"  Min track width     {G._fmt(a['min_track_width_mm'])}\n"
+        f"  Min track spacing   {G._fmt(a['min_track_spacing_mm'])}\n"
+        f"  Min drill size      {G._fmt(a['min_drill_mm'])}\n"
+        f"  Number of drills    {a['drill_count']}\n")
+    if job["warnings"]:
+        brief += ("\nCaveats that must be repeated to the customer if they "
+                  "affect the answer:\n  - "
+                  + "\n  - ".join(job["warnings"]) + "\n")
+    ui.info("🔒  Only the numbers above go to the agent. The Gerber files stay here.")
+    run_query(cfg, brief, dry=False, attachments=[])
+
+
 def cmd_reel(cfg, arg: str, attachments: list):
     """/reel <what the reel is about> — a finished vertical reel, rendered here.
 
@@ -1457,6 +1564,8 @@ def _dispatch(cfg: dict, line: str, attachments: list) -> tuple[dict, bool]:
         cmd_email(cfg, line[len("/email"):].strip(), attachments)
     elif line.startswith("/boq"):
         cmd_boq(cfg, line[len("/boq"):].strip(), attachments)
+    elif line.startswith("/gerber"):
+        cmd_gerber(cfg, line[len("/gerber"):].strip(), attachments)
     elif line.startswith("/reel"):
         cmd_reel(cfg, line[len("/reel"):].strip(), attachments)
     elif line.startswith("/dry"):

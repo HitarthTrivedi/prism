@@ -37,5 +37,12 @@ ezdxf
 # The standalone whisper.py reference app additionally needs:
 #   pip install numpy aiohttp
 
+# ── /gerber: PCB fabrication data from Gerber + drill files (optional) ──
+# Board size, minimum track width/spacing, drill sizes and hole counts are
+# MEASURED from the real geometry — no AI ever sees a Gerber file, so the
+# customer's design never leaves the machine. shapely does the copper
+# geometry; without it everything except track SPACING still works.
+shapely
+
 # Prism Studio films an HTML page frame by frame — this is the browser engine.
 playwright>=1.44
