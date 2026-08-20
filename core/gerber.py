@@ -120,6 +120,13 @@ _EXT_ROLE = {
     ".g4": "copper_inner", ".g5": "copper_inner", ".g6": "copper_inner",
     ".gko": "outline", ".gm1": "outline", ".gml": "outline", ".oln": "outline",
     ".dim": "outline", ".gbr": "unknown",
+    # Mechanical 2-30. Altium puts the board profile on Mechanical 1 (.GM1,
+    # above) and everything else — dimensions, notes, a fab drawing, an
+    # assembly view — on the rest. They are documentation, not fabrication,
+    # but naming them beats calling them unrecognised: a CAM operator opening
+    # a strange folder wants to know which files he can ignore, and that is
+    # half of what layer identification is for.
+    **{f".gm{n}": "mechanical" for n in range(2, 31)},
     ".gts": "mask_top", ".gbs": "mask_bottom",
     ".gto": "silk_top", ".gbo": "silk_bottom",
     ".gtp": "paste_top", ".gbp": "paste_bottom",
@@ -149,6 +156,7 @@ _ROLE_LABEL = {
     "drill_gerber": "drill supplied as a Gerber (holes drawn as flashed pads)",
     "drill_drawing": "drill drawing (a human-readable picture of the holes)",
     "drill_guide": "drill guide (hole positions, often with the board outline)",
+    "mechanical": "mechanical/documentation layer (dimensions, notes, fab drawing)",
     "report": "text report written by the CAM tool (human-readable summary)",
     "unknown": "unrecognised — content was checked, see notes",
     "aperture_list": "aperture list (the CAM tool's own D-code table)",
