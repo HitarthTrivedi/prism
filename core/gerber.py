@@ -1337,6 +1337,21 @@ def write_report_csv(job: dict, path: str) -> None:
             w.writerow([f"T{t['tool']}", f"{t['dia_mm']:.4f}",
                         f"{mm_to_mil(t['dia_mm']):.1f}", t["hits"], ""])
         w.writerow([])
+        # Layer identification. It was printed on screen and left out of the
+        # file, which is the wrong way round: the screen scrolls away and the
+        # file is what gets emailed to the customer. He asked for this by
+        # name, and "used" tells him which files the numbers above came from.
+        w.writerow(["file", "identified_as", "used_for_measurement", "", ""])
+        order = {"copper_top": 0, "copper_bottom": 1, "copper_inner": 2,
+                 "plane": 3, "outline": 4, "drill": 5, "drill_gerber": 5,
+                 "drill_drawing": 6, "drill_guide": 7}
+        used = {"copper_top", "copper_bottom", "copper_inner", "outline",
+                "drill", "drill_gerber", "drill_guide", "drill_drawing"}
+        for f in sorted(job["files"], key=lambda f: (order.get(f["role"], 9),
+                                                     f["name"])):
+            w.writerow([f["name"], f["label"],
+                        "yes" if f["role"] in used else "no", "", ""])
+        w.writerow([])
         w.writerow(["layer", "track_width_mm", "track_width_mil", "segments",
                     "trace_length_m"])
         for row in job["copper"]:
