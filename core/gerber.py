@@ -1291,6 +1291,18 @@ def write_report_csv(job: dict, path: str) -> None:
         w = csv.writer(fh)
         w.writerow(["measurement", "value", "unit", "source", "note"])
         b = job["board"]
+        # The layer count belongs here too. It is one of the answers, it is
+        # the one a customer is most likely to read differently from us (their
+        # sheet said 2 for a board whose Gerbers hold four copper layers), and
+        # a figure that only ever appears on screen cannot be checked later.
+        w.writerow(["copper_layers", a.get("layers", ""), "layers",
+                    "copper + plane files",
+                    f"{a.get('routed_layers', 0)} routed, "
+                    f"{a.get('plane_layers', 0)} solid plane"])
+        w.writerow(["routed_layers", a.get("routed_layers", ""), "layers",
+                    "copper files",
+                    "layers carrying tracks — what a fabricator's check sheet "
+                    "may mean by 'layers'"])
         w.writerow(["pcb_width", f"{b['width_mm']:.4f}" if b["width_mm"] else "",
                     "mm", b.get("source", ""), b.get("method", "")])
         w.writerow(["pcb_height", f"{b['height_mm']:.4f}" if b["height_mm"] else "",
@@ -1304,7 +1316,8 @@ def write_report_csv(job: dict, path: str) -> None:
                     f"{a['min_track_spacing_mm']:.4f}" if a["min_track_spacing_mm"] else "",
                     "mm", "copper layers",
                     f"conductors only; gaps below {job['snap_mm']} mm treated "
-                    "as touching"])
+                    f"as touching; {a.get('spacing_pairs_at_min', 0)} place(s) "
+                    "on the board are this tight"])
         w.writerow(["min_drill", f"{a['min_drill_mm']:.4f}" if a["min_drill_mm"] else "",
                     "mm", job["drills"]["source"] if job["drills"] else "",
                     "smallest tool with at least one hit"])
