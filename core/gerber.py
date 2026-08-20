@@ -1054,6 +1054,7 @@ def analyse(paths: list[str], snap_mm: float = SNAP_MM) -> dict:
             "pcb_size_mm": (board["width_mm"], board["height_mm"]),
             "min_track_width_mm": min_width,
             "min_track_spacing_mm": min_gap,
+            "spacing_pairs_at_min": _pairs_at(copper_results, min_gap),
             "min_drill_mm": min((t["dia_mm"] for t in used_tools), default=None),
             "drill_count": drills["total"] if drills else None,
             "layers": len(copper_results) + len(planes),
@@ -1143,6 +1144,27 @@ def crosscheck_text(checks: list[dict]) -> str:
 
 # ── presentation ──────────────────────────────────────────────────────────────
 
+def _pairs_at(copper_results: list, min_gap) -> int:
+    """How many places on the board are at (or within a mil of) the minimum.
+
+    One pair at 9 mil on a board otherwise routed to 10 is a single
+    footprint. Twenty-nine pairs at 9 mil is how the board was routed, and
+    the fab has to be able to etch it. Same headline number, different job —
+    and the customer's own sheet said 10 where we measure 9, precisely
+    because theirs is a design rule and ours is the worst case actually
+    present. Neither is wrong; only one of them limits manufacture.
+    """
+    if min_gap is None:
+        return 0
+    n = 0
+    for row in copper_results:
+        sp = row.get("spacing") or {}
+        for gap, count in (sp.get("histogram") or {}).items():
+            if gap <= min_gap + 0.0254:          # within one mil
+                n += count
+    return n
+
+
 def mm_to_mil(v: float) -> float:
     return v / MM_PER_INCH * 1000.0
 
@@ -1170,7 +1192,9 @@ def answers_text(job: dict) -> str:
         f"0. Copper layers        {layer_txt}",
         f"1. PCB size             {size}",
         f"2. Min track width      {_fmt(a['min_track_width_mm'])}",
-        f"3. Min track spacing    {_fmt(a['min_track_spacing_mm'])}",
+        f"3. Min track spacing    {_fmt(a['min_track_spacing_mm'])}"
+        + (f"   — {a['spacing_pairs_at_min']} place(s) on the board are this "
+           f"tight" if a.get("spacing_pairs_at_min") else ""),
         f"4. Min drill size       {_fmt(a['min_drill_mm'])}",
         f"5. Number of drills     "
         f"{a['drill_count'] if a['drill_count'] is not None else 'not measured'}",
