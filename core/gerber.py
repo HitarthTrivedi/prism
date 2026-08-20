@@ -115,7 +115,7 @@ ARC_SAGITTA_MM = 0.005
 _EXT_ROLE = {
     ".gtl": "copper_top", ".cmp": "copper_top", ".top": "copper_top",
     ".gbl": "copper_bottom", ".sol": "copper_bottom", ".bot": "copper_bottom",
-    ".gp1": "copper_inner", ".gp2": "copper_inner", ".gp3": "copper_inner",
+    ".gp1": "plane", ".gp2": "plane", ".gp3": "plane", ".gp4": "plane",
     ".g1": "copper_inner", ".g2": "copper_inner", ".g3": "copper_inner",
     ".g4": "copper_inner", ".g5": "copper_inner", ".g6": "copper_inner",
     ".gko": "outline", ".gm1": "outline", ".gml": "outline", ".oln": "outline",
@@ -135,7 +135,8 @@ _EXT_ROLE = {
 _ROLE_LABEL = {
     "copper_top": "top copper (the tracks and pads on the component side)",
     "copper_bottom": "bottom copper (tracks and pads on the solder side)",
-    "copper_inner": "inner copper layer / power or ground plane",
+    "copper_inner": "inner copper layer (routed, like top and bottom)",
+    "plane": "internal ground or power plane — a solid copper sheet, no tracks",
     "outline": "board outline — the shape the board is cut to",
     "mask_top": "top solder mask (the green coating; holes where solder goes)",
     "mask_bottom": "bottom solder mask",
@@ -155,7 +156,15 @@ _ROLE_LABEL = {
     "other": "not a fabrication file",
 }
 
+# Layers that carry ROUTED copper, and therefore have a track width and a
+# track spacing at all. An internal plane is a solid sheet: the only thing in
+# its Gerber is the clearance punched around each hole, so "minimum track
+# width" on one is a category error, not a small number. On a real 2018 job
+# the two plane layers reported 3 mil on a board routed to 10, and dragged
+# the whole job's answer down with them.
 _COPPER_ROLES = ("copper_top", "copper_bottom", "copper_inner")
+_PLANE_ROLES = ("plane",)
+_ALL_COPPER = _COPPER_ROLES + _PLANE_ROLES
 
 
 def _sniff(path: str) -> str:
@@ -589,20 +598,76 @@ def islands(copper) -> list:
 
 # ── the five measurements ─────────────────────────────────────────────────────
 
-def track_widths(layer: GerberLayer) -> list[dict]:
+def classify_copper(layer: GerberLayer, copper=None):
+    """Split a layer's copper into CONDUCTORS and MARKINGS.
+
+    Boards carry text: part numbers, revision marks, a company logo, etched
+    into the copper alongside the tracks. It is copper, and it is not a
+    conductor, and telling them apart is the difference between a number a
+    fabricator recognises and one they do not.
+
+    On a real 2013 board, 94 of the layer's 114 copper islands are lettering
+    drawn with a thin 10-mil pen, while every actual conductor is a 3 mm
+    strip. Measuring all of it reported a minimum track width of 10 mil for
+    a board whose narrowest conductor is 118 mil — and a clearance of 5 mil
+    for a board whose tightest real gap is 81. The customer's own check
+    sheet said 118 and 81.9. A 2018 four-layer board had the same fault in
+    miniature: 184 tiny segments of vertical text at the board edge,
+    reported as an 8-mil minimum on a board routed to 10.
+
+    THE TEST: a conductor connects to something. Lettering connects to
+    nothing. So an island counts as a conductor when it carries at least one
+    flashed pad. Pads are where holes and components land, and they are on
+    the same layer in the same coordinates, so no cross-file assumption is
+    needed.
+
+    Returns (conductors, markings). If the layer has no flashes at all there
+    is nothing to test against, so everything is treated as conductor and
+    the caller is told why.
+    """
+    if copper is None:
+        copper = layer_copper(layer)
+    isl = islands(copper)
+    if not layer.flashes or len(isl) < 2:
+        return isl, []
+    pads = [Point(pt) for _, pt in layer.flashes]
+    tree = STRtree(pads)
+    conductors, markings = [], []
+    for g in isl:
+        hit = [int(i) for i in tree.query(g)]
+        if any(g.intersects(pads[i]) for i in hit):
+            conductors.append(g)
+        else:
+            markings.append(g)
+    # A layer that is ALL markings by this test is a layer the test does not
+    # understand — a plane with no flashed pads, say. Better to measure
+    # everything and say so than to report nothing.
+    return (conductors, markings) if conductors else (isl, [])
+
+
+def track_widths(layer: GerberLayer, conductors=None) -> list[dict]:
     """Every width copper was DRAWN with, and how much of it there is.
 
-    Flashes are excluded — a 3mm pad is not a 3mm track — and so is anything
-    non-circular, because a rectangle dragged along a path is a pad shape,
-    not a routed trace.
+    Flashes are excluded — a 3 mm pad is not a 3 mm track — and so is
+    anything non-circular, because a rectangle dragged along a path is a pad
+    shape, not a routed trace.
+
+    With `conductors` given, a segment only counts if its midpoint lands on
+    one. That is what keeps the silkscreen-in-copper out of the answer; see
+    classify_copper().
     """
     stats: dict[int, dict] = {}
+    tree = STRtree(conductors) if (conductors and HAVE_SHAPELY) else None
     for (dcode, a, b), is_dark in zip(layer.draws, layer.dark_flags):
         if not is_dark:
             continue
         shape, params = layer.apertures.get(dcode, (None, []))
         if shape != "C" or not params:
             continue
+        if tree is not None:
+            mid = Point((a[0] + b[0]) / 2, (a[1] + b[1]) / 2)
+            if not any(conductors[int(i)].intersects(mid) for i in tree.query(mid)):
+                continue
         row = stats.setdefault(dcode, {"width_mm": params[0], "dcode": dcode,
                                        "segments": 0, "length_mm": 0.0})
         row["segments"] += 1
@@ -610,31 +675,14 @@ def track_widths(layer: GerberLayer) -> list[dict]:
     return sorted(stats.values(), key=lambda r: r["width_mm"])
 
 
-def spacing(layer: GerberLayer, snap_mm: float = SNAP_MM) -> dict:
-    """Minimum copper-to-copper clearance on one layer, plus the distribution.
-
-    The distribution is the point. A lone 1-mil gap at one connector and a
-    board routed throughout to 4 mil are the same headline number and very
-    different jobs, and only the histogram tells them apart.
-    """
-    copper = layer_copper(layer)
-    isl = islands(copper)
-    if len(isl) < 2:
-        return {"min_mm": None, "islands": len(isl), "pairs": 0,
-                "histogram": {}, "tightest": [], "snapped": 0,
-                "note": "one connected copper island — nothing to measure a "
-                        "gap against on this layer."}
+def _nearest_pairs(isl: list, snap_mm: float) -> dict:
+    """Every neighbouring pair and the gap between them."""
     tree = STRtree(isl)
-    pairs: dict[tuple[int, int], float] = {}
-    # 2 mm reaches past any sane design rule while keeping the query cheap —
-    # but a sparse board (a chunky single-sided power board, a two-part
-    # panel) can have every gap wider than that, and a fixed reach reports
-    # such a board as having no measurable spacing at all. So the ring grows
-    # until this island finds a neighbour, or until the board runs out.
-    span = max(isl[0].bounds[2] - isl[0].bounds[0], 1.0)
+    span = 1.0
     for g in isl:
         x0, y0, x1, y1 = g.bounds
         span = max(span, x1 - x0, y1 - y0)
+    pairs: dict[tuple[int, int], float] = {}
     for i, geom in enumerate(isl):
         reach = 2.0
         while True:
@@ -646,18 +694,46 @@ def spacing(layer: GerberLayer, snap_mm: float = SNAP_MM) -> dict:
             key = (i, j) if i < j else (j, i)
             if key not in pairs:
                 pairs[key] = geom.distance(isl[j])
+    return pairs
+
+
+def spacing(layer: GerberLayer, snap_mm: float = SNAP_MM, conductors=None,
+            copper=None) -> dict:
+    """Minimum copper-to-copper clearance on one layer, plus the distribution.
+
+    Measured between CONDUCTORS. Lettering etched in copper is real copper
+    and a real etching constraint, but it is not track spacing, and a fab
+    quoting off "5 mil" when the board is routed to 81 is quoting a
+    different board. The markings figure is still computed and returned
+    beside it, so nothing is hidden — just not confused with the answer.
+
+    The distribution is the other half. A lone 1-mil gap at one connector
+    and a board routed throughout to 10 mil are the same headline number and
+    very different jobs, and only the histogram tells them apart.
+    """
+    if conductors is None:
+        conductors, _ = classify_copper(layer, copper)
+    isl = conductors
+    if len(isl) < 2:
+        return {"min_mm": None, "islands": len(isl), "pairs": 0,
+                "histogram": {}, "tightest": [], "snapped": 0,
+                "with_markings_mm": None,
+                "note": "one connected copper island — nothing to measure a "
+                        "gap against on this layer."}
+    pairs = _nearest_pairs(isl, snap_mm)
     real = {k: v for k, v in pairs.items() if v >= snap_mm}
     snapped = len(pairs) - len(real)
     if not real:
         return {"min_mm": None, "islands": len(isl), "pairs": len(pairs),
                 "histogram": {}, "tightest": [], "snapped": snapped,
+                "with_markings_mm": None,
                 "note": f"every gap was below the {snap_mm} mm snap tolerance "
                         "— the shapes touch."}
     ordered = sorted(real.items(), key=lambda kv: kv[1])
     hist: dict[float, int] = {}
     for _, gap in ordered:
-        bucket = round(gap / 0.025) * 0.025      # 1-mil buckets
-        hist[round(bucket, 3)] = hist.get(round(bucket, 3), 0) + 1
+        bucket = round(round(gap / 0.025) * 0.025, 3)
+        hist[bucket] = hist.get(bucket, 0) + 1
     tightest = []
     for (i, j), gap in ordered[:8]:
         try:
@@ -669,7 +745,7 @@ def spacing(layer: GerberLayer, snap_mm: float = SNAP_MM) -> dict:
         tightest.append({"gap_mm": gap, "at": where})
     return {"min_mm": ordered[0][1], "islands": len(isl), "pairs": len(real),
             "histogram": dict(sorted(hist.items())), "tightest": tightest,
-            "snapped": snapped, "note": ""}
+            "snapped": snapped, "with_markings_mm": None, "note": ""}
 
 
 def board_outline(layers: list[GerberLayer]) -> dict:
@@ -882,18 +958,46 @@ def analyse(paths: list[str], snap_mm: float = SNAP_MM) -> dict:
         if entry["role"] not in _COPPER_ROLES or entry["path"] not in parsed:
             continue
         layer = parsed[entry["path"]]
-        widths = track_widths(layer)
-        row = {"name": entry["name"], "role": entry["role"], "widths": widths,
-               "min_width_mm": widths[0]["width_mm"] if widths else None,
-               "spacing": None}
+        row = {"name": entry["name"], "role": entry["role"], "widths": [],
+               "min_width_mm": None, "spacing": None, "markings": 0,
+               "conductors": 0, "widths_all": track_widths(layer)}
+        conductors = None
         if HAVE_SHAPELY:
             try:
-                row["spacing"] = spacing(layer, snap_mm)
+                copper = layer_copper(layer)
+                conductors, markings = classify_copper(layer, copper)
+                row["conductors"], row["markings"] = len(conductors), len(markings)
+                row["spacing"] = spacing(layer, snap_mm, conductors, copper)
+                if markings:
+                    # Keep the everything-included figure for disclosure. A
+                    # customer who asks "what about the printing?" gets an
+                    # answer instead of a shrug.
+                    allsp = spacing(layer, snap_mm, islands(copper), copper)
+                    row["spacing"]["with_markings_mm"] = allsp.get("min_mm")
             except GerberError as e:
                 warnings.append(str(e))
             except Exception as e:                          # pragma: no cover
                 warnings.append(f"{entry['name']}: spacing not measured ({e}).")
+        row["widths"] = track_widths(layer, conductors)
+        if not row["widths"]:
+            row["widths"] = row["widths_all"]
+        row["min_width_mm"] = row["widths"][0]["width_mm"] if row["widths"] else None
+        if row["markings"]:
+            warnings.append(
+                f"{entry['name']}: {row['markings']} piece(s) of copper carry no "
+                "pad — lettering or a logo etched into the layer. They are "
+                "excluded from track width and spacing, which measure "
+                "CONDUCTORS. Including them reported 10 mil on a board routed "
+                "to 118 on one real job.")
         copper_results.append(row)
+    planes = [e["name"] for e in files if e["role"] in _PLANE_ROLES]
+    if planes:
+        warnings.append(
+            f"{len(planes)} internal plane layer(s) ({', '.join(planes)}) — solid "
+            "copper sheets, so they have no tracks and are excluded from track "
+            "width and spacing. They DO count toward the layer total: this board "
+            f"has {len(copper_results) + len(planes)} copper layers, of which "
+            f"{len(copper_results)} are routed.")
     if not copper_results:
         warnings.append("No copper layer was identified in this job — track "
                         "width and spacing could not be measured.")
@@ -952,6 +1056,9 @@ def analyse(paths: list[str], snap_mm: float = SNAP_MM) -> dict:
             "min_track_spacing_mm": min_gap,
             "min_drill_mm": min((t["dia_mm"] for t in used_tools), default=None),
             "drill_count": drills["total"] if drills else None,
+            "layers": len(copper_results) + len(planes),
+            "routed_layers": len(copper_results),
+            "plane_layers": len(planes),
         },
         "warnings": warnings,
         "snap_mm": snap_mm,
@@ -1054,7 +1161,13 @@ def answers_text(job: dict) -> str:
     if b.get("width_mm"):
         size += (f"   [{b['width_mm'] / MM_PER_INCH:.3f} x "
                  f"{b['height_mm'] / MM_PER_INCH:.3f} in]")
+    layers = a.get("layers")
+    layer_txt = str(layers) if layers else "not measured"
+    if a.get("plane_layers"):
+        layer_txt += (f"   ({a['routed_layers']} routed + "
+                      f"{a['plane_layers']} solid plane)")
     lines = [
+        f"0. Copper layers        {layer_txt}",
         f"1. PCB size             {size}",
         f"2. Min track width      {_fmt(a['min_track_width_mm'])}",
         f"3. Min track spacing    {_fmt(a['min_track_spacing_mm'])}",
@@ -1088,10 +1201,18 @@ def summary_text(job: dict) -> str:
                            f"({mm_to_mil(w['width_mm']):5.1f} mil)   "
                            f"{w['segments']:6d} segments, "
                            f"{w['length_mm'] / 1000:7.2f} m of trace")
+        if row.get("markings"):
+            out.append(f"   {row['conductors']} conductor(s) measured; "
+                       f"{row['markings']} piece(s) of lettering/logo in copper "
+                       "excluded")
         sp = row["spacing"]
         if sp and sp.get("min_mm"):
             out.append(f"   minimum clearance {_fmt(sp['min_mm'])} "
-                       f"across {sp['islands']} copper islands")
+                       f"across {sp['islands']} conductors")
+            if sp.get("with_markings_mm"):
+                out.append(f"   (counting the lettering too it would be "
+                           f"{_fmt(sp['with_markings_mm'])} — real copper, "
+                           "not track spacing)")
             if sp["histogram"]:
                 top = sorted(sp["histogram"].items(), key=lambda kv: kv[0])[:8]
                 out.append("   gap distribution: " + ",  ".join(
@@ -1152,11 +1273,14 @@ def write_report_csv(job: dict, path: str) -> None:
                     "mm", b.get("source", ""), b.get("shape", "")])
         w.writerow(["min_track_width",
                     f"{a['min_track_width_mm']:.4f}" if a["min_track_width_mm"] else "",
-                    "mm", "copper layers", "smallest circular aperture used to draw"])
+                    "mm", "copper layers",
+                    "smallest circular aperture used to draw a CONDUCTOR "
+                    "(lettering etched in copper excluded)"])
         w.writerow(["min_track_spacing",
                     f"{a['min_track_spacing_mm']:.4f}" if a["min_track_spacing_mm"] else "",
                     "mm", "copper layers",
-                    f"gaps below {job['snap_mm']} mm treated as touching"])
+                    f"conductors only; gaps below {job['snap_mm']} mm treated "
+                    "as touching"])
         w.writerow(["min_drill", f"{a['min_drill_mm']:.4f}" if a["min_drill_mm"] else "",
                     "mm", job["drills"]["source"] if job["drills"] else "",
                     "smallest tool with at least one hit"])
