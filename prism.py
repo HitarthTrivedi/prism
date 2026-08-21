@@ -1107,6 +1107,29 @@ def cmd_boq(cfg, arg: str, attachments: list):
     ui.ok(f"Run saved → {saved}")
 
 
+def _show_gerber(job, label: str = ""):
+    """Print one measured job and save its auditable CSV."""
+    from core import gerber as G
+    import time
+
+    ui.panel(G.files_text(job), title="📁  What is in this job", style="teal")
+    ui.panel(G.answers_text(job),
+             title="📐  The five numbers (measured, not guessed)", style="teal")
+    ui.panel(G.summary_text(job), title="🔬  The workings behind them", style="pink")
+    ui.panel(G.crosscheck_text(G.crosscheck(job)),
+             title="✓  Checked against the job's own CAM report", style="teal")
+    for w in job["warnings"]:
+        ui.warn(w)
+
+    os.makedirs(C.RUNS_DIR, exist_ok=True)
+    safe = "".join(c if c.isalnum() or c in "-_" else "_" for c in label)[:40]
+    stem = f"gerber_{safe}_{int(time.time())}" if safe else f"gerber_{int(time.time())}"
+    csv_path = os.path.join(C.RUNS_DIR, f"{stem}.csv")
+    G.write_report_csv(job, csv_path)
+    ui.ok(f"Auditable figures saved → {csv_path}")
+
+
+
 def cmd_gerber(cfg, arg: str, attachments: list):
     """/gerber <folder|zip|rar|files…> [what to write] — measure a PCB job.
 
@@ -1158,28 +1181,45 @@ def cmd_gerber(cfg, arg: str, attachments: list):
         ui.err("Nothing readable in there.")
         return
 
-    ui.info(f"📐  measuring {len(paths)} file(s) — the design never leaves this "
-            "machine; no AI sees a Gerber.")
-    try:
-        job = G.analyse(paths)
-    except G.GerberError as e:
-        ui.err(str(e))
+    # A folder can hold more than one board. Measuring five jobs as one
+    # produces a single confident answer that describes none of them.
+    groups = G.split_jobs(paths)
+    if len(groups) > 1:
+        ui.info(f"📦  {len(groups)} separate jobs in there — measuring each on "
+                "its own:")
+        for name, group in groups:
+            ui.info(f"      {name}  ({len(group)} files)")
+
+    ok = 0
+    measured: list = []
+    for name, group in groups:
+        if len(groups) > 1:
+            ui.rule(name, "teal")
+        ui.info(f"📐  measuring {len(group)} file(s) — the design never leaves "
+                "this machine; no AI sees a Gerber.")
+        try:
+            job = G.analyse(group)
+        except G.GerberError as e:
+            ui.err(str(e))
+            continue
+        _show_gerber(job, name if len(groups) > 1 else "")
+        measured.append((name, job))
+        ok += 1
+    if not ok:
         return
-
-    ui.panel(G.files_text(job), title="📁  What is in this job", style="teal")
-    ui.panel(G.answers_text(job), title="📐  The five numbers (measured, not guessed)",
-             style="teal")
-    ui.panel(G.summary_text(job), title="🔬  The workings behind them", style="pink")
-    ui.panel(G.crosscheck_text(G.crosscheck(job)),
-             title="✓  Checked against the job's own CAM report", style="teal")
-    for w in job["warnings"]:
-        ui.warn(w)
-
+    # One sheet across every job — a row per board, in the column order and
+    # the units the customer's own spreadsheet already uses.
     import time
-    os.makedirs(C.RUNS_DIR, exist_ok=True)
-    csv_path = os.path.join(C.RUNS_DIR, f"gerber_{int(time.time())}.csv")
-    G.write_report_csv(job, csv_path)
-    ui.ok(f"Auditable figures saved → {csv_path}")
+    summary = os.path.join(C.RUNS_DIR, f"gerber_summary_{int(time.time())}.csv")
+    G.write_summary_csv(measured, summary)
+    ui.ok(f"One sheet for all {len(measured)} job(s) → {summary}")
+    ui.info("   Opens in Excel. A row per board, plus layer identification "
+            "for every file underneath.")
+
+    if len(groups) > 1:
+        ui.info("Each job above was measured separately. Add an instruction to "
+                "write one of them up, or run /gerber on a single folder.")
+        return
 
     if not context:
         ui.info("Add an instruction to have an agent write this up, e.g.\n"

@@ -1609,6 +1609,72 @@ def split_jobs(paths: list[str]) -> list[tuple[str, list[str]]]:
     return jobs
 
 
+def write_summary_csv(jobs: list[tuple[str, dict]], path: str) -> None:
+    """One row per job, across every job measured — the customer's own sheet.
+
+    He keeps a spreadsheet with a row per board: LAYER, PCB SIZE, TRACK
+    WIDTH, TRACK SPACING, MIN DRILL SIZE, TOTAL DRILL. That is the artefact
+    being replaced, so the output is written in his column order and in MIL,
+    which is what he works in — a file he can paste into the sheet he
+    already has beats a better file he has to re-key.
+
+    Both layer readings go in. His column says 2 for a board whose Gerbers
+    hold four copper layers, and both numbers are true: two are routed and
+    two are solid planes. Printing one of them would be picking a side of a
+    disagreement that is really a difference in wording.
+
+    The last column names what each figure was checked against, because a
+    row that reproduces the job's own CAM report is worth more than a row
+    that only reproduces itself.
+    """
+    import csv
+    with open(path, "w", newline="", encoding="utf-8") as fh:
+        w = csv.writer(fh)
+        w.writerow(["JOB", "LAYERS", "ROUTED", "PCB SIZE X (in)",
+                    "PCB SIZE Y (in)", "PCB SIZE (mm)", "TRACK WIDTH (mil)",
+                    "TRACK SPACING (mil)", "MIN DRILL SIZE (mil)",
+                    "TOTAL DRILL", "FILES", "CHECKED AGAINST"])
+        for name, job in jobs:
+            a = job["answers"]
+            def m(v, dp=1):
+                return "" if v is None else f"{mm_to_mil(v):.{dp}f}"
+            x, y = a.get("pcb_size_mm", (None, None))
+            checks = crosscheck(job)
+            if checks:
+                agreed = sum(1 for c in checks if c["agrees"])
+                verdict = (f"{agreed}/{len(checks)} figures match the job's own "
+                           "CAM report")
+            else:
+                verdict = "no report in the job — geometry only"
+            w.writerow([
+                name,
+                a.get("layers", ""),
+                a.get("routed_layers", ""),
+                f"{x / MM_PER_INCH:.4f}" if x else "",
+                f"{y / MM_PER_INCH:.4f}" if y else "",
+                f"{x:.2f} x {y:.2f}" if x else "",
+                m(a.get("min_track_width_mm")),
+                m(a.get("min_track_spacing_mm")),
+                m(a.get("min_drill_mm"), 2),
+                a.get("drill_count", ""),
+                len(job["files"]),
+                verdict,
+            ])
+        # Layer identification, per job, underneath — he asked for it by name
+        # and it does not fit one row per board.
+        w.writerow([])
+        w.writerow(["JOB", "FILE", "IDENTIFIED AS", "USED FOR MEASUREMENT"])
+        used = {"copper_top", "copper_bottom", "copper_inner", "outline",
+                "drill", "drill_gerber", "drill_guide", "drill_drawing"}
+        order = {"copper_top": 0, "copper_bottom": 1, "copper_inner": 2,
+                 "plane": 3, "outline": 4, "drill": 5, "drill_gerber": 5}
+        for name, job in jobs:
+            for f in sorted(job["files"],
+                            key=lambda f: (order.get(f["role"], 9), f["name"])):
+                w.writerow([name, f["name"], f["label"],
+                            "yes" if f["role"] in used else "no"])
+
+
 def gather(paths: list[str]) -> list[str]:
     """Expand folders and archives into the flat list of files to measure.
 
