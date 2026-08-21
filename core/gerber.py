@@ -1190,7 +1190,11 @@ def excellon(path: str) -> dict:
         if line.startswith("M16") or line.startswith("M17"):
             routing = False
             continue
-        sel = re.fullmatch(r"T(\d+)", line)
+        # A tool select is not always a bare `T1`. Real files write
+        # `T1C.01969F095S3` — the diameter and the feed/speed repeated on
+        # every select. Matching only the bare form left every hole
+        # attributed to no tool at all, and a 1,000-hole job reported zero.
+        sel = re.fullmatch(r"T(\d+)(?:[CFSHZB][\d.]+)*", line)
         if sel:
             current = int(sel.group(1))
             continue
@@ -1489,6 +1493,7 @@ def crosscheck(job: dict) -> list[dict]:
     get. Agreement is worth showing; disagreement is worth stopping for.
     """
     checks: list[dict] = []
+    per_file: list[tuple[str, int, int]] = []
     drills = job.get("drills")
     for entry in job["files"]:
         if entry["role"] != "report":
@@ -1505,6 +1510,17 @@ def crosscheck(job: dict) -> list[dict]:
                 "what": "total holes", "source": entry["name"],
                 "stated": stated, "measured": drills["total"],
                 "agrees": stated == drills["total"]})
+
+        # "Drill Sizes Report": Tool / Size(mil) / Pltd / Feed / Speed / Qty
+        sizes = re.findall(r"^\s*(\d+)\s+([\d.]+)\s+[x-]\s+\d+\s+\d+\s+(\d+)\s*$",
+                           text, re.M)
+        if sizes:
+            # One report per DRILL FILE, and a job ships several — plated,
+            # non-plated. Each states only its own holes, so they are summed
+            # and compared once. Checking each against the job total reported
+            # a perfect 8 + 1169 = 1177 as two failures.
+            per_file.append((entry["name"], len(sizes),
+                             sum(int(q) for _, _, q in sizes)))
 
         rows = re.findall(
             r"^\s*T(\d+)\s+[\d.]+\s*mil\s*\(([\d.]+)\s*mm\)\s+(\d+)",
@@ -1533,6 +1549,16 @@ def crosscheck(job: dict) -> list[dict]:
                 "stated": f"{want[0]:g} x {want[1]:g} mm",
                 "measured": f"{got[0]:.2f} x {got[1]:.2f} mm",
                 "agrees": all(abs(a - b) < 0.5 for a, b in zip(want, got))})
+
+    if per_file and drills:
+        stated = sum(n for _, _, n in per_file)
+        tools = sum(t for _, t, _ in per_file)
+        checks.append({
+            "what": f"{tools} drill tools across "
+                    f"{len(per_file)} drill report(s)",
+            "source": " + ".join(n for n, _, _ in per_file),
+            "stated": stated, "measured": drills["total"],
+            "agrees": stated == drills["total"]})
     return checks
 
 
