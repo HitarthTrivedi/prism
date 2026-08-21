@@ -860,13 +860,19 @@ def classify_copper(layer: GerberLayer, copper=None):
         return isl, []
     pads = [Point(pt) for _, pt in layer.flashes]
     tree = STRtree(pads)
-    conductors, markings = [], []
-    for g in isl:
-        hit = [int(i) for i in tree.query(g)]
-        if any(g.intersects(pads[i]) for i in hit):
-            conductors.append(g)
-        else:
-            markings.append(g)
+    # One vectorised `intersects` query for the whole layer. Per-island
+    # Python looping meant a big pour's bounding box pulled in thousands of
+    # pads and tested each against a complex polygon, one at a time.
+    try:
+        island_idx, _ = tree.query(isl, predicate="intersects")
+        with_pad = set(int(i) for i in island_idx.tolist())
+    except Exception:                           # pragma: no cover
+        with_pad = set()
+        for n, g in enumerate(isl):
+            if any(g.intersects(pads[int(i)]) for i in tree.query(g)):
+                with_pad.add(n)
+    conductors = [g for n, g in enumerate(isl) if n in with_pad]
+    markings = [g for n, g in enumerate(isl) if n not in with_pad]
     # A layer that is ALL markings by this test is a layer the test does not
     # understand — a plane with no flashed pads, say. Better to measure
     # everything and say so than to report nothing.
@@ -914,39 +920,66 @@ _REACH_MM = 2.0
 # fabrication tolerance.
 _SIMPLIFY_MM = 0.002
 
+# Above this many copper islands, the second (lettering-included) spacing
+# pass is skipped: it is disclosure rather than an answer, and it doubles
+# the cost of the only genuinely expensive step.
+_MARKINGS_LIMIT = 400
+
 
 def _nearest_pairs(isl: list, snap_mm: float) -> dict:
-    """Every neighbouring pair and the gap between them.
+    """For each copper island, its nearest neighbour and the gap between.
 
-    Vectorised: one bulk `dwithin` query for the candidates, then exact
-    distances on those alone. The obvious loop — buffer each island, query,
-    measure — is fine on a 250-island board and takes minutes on a 2,400-
-    island one, which is what a real 12-layer job turned out to be.
+    One vectorised `query_nearest` over simplified geometry. Everything
+    slower was tried on the way here: a Python loop buffering each island
+    (minutes on a 2,400-island layer), then a bulk `dwithin` followed by
+    exact distances on every candidate pair (27 seconds). This is 4, and
+    returns the same minimum.
+
+    Per-island nearest rather than every pair is also the better histogram:
+    it asks "how close is this piece of copper to anything else", once per
+    piece, instead of counting a crowded neighbourhood many times over.
     """
     simple = [g.simplify(_SIMPLIFY_MM, preserve_topology=True) for g in isl]
     tree = STRtree(simple)
     pairs: dict[tuple[int, int], float] = {}
-
-    reach = _REACH_MM
-    span = 1.0
-    for g in isl:
-        x0, y0, x1, y1 = g.bounds
-        span = max(span, x1 - x0, y1 - y0)
-
-    while True:
-        try:
-            left, right = tree.query(simple, predicate="dwithin", distance=reach)
-        except Exception:                       # older shapely: fall back
-            left, right = tree.query(
-                [g.buffer(reach) for g in simple], predicate="intersects")
+    try:
+        # Returns ((input_idx, tree_idx), distances) — a 2xN index array and
+        # a 1-D distance array, NOT three arrays. Unpacking it wrong raised
+        # ValueError, which the except below swallowed straight into the slow
+        # fallback: correct answers, six times the wall clock, and no sign
+        # anything was amiss.
+        idx, dist = tree.query_nearest(
+            simple, exclusive=True, all_matches=False, return_distance=True)
+        left, right = idx[0], idx[1]
         for i, j in zip(left.tolist(), right.tolist()):
             if i == j:
                 continue
             key = (i, j) if i < j else (j, i)
             if key not in pairs:
+                # Simplification found the pair; the ORIGINAL geometry gives
+                # the gap. Two microns of tolerance moved the reported
+                # minimum by one and a half, which is nothing to a fab and
+                # everything to a number pinned in a test.
                 pairs[key] = isl[i].distance(isl[j])
-        # A sparse board can have every gap wider than the reach — a chunky
-        # single-sided power board did. Grow until something is found.
+        return pairs
+    except Exception:                           # pragma: no cover
+        pass
+
+    # Fallback for a shapely without query_nearest.
+    span = 1.0
+    for g in isl:
+        x0, y0, x1, y1 = g.bounds
+        span = max(span, x1 - x0, y1 - y0)
+    reach = _REACH_MM
+    while True:
+        for i, geom in enumerate(simple):
+            for j in tree.query(geom.buffer(reach)):
+                j = int(j)
+                if j == i:
+                    continue
+                key = (i, j) if i < j else (j, i)
+                if key not in pairs:
+                    pairs[key] = isl[i].distance(isl[j])
         if pairs or reach > span:
             break
         reach *= 4
@@ -1323,12 +1356,17 @@ def analyse(paths: list[str], snap_mm: float = SNAP_MM, on_progress=None) -> dic
                 conductors, markings = classify_copper(layer, copper)
                 row["conductors"], row["markings"] = len(conductors), len(markings)
                 row["spacing"] = spacing(layer, snap_mm, conductors, copper)
-                if markings:
-                    # Keep the everything-included figure for disclosure. A
-                    # customer who asks "what about the printing?" gets an
-                    # answer instead of a shrug.
+                # The everything-included figure is disclosure, not an
+                # answer — a customer who asks "what about the printing?"
+                # gets a number instead of a shrug. It costs a second full
+                # neighbour search, which is nothing on a 250-island board
+                # and doubles a twelve-layer job. So it is skipped where it
+                # would be felt, and says so rather than going quiet.
+                if markings and len(islands(copper)) <= _MARKINGS_LIMIT:
                     allsp = spacing(layer, snap_mm, islands(copper), copper)
                     row["spacing"]["with_markings_mm"] = allsp.get("min_mm")
+                elif markings:
+                    row["spacing"]["with_markings_skipped"] = True
             except GerberError as e:
                 warnings.append(str(e))
             except Exception as e:                          # pragma: no cover
@@ -1683,7 +1721,11 @@ def summary_text(job: dict) -> str:
         if sp and sp.get("min_mm"):
             out.append(f"   minimum clearance {_fmt(sp['min_mm'])} "
                        f"across {sp['islands']} conductors")
-            if sp.get("with_markings_mm"):
+            if sp.get("with_markings_skipped"):
+                out.append("   (the lettering-included figure was skipped on "
+                           "this layer — too many pieces of copper for a "
+                           "second full pass; ask if you need it)")
+            elif sp.get("with_markings_mm"):
                 out.append(f"   (counting the lettering too it would be "
                            f"{_fmt(sp['with_markings_mm'])} — real copper, "
                            "not track spacing)")
