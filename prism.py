@@ -1198,7 +1198,7 @@ def cmd_gerber(cfg, arg: str, attachments: list):
         ui.info(f"📐  measuring {len(group)} file(s) — the design never leaves "
                 "this machine; no AI sees a Gerber.")
         try:
-            job = G.analyse(group)
+            job = G.analyse(group, on_progress=lambda m: ui.info(f"   {m}"))
         except G.GerberError as e:
             ui.err(str(e))
             continue

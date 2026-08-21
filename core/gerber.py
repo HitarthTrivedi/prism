@@ -177,6 +177,43 @@ _PLANE_ROLES = ("plane",)
 _ALL_COPPER = _COPPER_ROLES + _PLANE_ROLES
 
 
+# PADS and the older photoplotter houses name files by ROLE and LAYER
+# NUMBER, not by extension: art001.pho is copper layer 1, sm010128.pho is
+# the solder mask on layer 10. Two real jobs arrived this way and measured
+# nothing at all, because `.pho` means only "a photoplot" and every file
+# had it. The number matters as much as the prefix — 001 is the top side,
+# the highest is the bottom.
+_NAME_HINTS = (
+    (re.compile(r"^art0*(\d+)", re.I), "copper"),
+    (re.compile(r"^(?:l|lyr|layer)0*(\d+)$", re.I), "copper"),
+    (re.compile(r"^smd0*(\d+)", re.I), "paste"),
+    (re.compile(r"^(?:sm|mask)0*(\d+)", re.I), "mask"),
+    (re.compile(r"^sst0*(\d+)", re.I), "silk"),
+    (re.compile(r"^ssb0*(\d+)", re.I), "silk_bottom_forced"),
+    (re.compile(r"^ss0*(\d+)", re.I), "silk"),
+    (re.compile(r"^ad[bt]0*(\d+)", re.I), "mechanical"),
+    (re.compile(r"^dd0*(\d+)", re.I), "drill_drawing"),
+    (re.compile(r"^(?:drl|drill|nc)", re.I), "drill"),
+    (re.compile(r"^(?:pf|profile|outline|border|route)", re.I), "outline"),
+    (re.compile(r"paste", re.I), "paste"),
+    (re.compile(r"^gko|keepout", re.I), "outline"),
+)
+
+
+def _name_hint(name: str) -> tuple[str, int] | None:
+    """(family, layer number) from a role-and-number filename, or None."""
+    stem = os.path.splitext(name)[0]
+    for pattern, family in _NAME_HINTS:
+        m = pattern.match(stem)
+        if m:
+            try:
+                n = int(m.group(1))
+            except (IndexError, ValueError):
+                n = 0
+            return family, n
+    return None
+
+
 def _sniff(path: str) -> str:
     """What the file actually IS, read from its first few hundred bytes."""
     try:
@@ -189,6 +226,11 @@ def _sniff(path: str) -> str:
     if re.search(r"^M48\b", head, re.M) or re.search(r"^M7[12]\b", head, re.M):
         return "excellon"
     if re.search(r"^T\d+\b.*?[CF]\d", head, re.M) and re.search(r"^X[\d.+-]", head, re.M):
+        return "excellon"
+    # Some tools ship a drill with no M48 header at all — just `%` and then
+    # `T1C.008F0S0`. Reading only the header reported such a job as having
+    # no drill file, on a board with 3,104 holes.
+    if re.search(r"^T\d+\s*C\s*\.?\d", head, re.M):
         return "excellon"
     if re.search(r"Tool\s+Hole Size|NCDrill File Report|Aperture|Report For:"
                  r"|Generation Report|Layer Extension", head, re.I):
@@ -227,6 +269,16 @@ def classify(paths: list[str]) -> list[dict]:
             # away a role the extension already settled.
             role = "drill_binary" if role == "drill" else "other"
 
+        if role in ("unknown", "other") and kind == "gerber":
+            hint = _name_hint(os.path.basename(p))
+            if hint:
+                family, _ = hint
+                role = {"copper": "copper_inner", "mask": "mask_top",
+                        "silk": "silk_top", "paste": "paste_top",
+                        "silk_bottom_forced": "silk_bottom",
+                        "mechanical": "mechanical",
+                        "drill_drawing": "drill_drawing",
+                        "outline": "outline"}.get(family, role)
         out.append({
             "path": p,
             "name": os.path.basename(p),
@@ -235,8 +287,40 @@ def classify(paths: list[str]) -> list[dict]:
             "role": role,
             "label": _ROLE_LABEL.get(role, role),
             "size": os.path.getsize(p) if os.path.exists(p) else 0,
+            "hint": _name_hint(os.path.basename(p)),
         })
+    _resolve_numbered_layers(out)
     return out
+
+
+def _resolve_numbered_layers(entries: list[dict]) -> None:
+    """Turn `art001 … art012` into top, inner, inner … bottom.
+
+    Numbered-family exports say which SIDE a layer is on only by its
+    position in the run: the lowest number is the component side, the
+    highest the solder side, everything between is inner. Guessing per-file
+    cannot know that; it needs the whole job, which is why it happens here.
+    """
+    numbered: dict[str, list[dict]] = {}
+    for e in entries:
+        hint = e.get("hint")
+        if hint and hint[0] in ("copper", "mask", "silk", "paste"):
+            numbered.setdefault(hint[0], []).append(e)
+    for family, group in numbered.items():
+        group.sort(key=lambda e: e["hint"][1])
+        if len(group) < 2:
+            continue
+        first, last = group[0], group[-1]
+        roles = {"copper": ("copper_top", "copper_bottom"),
+                 "mask": ("mask_top", "mask_bottom"),
+                 "silk": ("silk_top", "silk_bottom"),
+                 "paste": ("paste_top", "paste_bottom")}[family]
+        if first["role"] in ("unknown", "other") or first["hint"]:
+            first["role"] = roles[0]
+        if last["role"] in ("unknown", "other") or last["hint"]:
+            last["role"] = roles[1]
+        for e in group:
+            e["label"] = _ROLE_LABEL.get(e["role"], e["role"])
 
 
 def _role_from_gerber_hint(path: str) -> str:
@@ -654,6 +738,16 @@ def layer_copper(layer: GerberLayer):
             "Size, track width and drill counts work without it.")
 
     def geom_for(kind, payload):
+        if kind == "path":
+            dcode, pts = payload
+            shape, params = layer.apertures.get(dcode, (None, []))
+            if not params:
+                return None
+            if shape == "C":
+                return LineString(pts).buffer(params[0] / 2, 8)
+            if shape in ("R", "O"):
+                return LineString(pts).buffer(min(params) / 2, 8, cap_style=3)
+            return None
         if kind == "draw":
             dcode, a, b = payload
             shape, params = layer.apertures.get(dcode, (None, []))
@@ -676,6 +770,24 @@ def layer_copper(layer: GerberLayer):
         except Exception:
             return None
 
+    # Consecutive segments of one trace are chained into a single polyline
+    # before buffering. A dense 12-layer board writes 187,674 segments where
+    # there are 69,885 actual traces, and unioning them one at a time took
+    # 22 seconds a layer against 9. It is also more correct: separately
+    # buffered segments can fail to overlap at a joint by a rounding error
+    # and split one trace into two islands.
+    ops: list = []
+    for kind, payload, is_dark in layer.ops:
+        if kind == "draw":
+            dcode, a, b = payload
+            if (ops and ops[-1][0] == "path" and ops[-1][2] == is_dark
+                    and ops[-1][1][0] == dcode and ops[-1][1][1][-1] == a):
+                ops[-1][1][1].append(b)
+                continue
+            ops.append(["path", (dcode, [a, b]), is_dark])
+        else:
+            ops.append([kind, payload, is_dark])
+
     copper = None
     run: list = []
     run_dark = True
@@ -689,7 +801,7 @@ def layer_copper(layer: GerberLayer):
             return merged if run_dark else None
         return target.union(merged) if run_dark else target.difference(merged)
 
-    for kind, payload, is_dark in layer.ops:
+    for kind, payload, is_dark in ops:
         g = geom_for(kind, payload)
         if g is None:
             continue
@@ -791,25 +903,53 @@ def track_widths(layer: GerberLayer, conductors=None) -> list[dict]:
     return sorted(stats.values(), key=lambda r: r["width_mm"])
 
 
+# Two shapes only need comparing if they are within this of each other. It
+# reaches past any sane design rule while keeping the search cheap.
+_REACH_MM = 2.0
+
+# Islands are simplified before the distance search. On a dense 12-layer
+# board one copper layer carries 380,000 vertices and the exact search took
+# 29 seconds; at 2 microns of tolerance it carries 134,000, takes 4, and
+# returns the identical minimum. Two microns is two orders below any
+# fabrication tolerance.
+_SIMPLIFY_MM = 0.002
+
+
 def _nearest_pairs(isl: list, snap_mm: float) -> dict:
-    """Every neighbouring pair and the gap between them."""
-    tree = STRtree(isl)
+    """Every neighbouring pair and the gap between them.
+
+    Vectorised: one bulk `dwithin` query for the candidates, then exact
+    distances on those alone. The obvious loop — buffer each island, query,
+    measure — is fine on a 250-island board and takes minutes on a 2,400-
+    island one, which is what a real 12-layer job turned out to be.
+    """
+    simple = [g.simplify(_SIMPLIFY_MM, preserve_topology=True) for g in isl]
+    tree = STRtree(simple)
+    pairs: dict[tuple[int, int], float] = {}
+
+    reach = _REACH_MM
     span = 1.0
     for g in isl:
         x0, y0, x1, y1 = g.bounds
         span = max(span, x1 - x0, y1 - y0)
-    pairs: dict[tuple[int, int], float] = {}
-    for i, geom in enumerate(isl):
-        reach = 2.0
-        while True:
-            found = [int(j) for j in tree.query(geom.buffer(reach)) if int(j) != i]
-            if found or reach > span:
-                break
-            reach *= 4
-        for j in found:
+
+    while True:
+        try:
+            left, right = tree.query(simple, predicate="dwithin", distance=reach)
+        except Exception:                       # older shapely: fall back
+            left, right = tree.query(
+                [g.buffer(reach) for g in simple], predicate="intersects")
+        for i, j in zip(left.tolist(), right.tolist()):
+            if i == j:
+                continue
             key = (i, j) if i < j else (j, i)
             if key not in pairs:
-                pairs[key] = geom.distance(isl[j])
+                pairs[key] = isl[i].distance(isl[j])
+        # A sparse board can have every gap wider than the reach — a chunky
+        # single-sided power board did. Grow until something is found.
+        if pairs or reach > span:
+            break
+        reach *= 4
     return pairs
 
 
@@ -1095,18 +1235,30 @@ def drill_from_gerber(layer: GerberLayer) -> dict:
 
 # ── the whole job ─────────────────────────────────────────────────────────────
 
-def analyse(paths: list[str], snap_mm: float = SNAP_MM) -> dict:
-    """Measure a job. Every number here came out of the geometry."""
+def analyse(paths: list[str], snap_mm: float = SNAP_MM, on_progress=None) -> dict:
+    """Measure a job. Every number here came out of the geometry.
+
+    `on_progress(message)` is called as each layer starts. A dense 12-layer
+    board takes minutes, and a terminal that prints nothing for that long
+    reads as a hang — the user kills it and reports the tool as broken.
+    """
+    def say(msg):
+        if on_progress:
+            try:
+                on_progress(msg)
+            except Exception:
+                pass
+
     if not paths:
         raise GerberError("No files given.")
     files = classify(paths)
     warnings: list[str] = []
     parsed: dict[str, GerberLayer] = {}
 
-    for entry in files:
-        if entry["kind"] != "gerber":
-            continue
+    gerbers = [e for e in files if e["kind"] == "gerber"]
+    for n, entry in enumerate(gerbers, 1):
         try:
+            say(f"reading {entry['name']}  ({n}/{len(gerbers)})")
             layer = parse_gerber(entry["path"])
             parsed[entry["path"]] = layer
             warnings.extend(layer.warnings)
@@ -1155,10 +1307,12 @@ def analyse(paths: list[str], snap_mm: float = SNAP_MM) -> dict:
 
     # ── copper ──
     copper_results = []
-    for entry in files:
-        if entry["role"] not in _COPPER_ROLES or entry["path"] not in parsed:
-            continue
+    to_measure = [e for e in files
+                  if e["role"] in _COPPER_ROLES and e["path"] in parsed]
+    for n, entry in enumerate(to_measure, 1):
         layer = parsed[entry["path"]]
+        say(f"measuring {entry['name']}  ({n}/{len(to_measure)}, "
+            f"{len(layer.draws)} traces)")
         row = {"name": entry["name"], "role": entry["role"], "widths": [],
                "min_width_mm": None, "spacing": None, "markings": 0,
                "conductors": 0, "widths_all": track_widths(layer)}
