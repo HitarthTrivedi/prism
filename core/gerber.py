@@ -272,6 +272,7 @@ class GerberLayer:
         self.source_unit = "mm"
         self.apertures: dict[int, tuple[str, list[float]]] = {}
         self.macros: set[str] = set()
+        self.macro_defs: dict[str, list[str]] = {}
         self.draws: list[tuple[int, tuple, tuple]] = []      # (dcode, a, b)
         self.arcs: list[tuple[int, tuple, tuple, tuple, int]] = []
         self.flashes: list[tuple[int, tuple]] = []
@@ -284,6 +285,7 @@ class GerberLayer:
         self.ops: list[tuple[str, object, bool]] = []
         self.has_step_repeat = False
         self.macro_flashes = 0
+        self.to_mm = 1.0
         self.warnings: list[str] = []
 
 
@@ -304,6 +306,7 @@ def parse_gerber(path: str) -> GerberLayer:
 
     layer.source_unit = "mm" if "%MOMM*%" in text else "in"
     to_mm = 1.0 if layer.source_unit == "mm" else MM_PER_INCH
+    layer.to_mm = to_mm
     scale = (10.0 ** -dec_digits) * to_mm
     width = int_digits + dec_digits
 
@@ -319,8 +322,12 @@ def parse_gerber(path: str) -> GerberLayer:
         value = int(digits) * scale
         return -value if neg else value
 
-    for am in re.finditer(r"%AM([^*]+)\*", text):
-        layer.macros.add(am.group(1).strip())
+    for am in re.finditer(r"%AM([^*]+)\*(.*?)%", text, re.S):
+        name = am.group(1).strip()
+        layer.macros.add(name)
+        layer.macro_defs[name] = [ln.strip().rstrip("*")
+                                  for ln in am.group(2).strip().splitlines()
+                                  if ln.strip().rstrip("*")]
     for ad in _APERTURE.finditer(text):
         dcode, shape, params = int(ad.group(1)), ad.group(2), ad.group(3)
         nums: list[float] = []
@@ -432,7 +439,7 @@ def parse_gerber(path: str) -> GerberLayer:
         elif d == "03":
             if dcode is not None:
                 shape = layer.apertures.get(dcode, ("", []))[0]
-                if shape not in ("C", "R", "O", "P"):
+                if shape not in ("C", "R", "O", "P") and shape not in layer.macro_defs:
                     layer.macro_flashes += 1
                 layer.flashes.append((dcode, (nx, ny)))
                 layer.ops.append(("flash", (dcode, (nx, ny)), dark))
@@ -497,9 +504,102 @@ def _arc_points(start, end, i, j, clockwise: bool, multiquadrant: bool):
 
 # ── geometry from a parsed layer ──────────────────────────────────────────────
 
-def aperture_shape(shape: str, params: list[float], at=(0.0, 0.0)):
-    """One flash as a polygon. None for anything macro-defined."""
-    if not HAVE_SHAPELY or not params:
+def macro_shape(body: list[str], args: list[float], to_mm: float, at=(0.0, 0.0)):
+    """Build a polygon from an aperture-macro definition.
+
+    A macro is a little program: a list of primitives, each `code,exposure,
+    …parameters`. Only the shapes that actually appear on copper are handled
+    — circle, outline, polygon, and the three line forms — because those are
+    what a rotated rectangular pad or an oval compiles to, and they account
+    for every macro on the real jobs seen so far. `$n` substitutes an
+    argument from the AD statement.
+
+    Returning None is honest and safe: the caller counts the flash and warns
+    that it took no part in the geometry. Guessing a shape would be neither.
+    """
+    if not HAVE_SHAPELY:
+        return None
+    x0, y0 = at
+    add, cut = [], []
+
+    def val(tok: str):
+        tok = tok.strip()
+        if tok.startswith("$"):
+            try:
+                return args[int(tok[1:]) - 1]
+            except (ValueError, IndexError):
+                raise ValueError(tok)
+        return float(tok)
+
+    for line in body:
+        if line.startswith("0") or line.startswith("$"):
+            continue                                # a comment, or an assignment
+        try:
+            nums = [val(t) for t in line.split(",")]
+        except ValueError:
+            return None                             # arithmetic — not handled
+        if len(nums) < 2:
+            continue
+        code, expose = int(nums[0]), nums[1]
+        try:
+            if code == 1:                           # circle
+                d, cx, cy = nums[2] * to_mm, nums[3] * to_mm, nums[4] * to_mm
+                g = Point(x0 + cx, y0 + cy).buffer(d / 2, 24)
+            elif code == 4:                         # outline
+                n = int(nums[2])
+                pts = [(x0 + nums[3 + 2 * i] * to_mm, y0 + nums[4 + 2 * i] * to_mm)
+                       for i in range(n + 1)]
+                g = Polygon(pts)
+                if not g.is_valid:
+                    g = g.buffer(0)
+            elif code == 5:                         # regular polygon
+                n = max(3, int(nums[2]))
+                cx, cy, d = nums[3] * to_mm, nums[4] * to_mm, nums[5] * to_mm
+                rot = math.radians(nums[6]) if len(nums) > 6 else 0.0
+                r = d / 2
+                g = Polygon([(x0 + cx + r * math.cos(rot + 2 * math.pi * k / n),
+                              y0 + cy + r * math.sin(rot + 2 * math.pi * k / n))
+                             for k in range(n)])
+            elif code in (2, 20):                   # vector line
+                w = nums[2] * to_mm
+                ax, ay = nums[3] * to_mm, nums[4] * to_mm
+                bx, by = nums[5] * to_mm, nums[6] * to_mm
+                g = LineString([(x0 + ax, y0 + ay), (x0 + bx, y0 + by)]) \
+                    .buffer(w / 2, 8, cap_style=2)
+            elif code in (21, 22):                  # centre / lower-left line
+                w, h = nums[2] * to_mm, nums[3] * to_mm
+                cx, cy = nums[4] * to_mm, nums[5] * to_mm
+                if code == 22:
+                    cx, cy = cx + w / 2, cy + h / 2
+                g = box(x0 + cx - w / 2, y0 + cy - h / 2,
+                        x0 + cx + w / 2, y0 + cy + h / 2)
+            elif code == 7:                         # thermal — outer ring
+                cx, cy = nums[2] * to_mm, nums[3] * to_mm
+                g = Point(x0 + cx, y0 + cy).buffer(nums[4] * to_mm / 2, 24)
+            else:
+                continue
+        except (IndexError, ValueError):
+            return None
+        rot = 0.0
+        if code == 4 and len(nums) > 3 + 2 * (int(nums[2]) + 1):
+            rot = nums[3 + 2 * (int(nums[2]) + 1)]
+        if rot:
+            from shapely.affinity import rotate
+            g = rotate(g, rot, origin=(x0, y0))
+        (add if expose else cut).append(g)
+    if not add:
+        return None
+    shape = unary_union(add)
+    if cut:
+        shape = shape.difference(unary_union(cut))
+    return None if shape.is_empty else shape
+
+
+def aperture_shape(shape: str, params: list[float], at=(0.0, 0.0), layer=None):
+    """One flash as a polygon. None only when the shape cannot be built."""
+    if not HAVE_SHAPELY:
+        return None
+    if not params and not (layer is not None and shape in layer.macro_defs):
         return None
     x, y = at
     if shape == "C":
@@ -515,6 +615,8 @@ def aperture_shape(shape: str, params: list[float], at=(0.0, 0.0)):
         if w >= h:
             return LineString([(x - (w / 2 - r), y), (x + (w / 2 - r), y)]).buffer(r, 16)
         return LineString([(x, y - (h / 2 - r)), (x, y + (h / 2 - r))]).buffer(r, 16)
+    if layer is not None and shape in layer.macro_defs:
+        return macro_shape(layer.macro_defs[shape], params, layer.to_mm, at)
     if shape == "P":
         d = params[0]
         sides = int(params[1]) if len(params) > 1 else 6
@@ -559,7 +661,7 @@ def layer_copper(layer: GerberLayer):
         if kind == "flash":
             dcode, at = payload
             shape, params = layer.apertures.get(dcode, (None, []))
-            return aperture_shape(shape, params, at) if params else None
+            return aperture_shape(shape, params, at, layer)
         try:
             poly = Polygon(payload)
             if not poly.is_valid:
@@ -815,23 +917,59 @@ def board_outline(layers: list[GerberLayer]) -> dict:
     return result
 
 
+_ROUT = re.compile(r"^(M15|M16|G0[123])\b", re.M)
+
+
 def excellon(path: str) -> dict:
-    """Parse a drill file. Returns tools in mm and a hit count per tool."""
+    """Parse a drill file. Returns tools in mm and a hit count per tool.
+
+    Excellon is chronically under-specified and every CAD tool leans on a
+    different convention, so three things are read rather than assumed:
+
+    · `;FILE_FORMAT=4:4` — a comment, and the only place some tools state
+      the coordinate format at all.
+
+    · LZ / TZ. `LZ` means leading zeros are PRESENT, so it is the trailing
+      ones that were dropped and the digits pad to the RIGHT. `TZ` is the
+      mirror. Reading it backwards scales every coordinate by a power of
+      ten, which looks like a different board rather than like a bug.
+
+    · `;TYPE=PLATED` / `;TYPE=NON_PLATED`. A job often ships plated and
+      non-plated holes as separate files, and both are holes the fab has to
+      drill. Reading only the first file found reported one real job as
+      having no holes at all.
+
+    A ROUT file is not a drill file. Board-edge routing is a milling path —
+    a tool tracing the outline with the spindle down — and counting its
+    coordinates as holes would have added hundreds of holes that nobody
+    drills. Detected and reported separately.
+    """
     text = open(path, "r", errors="replace").read()
     metric = bool(re.search(r"^(METRIC|M71)", text, re.M))
     to_mm = 1.0 if metric else MM_PER_INCH
 
-    # Coordinate format. Excellon is chronically under-specified; the header
-    # sometimes says, and when it doesn't the convention is 2.4 inch / 3.3
-    # metric with trailing zeros suppressed.
-    lead = bool(re.search(r"LZ\b", text))
-    dec = 4 if not metric else 3
-    fm = re.search(r"FMAT,(\d)", text)
-    if fm and fm.group(1) == "1":
-        dec = 3 if not metric else 3
+    fmt = re.search(r";?\s*FILE_FORMAT\s*=\s*(\d)\s*:\s*(\d)", text, re.I)
+    if fmt:
+        int_digits, dec = int(fmt.group(1)), int(fmt.group(2))
+    else:
+        int_digits, dec = (3, 3) if metric else (2, 4)
+
+    # LZ: leading zeros kept, trailing dropped -> pad right.
+    # TZ: trailing zeros kept, leading dropped -> pad left.
+    pad_right = True
+    if re.search(r"\bTZ\b", text):
+        pad_right = False
+    elif re.search(r"\bLZ\b", text):
+        pad_right = True
+
+    plated = None
+    if re.search(r";\s*TYPE\s*=\s*NON[_ ]?PLATED", text, re.I):
+        plated = False
+    elif re.search(r";\s*TYPE\s*=\s*PLATED", text, re.I):
+        plated = True
 
     tools: dict[int, float] = {}
-    for m in re.finditer(r"^T(\d+)(?:[^\nCX]*)C\s*([\d.]+)", text, re.M):
+    for m in re.finditer(r"^T(\d+)(?:[^\nCX;]*)C\s*([\d.]+)", text, re.M):
         try:
             tools[int(m.group(1))] = float(m.group(2)) * to_mm
         except ValueError:
@@ -840,32 +978,52 @@ def excellon(path: str) -> dict:
         raise GerberError(f"{os.path.basename(path)}: no tool table (T..C..) "
                           "found — this does not look like an Excellon drill file.")
 
+    body = text
+    if "%" in text:
+        body = text.split("%", 1)[1]
+    elif re.search(r"^M95\b", text, re.M):
+        body = re.split(r"^M95\b", text, maxsplit=1, flags=re.M)[1]
+
+    is_rout = bool(_ROUT.search(body)) or bool(
+        re.search(r"rout|mill|slot|profile", os.path.basename(path), re.I))
+
     def coord(raw: str) -> float:
         if "." in raw:
             return float(raw) * to_mm
         neg = raw.startswith("-")
         digits = raw.lstrip("+-")
-        width = 2 + dec if not metric else 3 + dec
-        digits = digits.rjust(width, "0") if lead else digits.ljust(width, "0")
+        width = int_digits + dec
+        digits = digits.ljust(width, "0") if pad_right else digits.rjust(width, "0")
         v = int(digits) * (10.0 ** -dec) * to_mm
         return -v if neg else v
 
     hits: dict[int, int] = {}
     positions: dict[int, list] = {}
     current: int | None = None
-    body = text
-    if "%" in text:
-        body = text.split("%", 1)[1]
-    elif re.search(r"^M95\b", text, re.M):
-        body = re.split(r"^M95\b", text, maxsplit=1, flags=re.M)[1]
+    routing = False
     for line in body.splitlines():
         line = line.strip()
+        if not line or line.startswith(";"):
+            continue
+        if line.startswith("M15"):          # spindle down: a cut, not a hole
+            routing = True
+            continue
+        if line.startswith("M16") or line.startswith("M17"):
+            routing = False
+            continue
         sel = re.fullmatch(r"T(\d+)", line)
         if sel:
             current = int(sel.group(1))
             continue
+        if line[:1] in ("G", "M"):
+            # G00 positions the head; G01/02/03 with the spindle down mill.
+            if re.match(r"^G0[123]\b", line):
+                routing = True
+            continue
         pos = re.match(r"^(?:X([+-]?[\d.]+))?(?:Y([+-]?[\d.]+))?", line)
         if line[:1] in ("X", "Y") and pos and (pos.group(1) or pos.group(2)):
+            if routing:
+                continue                    # a point on a milling path
             hits[current] = hits.get(current, 0) + 1
             if pos.group(1) and pos.group(2):
                 positions.setdefault(current, []).append(
@@ -873,11 +1031,40 @@ def excellon(path: str) -> dict:
             rep = re.search(r"R(\d+)", line)
             if rep:
                 hits[current] += int(rep.group(1))
-    used = [{"tool": t, "dia_mm": tools[t], "hits": hits.get(t, 0)}
-            for t in sorted(tools)]
+    used = [{"tool": t, "dia_mm": tools[t], "hits": hits.get(t, 0),
+             "plated": plated} for t in sorted(tools)]
     return {"tools": used, "total": sum(h for h in hits.values()),
             "positions": positions, "source": os.path.basename(path),
-            "as_gerber": False}
+            "as_gerber": False, "plated": plated, "is_rout": is_rout}
+
+
+def merge_drills(files: list[dict]) -> dict:
+    """One job, several drill files: plated, non-plated, and a rout path.
+
+    All of them are holes the fab drills, so all of them count. Tool numbers
+    collide between files (both start at T1), so the merged table is keyed by
+    DIAMETER, which is what a fab orders bits by anyway.
+    """
+    real = [f for f in files if not f["is_rout"]]
+    routs = [f for f in files if f["is_rout"]]
+    if not real:
+        real, routs = files, []
+    by_dia: dict[float, dict] = {}
+    for f in real:
+        for t in f["tools"]:
+            if not t["hits"]:
+                continue
+            row = by_dia.setdefault(round(t["dia_mm"], 4), {
+                "tool": t["tool"], "dia_mm": t["dia_mm"], "hits": 0,
+                "plated": t.get("plated")})
+            row["hits"] += t["hits"]
+            if row["plated"] is not None and t.get("plated") != row["plated"]:
+                row["plated"] = None            # both kinds at this size
+    tools = sorted(by_dia.values(), key=lambda r: r["dia_mm"])
+    return {"tools": tools, "total": sum(t["hits"] for t in tools),
+            "positions": {}, "as_gerber": False,
+            "source": ", ".join(f["source"] for f in real),
+            "rout_files": [f["source"] for f in routs]}
 
 
 def drill_from_gerber(layer: GerberLayer) -> dict:
@@ -1016,13 +1203,26 @@ def analyse(paths: list[str], snap_mm: float = SNAP_MM) -> dict:
 
     # ── drills ──
     drills = None
+    found = []
     for entry in files:
         if entry["role"] == "drill":
             try:
-                drills = excellon(entry["path"])
-                break
+                found.append(excellon(entry["path"]))
             except GerberError as e:
                 warnings.append(str(e))
+    if found:
+        drills = merge_drills(found) if len(found) > 1 else found[0]
+        if len(found) > 1:
+            kinds = []
+            for f in found:
+                kind = ("rout/milling path — not counted as holes" if f["is_rout"]
+                        else "plated" if f["plated"] else
+                        "non-plated" if f["plated"] is False else "holes")
+                kinds.append(f"{f['source']} ({kind}, {f['total']})")
+            warnings.append(
+                f"{len(found)} drill files in this job — all the drilled ones "
+                "are counted together, keyed by diameter because tool numbers "
+                "restart in each file: " + "; ".join(kinds))
     if drills is None:
         for entry in files:
             if entry["role"] == "drill_gerber" and entry["path"] in parsed:
@@ -1359,6 +1559,54 @@ def write_report_csv(job: dict, path: str) -> None:
                 w.writerow([row["name"], f"{wd['width_mm']:.4f}",
                             f"{mm_to_mil(wd['width_mm']):.1f}", wd["segments"],
                             f"{wd['length_mm'] / 1000:.3f}"])
+
+
+def split_jobs(paths: list[str]) -> list[tuple[str, list[str]]]:
+    """Group a flat file list into separate JOBS.
+
+    A folder handed over by a customer usually holds one board. A folder
+    the customer has been collecting into holds five, and measuring them as
+    one board produces a single confident answer that describes nothing —
+    the outline of one job, the drill count of all five, a minimum track
+    width from whichever board happened to be tightest. There is no error;
+    it just quietly answers the wrong question, which is the failure mode
+    this whole add-on keeps running into.
+
+    Two things separate jobs, and both are used: the folder a file sits in,
+    and the stem of its name. One CAM export shares a stem across every
+    layer — `BOARD-V2.GTL`, `BOARD-V2.GBL`, `BOARD-V2.TXT` — so two stems
+    with three or more fabrication files each are two jobs, even in one
+    folder.
+
+    Returns [(name, paths), ...]. A single job comes back as one entry, so
+    callers do not need a special case.
+    """
+    by_dir: dict[str, list[str]] = {}
+    for p in paths:
+        by_dir.setdefault(os.path.dirname(p), []).append(p)
+
+    jobs: list[tuple[str, list[str]]] = []
+    for folder, group in sorted(by_dir.items()):
+        stems: dict[str, list[str]] = {}
+        for p in group:
+            stem = os.path.splitext(os.path.basename(p))[0]
+            # A drill often drops a suffix the copper layers do not carry.
+            stem = re.sub(r"[-_ ]*(drill|drl|npth|pth|top|bot|copper)$", "",
+                          stem, flags=re.I).strip(" -_")
+            stems.setdefault(stem.lower(), []).append(p)
+        real = {k: v for k, v in stems.items() if len(v) >= 3}
+        if len(real) >= 2:
+            for stem, group_paths in sorted(real.items()):
+                jobs.append((stem, group_paths))
+            loose = [p for p in group
+                     if not any(p in v for v in real.values())]
+            if loose and jobs:
+                # Odd files with no family — a readme, a stray report. Give
+                # them to the first job rather than inventing a sixth.
+                jobs[-1] = (jobs[-1][0], jobs[-1][1] + loose)
+        else:
+            jobs.append((os.path.basename(folder) or "job", group))
+    return jobs
 
 
 def gather(paths: list[str]) -> list[str]:
