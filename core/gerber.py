@@ -136,6 +136,7 @@ _EXT_ROLE = {
     ".txt": "drill",   # overloaded — the content sniff decides (see classify)
     ".exc": "drill", ".drd": "drill",
     ".drr": "report", ".rep": "report", ".rpt": "report",
+    ".rul": "rules", ".extrep": "report", ".ldp": "report",
     ".apr": "aperture_list",
 }
 
@@ -157,6 +158,7 @@ _ROLE_LABEL = {
     "drill_drawing": "drill drawing (a human-readable picture of the holes)",
     "drill_guide": "drill guide (hole positions, often with the board outline)",
     "mechanical": "mechanical/documentation layer (dimensions, notes, fab drawing)",
+    "rules": "the designer's own DRC rules — what the board was ALLOWED to use",
     "report": "text report written by the CAM tool (human-readable summary)",
     "unknown": "unrecognised — content was checked, see notes",
     "aperture_list": "aperture list (the CAM tool's own D-code table)",
@@ -218,7 +220,11 @@ def classify(paths: list[str]) -> list[dict]:
                 role = _role_from_gerber_hint(p)
         elif kind == "report":
             role = "report"
-        elif kind == "other" and role not in ("report", "aperture_list"):
+        elif kind == "other" and role not in ("report", "aperture_list", "rules"):
+            # A .RUL is plain prose to the sniffer, but the extension is
+            # unambiguous and the file is the only place the designer's own
+            # limits are stated. Do not let "I do not recognise this" throw
+            # away a role the extension already settled.
             role = "drill_binary" if role == "drill" else "other"
 
         out.append({
@@ -1251,8 +1257,16 @@ def analyse(paths: list[str], snap_mm: float = SNAP_MM) -> dict:
             if r["spacing"] and r["spacing"]["min_mm"]]
     min_gap = min(gaps) if gaps else None
 
+    rules = design_rules(files)
+    if rules:
+        warnings.append(
+            f"{rules['source']} states the DESIGNER'S rules — what the board "
+            "was allowed to use, which is not what it actually uses. Both are "
+            "shown; the measured figure is the one that limits manufacture.")
+
     return {
         "files": files,
+        "rules": rules,
         "board": board,
         "copper": copper_results,
         "drills": drills,
@@ -1350,6 +1364,69 @@ def crosscheck_text(checks: list[dict]) -> str:
     return "\n".join(out)
 
 
+_RULE_LINE = re.compile(
+    r"RuleKind\s*=\s*(?P<kind>\w+)\s*\|"
+    r"\s*RuleName\s*=\s*(?P<name>[^|]*)\|"
+    r"[^\n]*?Minimum\s*=\s*(?P<min>[\d.]+)", re.I)
+
+# The board-wide rules, by name. A .RUL carries dozens of local exceptions
+# beside them — clearance to one ASIC, via to one plane — and the tightest of
+# those is not what the board was routed to.
+_RULE_WANTED = {
+    "width": "min_track_width_mm",
+    "clearance": "min_track_spacing_mm",
+    "holesize": "min_drill_mm",
+    "minimumannularring": "annular_ring_mm",
+}
+
+
+def design_rules(files: list[dict]) -> dict:
+    """What the DESIGNER said the board was allowed to use.
+
+    A `.RUL` file is the rulebook, not the board. It says "tracks may go as
+    thin as 3.94 mil"; the copper says "the thinnest actually drawn is 11.8".
+    Both are true and they answer different questions — a speed limit and a
+    radar reading.
+
+    This matters commercially, not academically. A fabricator who opens the
+    .RUL and quotes 3.94 against Prism's measured 11.8 sees a number three
+    times out and concludes the software is broken. Reporting both, side by
+    side, removes the argument before it starts.
+
+    Units are not declared in the file. Altium writes mil, and the values
+    give it away: 3.94, 7.87 and 4.92 are 0.1, 0.2 and 0.125 mm converted.
+    A genuinely metric export would be under 1, so that is the test, and the
+    assumption is reported rather than hidden.
+    """
+    out: dict = {}
+    for entry in files:
+        if entry["role"] != "rules":
+            continue
+        try:
+            text = open(entry["path"], "r", errors="replace").read()
+        except Exception:
+            continue
+        rows = list(_RULE_LINE.finditer(text))
+        if not rows:
+            continue
+        biggest = max(float(m.group("min")) for m in rows)
+        unit_is_mil = biggest > 2.0
+        scale = MM_PER_INCH / 1000.0 if unit_is_mil else 1.0
+        picked: dict = {}
+        for m in rows:
+            kind = m.group("kind").strip().lower()
+            name = m.group("name").strip().lower()
+            key = _RULE_WANTED.get(kind)
+            # Only the rule NAMED after its kind is the board-wide one.
+            if not key or name != kind:
+                continue
+            picked[key] = float(m.group("min")) * scale
+        if picked:
+            out = {"source": entry["name"],
+                   "unit": "mil" if unit_is_mil else "mm", **picked}
+    return out
+
+
 # ── presentation ──────────────────────────────────────────────────────────────
 
 def _pairs_at(copper_results: list, min_gap) -> int:
@@ -1383,6 +1460,15 @@ def _fmt(v, mil=True) -> str:
     return f"{v:.3f} mm ({mm_to_mil(v):.1f} mil)" if mil else f"{v:.3f} mm"
 
 
+def _rule_note(job: dict, key: str) -> str:
+    """`(design rule allows 3.94 mil)` — the limit beside the reading."""
+    rules = job.get("rules") or {}
+    allowed = rules.get(key)
+    if not allowed:
+        return ""
+    return f"   (design rule allows {mm_to_mil(allowed):.2f} mil)"
+
+
 def answers_text(job: dict) -> str:
     """The five numbers, and nothing else. This is what gets quoted from."""
     a = job["answers"]
@@ -1399,10 +1485,12 @@ def answers_text(job: dict) -> str:
     lines = [
         f"0. Copper layers        {layer_txt}",
         f"1. PCB size             {size}",
-        f"2. Min track width      {_fmt(a['min_track_width_mm'])}",
+        f"2. Min track width      {_fmt(a['min_track_width_mm'])}"
+        + _rule_note(job, "min_track_width_mm"),
         f"3. Min track spacing    {_fmt(a['min_track_spacing_mm'])}"
         + (f"   — {a['spacing_pairs_at_min']} place(s) on the board are this "
-           f"tight" if a.get("spacing_pairs_at_min") else ""),
+           f"tight" if a.get("spacing_pairs_at_min") else "")
+        + _rule_note(job, "min_track_spacing_mm"),
         f"4. Min drill size       {_fmt(a['min_drill_mm'])}",
         f"5. Number of drills     "
         f"{a['drill_count'] if a['drill_count'] is not None else 'not measured'}",
@@ -1531,6 +1619,18 @@ def write_report_csv(job: dict, path: str) -> None:
                     "smallest tool with at least one hit"])
         w.writerow(["drill_count", a["drill_count"] if a["drill_count"] is not None else "",
                     "holes", job["drills"]["source"] if job["drills"] else "", ""])
+        # The designer's stated limits, where the job ships them. Not the
+        # same question as the measurement above, and the note says so.
+        rules = job.get("rules") or {}
+        for key, label in (("min_track_width_mm", "rule_allows_track_width"),
+                           ("min_track_spacing_mm", "rule_allows_track_spacing"),
+                           ("min_drill_mm", "rule_allows_drill"),
+                           ("annular_ring_mm", "rule_min_annular_ring")):
+            if rules.get(key):
+                w.writerow([label, f"{rules[key]:.4f}", "mm", rules["source"],
+                            "what the DESIGN was allowed to use — not what it "
+                            "actually uses; the measured figure above is what "
+                            "limits manufacture"])
         w.writerow([])
         w.writerow(["drill_tool", "diameter_mm", "diameter_mil", "hits", ""])
         for t in (job["drills"]["tools"] if job["drills"] else []):
@@ -1646,7 +1746,8 @@ def write_summary_csv(jobs: list[tuple[str, dict]], path: str) -> None:
         w.writerow(["JOB", "LAYERS", "ROUTED", "PCB SIZE X (in)",
                     "PCB SIZE Y (in)", "PCB SIZE (mm)", "TRACK WIDTH (mil)",
                     "TRACK SPACING (mil)", "MIN DRILL SIZE (mil)",
-                    "TOTAL DRILL", "FILES", "CHECKED AGAINST"])
+                    "TOTAL DRILL", "RULE ALLOWS WIDTH (mil)",
+                    "RULE ALLOWS SPACING (mil)", "FILES", "CHECKED AGAINST"])
         for name, job in jobs:
             a = job["answers"]
             def m(v, dp=1):
@@ -1670,6 +1771,8 @@ def write_summary_csv(jobs: list[tuple[str, dict]], path: str) -> None:
                 m(a.get("min_track_spacing_mm")),
                 m(a.get("min_drill_mm"), 2),
                 a.get("drill_count", ""),
+                m((job.get("rules") or {}).get("min_track_width_mm"), 2),
+                m((job.get("rules") or {}).get("min_track_spacing_mm"), 2),
                 len(job["files"]),
                 verdict,
             ])
