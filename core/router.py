@@ -29,12 +29,50 @@ GROQ_URL = "https://api.groq.com/openai/v1/chat/completions"
 # nothing afterwards. Ordered by capability: routing is the most demanding
 # thing Prism asks a model to do, and a weaker one produces worse plans rather
 # than visible errors.
+# Verified against the live API on 18 Aug 2026 — every entry answered, and
+# every entry returned parseable JSON for a routing-shaped prompt. Do not add a
+# model to this tuple without checking BOTH: three of the four that used to be
+# here were dead, and the survivors are not interchangeable.
+#
+#   llama-3.3-70b-versatile   404, retired
+#   llama-3.1-8b-instant      404, retired
+#   gemma2-9b-it              400, decommissioned
+#
+# So the chain had one working model left and it was third, meaning every plan
+# paid for two failed round trips first, and one more retirement would have
+# stopped every customer planning anything.
+#
+# qwen/qwen3.6-27b is deliberately ABSENT although it answers. It is a
+# reasoning model that writes a <think> block into `content` — 1531 characters
+# of it for a prompt asking only for JSON — so routing would get a plan it
+# cannot parse. Answering is not the same as being usable.
+#
+# Note the reasoning models here put their working-out in a separate
+# `reasoning` field and can return EMPTY `content` if max_tokens runs out
+# first. Give them room; a short cap reads as "the model returned nothing".
 MODEL_FALLBACKS = (
-    "llama-3.3-70b-versatile",
-    "llama-3.1-8b-instant",
-    "openai/gpt-oss-120b",
-    "gemma2-9b-it",
+    "openai/gpt-oss-120b",      # largest; routing is the most demanding call
+    "openai/gpt-oss-20b",
+    "groq/compound-mini",
 )
+
+# Set from a licence-server payload, so a retirement is a database row rather
+# than a release every customer has to install. Empty until one arrives.
+_SERVED_CHAIN: list[str] = []
+
+
+def apply_model_chain(models) -> int:
+    """Replace the server-published model chain. Returns how many are in use.
+
+    Replace rather than merge: the payload is the whole intended list, so a
+    model dropped from it must stop being tried. Rubbish is ignored rather
+    than raising — a bad publish must not be able to stop Prism planning.
+    """
+    _SERVED_CHAIN.clear()
+    for name in (models or []):
+        if isinstance(name, str) and name.strip():
+            _SERVED_CHAIN.append(name.strip())
+    return len(_SERVED_CHAIN)
 
 # HTTP statuses worth trying again rather than surfacing. 429 is Groq's rate
 # limit, which a queue of tasks hits routinely on the free tier; 5xx is Groq
@@ -43,9 +81,16 @@ _RETRY_STATUS = (429, 500, 502, 503, 504)
 
 
 def model_chain(preferred: str = "") -> list[str]:
-    """The models to try, the caller's choice first and never duplicated."""
+    """The models to try, the caller's choice first and never duplicated.
+
+    A server-published chain, when there is one, comes before the built-in
+    tuple but still after the caller's own preference — the customer's setting
+    is theirs, and the payload exists to fix OUR stale list, not to override
+    what somebody deliberately chose.
+    """
     chain = [m for m in ([preferred] if preferred else []) if m]
-    chain += [m for m in MODEL_FALLBACKS if m not in chain]
+    for source in (_SERVED_CHAIN, MODEL_FALLBACKS):
+        chain += [m for m in source if m not in chain]
     return chain
 
 
