@@ -371,7 +371,12 @@ def check(cfg: dict, paths: Paths, *, state: State | None = None,
         return out
     out.fetched = len(messages)
 
+    # cfg["model"] is where a retired default gets replaced once a fallback
+    # answers — see router._remember_model. Leaving this at classify()'s own
+    # hardcoded default meant every check restarted from the dead model
+    # regardless of what had already been learned and saved to disk.
     verdicts = triage.classify(messages, api_key, knowledge=knowledge,
+                               model=cfg.get("model") or triage.FAST_MODEL,
                                local_only=local_only)
     out.counts = triage.summarise(verdicts)
     out.sorted_mail = list(zip(messages, verdicts))

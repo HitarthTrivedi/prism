@@ -326,8 +326,15 @@ def classify(messages: list[Message], api_key: str = "", *,
     if not pending or local_only or not api_key:
         return verdicts
 
+    from . import config as C
     from .router import groq_chat
 
+    # A retired model that dies on batch 1 was dying again on every batch
+    # after it, even though _remember_model had already written the fallback
+    # that worked to disk — this loop just never looked. `current` tracks
+    # what actually answered in THIS run, so it only pays the dead-model
+    # round trip once per check, not once per ten messages in the inbox.
+    current = model
     for start in range(0, len(pending), batch_size):
         chunk = pending[start:start + batch_size]
         batch = [messages[i] for i in chunk]
@@ -336,8 +343,9 @@ def classify(messages: list[Message], api_key: str = "", *,
         with checklog.stopwatch(f"AI sorting batch {batch_no} "
                                 f"({len(batch)} message(s))"):
             try:
-                reply = groq_chat(api_key, model, _prompt(batch),
+                reply = groq_chat(api_key, current, _prompt(batch),
                                   temperature=0.0, timeout=45)
+                current = C.load().get("model") or current
             except Exception as e:
                 checklog.line(f"batch {batch_no} failed: {e}")
                 ui.warn(f"Couldn't sort {len(batch)} message(s) automatically "
