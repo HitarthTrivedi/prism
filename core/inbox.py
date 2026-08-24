@@ -23,6 +23,7 @@ from __future__ import annotations
 
 import email
 import imaplib
+import time
 import os
 import re
 import ssl
@@ -30,6 +31,8 @@ from dataclasses import dataclass, field
 from email.header import decode_header, make_header
 from email.utils import getaddresses, parsedate_to_datetime
 from datetime import datetime, timedelta, timezone
+
+from . import checklog
 
 # Known providers → (imap host, port). Mirrors mailer._SMTP_HOSTS; 993 is the
 # SSL port and effectively universal — plaintext 143 is not offered at all.
@@ -517,10 +520,14 @@ def fetch_new(cfg: dict, state: State | None = None, *, limit: int = MAX_PER_FET
         return [], state or State(), "No mail account is set up for reading yet."
 
     state = state or State()
+    address = ic.get("address", "")
+    checklog.line(f"checking {address}")
     try:
-        conn = _connect(ic, timeout=timeout)
+        with checklog.stopwatch(f"connecting to {ic.get('host', '')}"):
+            conn = _connect(ic, timeout=timeout)
     except Exception as e:
-        return [], state, explain_error(str(e), ic.get("address", ""))
+        checklog.line(f"connect failed: {e}")
+        return [], state, explain_error(str(e), address)
 
     folder = ic.get("folder") or "INBOX"
     try:
@@ -528,6 +535,7 @@ def fetch_new(cfg: dict, state: State | None = None, *, limit: int = MAX_PER_FET
         # flags. The owner reads the same mailbox in Outlook.
         typ, data = conn.select(folder, readonly=True)
         if typ != "OK":
+            checklog.line(f"couldn't open '{folder}'")
             return [], state, f"Couldn't open the '{folder}' folder."
 
         validity = _uidvalidity(conn)
@@ -539,31 +547,61 @@ def fetch_new(cfg: dict, state: State | None = None, *, limit: int = MAX_PER_FET
             # rather than re-importing years of mail as new inquiries.
             new_state.last_uid = 0
 
-        uids = _search(conn, new_state.last_uid, first_days if fresh_start else 0)
+        window = first_days if fresh_start else 0
+        if fresh_start:
+            checklog.line(
+                f"first check on this mailbox — searching the last "
+                f"{window or FIRST_FETCH_DAYS} days, not the whole history")
+        uids = _search(conn, new_state.last_uid, window)
         if not uids:
+            checklog.line("nothing new")
             return [], new_state, ""
 
         # Oldest first, so the register fills in the order things happened, and
         # so a truncated batch leaves the bookmark somewhere sensible.
         uids.sort()
         clipped = uids[:limit]
+        if len(uids) > limit:
+            checklog.line(
+                f"{len(uids)} messages match — fetching the oldest {limit} "
+                "this run; the rest come on the next check")
+        else:
+            checklog.line(f"{len(clipped)} message(s) to fetch")
 
+        # Each one is a SEPARATE round trip to the server, full body and
+        # attachments included (BODY.PEEK[] — see _fetch_one), and imaplib
+        # has no way to pipeline several at once. A test mailbox with 2
+        # messages is instant; a real inbox with 30 days of history and a
+        # slow or distant IMAP server can genuinely take minutes on the
+        # very first check, one message at a time, with nothing to show for
+        # it on screen until the whole batch finishes. This is that "nothing
+        # to show" — logged per message instead.
         messages = []
-        for uid in clipped:
+        t0 = time.monotonic()
+        for i, uid in enumerate(clipped, 1):
             raw = _fetch_one(conn, uid)
             if raw is None:
+                checklog.line(f"  [{i}/{len(clipped)}] uid {uid} — server "
+                              "returned nothing, skipped")
                 continue
             try:
                 messages.append(parse_message(raw, uid))
-            except Exception:
+                checklog.line(f"  [{i}/{len(clipped)}] uid {uid} — "
+                              f"{len(raw)} bytes")
+            except Exception as e:
                 # One unparseable message must not stop the other 40. It stays
                 # unread in their real mail client, which is the safe failure.
+                checklog.line(f"  [{i}/{len(clipped)}] uid {uid} — could not "
+                              f"be read as a message, skipped ({e})")
                 continue
+        checklog.line(f"fetched {len(messages)}/{len(clipped)} in "
+                      f"{time.monotonic() - t0:.1f}s")
         if clipped:
             new_state.last_uid = max(new_state.last_uid, max(clipped))
         return messages, new_state, ""
     except Exception as e:
-        return [], state, explain_error(str(e), ic.get("address", ""))
+        checklog.line(f"fetch failed: {e}")
+        return [], state, explain_error(str(e), address)
     finally:
         _hangup(conn)
 

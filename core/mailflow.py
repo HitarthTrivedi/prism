@@ -347,6 +347,9 @@ def check(cfg: dict, paths: Paths, *, state: State | None = None,
     inbox costs one AI call for the handful of genuinely new correspondents
     rather than one per message.
     """
+    from . import checklog
+    checklog.line("── Check my mail — starting ──")
+    t0 = __import__("time").monotonic()
     today = today or date.today()
     api_key = (cfg or {}).get("api_key", "")
     # local_only has to mean every AI call on message content, not just the
@@ -363,6 +366,7 @@ def check(cfg: dict, paths: Paths, *, state: State | None = None,
     messages, new_state, error = inbox.fetch_new(cfg, state)
     out.state = new_state
     if error:
+        checklog.line(f"stopped: {error}")
         out.error = error
         return out
     out.fetched = len(messages)
@@ -446,6 +450,10 @@ def check(cfg: dict, paths: Paths, *, state: State | None = None,
                                                max_reminders=max_reminders,
                                                today=today)
     out.sops = _sops_due(paths, today)
+    checklog.line(f"── done in {__import__('time').monotonic() - t0:.1f}s — "
+                  f"{out.fetched} fetched, "
+                  f"{len(out.new_inquiries)} new inquiry(ies), "
+                  f"{len(out.orders)} order(s), {len(out.replies)} reply(ies) ──")
     return out
 
 

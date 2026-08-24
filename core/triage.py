@@ -313,10 +313,16 @@ def classify(messages: list[Message], api_key: str = "", *,
     anyway. Sorting is a convenience; nothing downstream may depend on it
     having succeeded.
     """
+    from . import checklog
     knowledge = knowledge or Knowledge()
     verdicts = [rules_pass(m, knowledge) for m in messages]
 
     pending = [i for i, v in enumerate(verdicts) if v.category == UNSORTED]
+    checklog.line(f"sorting: {len(messages) - len(pending)} placed by local "
+                  f"rules, {len(pending)} sent to the AI"
+                  if pending else
+                  f"sorting: all {len(messages)} placed by local rules — "
+                  "no AI call needed")
     if not pending or local_only or not api_key:
         return verdicts
 
@@ -325,13 +331,18 @@ def classify(messages: list[Message], api_key: str = "", *,
     for start in range(0, len(pending), batch_size):
         chunk = pending[start:start + batch_size]
         batch = [messages[i] for i in chunk]
-        try:
-            reply = groq_chat(api_key, model, _prompt(batch),
-                              temperature=0.0, timeout=45)
-        except Exception as e:
-            ui.warn(f"Couldn't sort {len(batch)} message(s) automatically "
-                    f"— they're listed as unsorted. ({e})")
-            continue
+        batch_no = start // batch_size + 1
+        reply = None
+        with checklog.stopwatch(f"AI sorting batch {batch_no} "
+                                f"({len(batch)} message(s))"):
+            try:
+                reply = groq_chat(api_key, model, _prompt(batch),
+                                  temperature=0.0, timeout=45)
+            except Exception as e:
+                checklog.line(f"batch {batch_no} failed: {e}")
+                ui.warn(f"Couldn't sort {len(batch)} message(s) automatically "
+                        f"— they're listed as unsorted. ({e})")
+                continue
         answers = parse_answers(reply, len(batch))
         for position, index in enumerate(chunk, 1):
             category = answers.get(position)
