@@ -1226,23 +1226,7 @@ def cmd_gerber(cfg, arg: str, attachments: list):
                 "  /gerber <path> reply to the customer with our price for 500 pieces")
         return
 
-    a = job["answers"]
-    brief = (
-        f"{context}\n\n"
-        "These figures were MEASURED from the customer's Gerber files by "
-        "Prism, on our own machine. Use them exactly as given — do not "
-        "recalculate, round differently, or invent any number that is not "
-        "here. The Gerber files themselves are confidential and are NOT "
-        "attached.\n\n"
-        f"  PCB size            {a['pcb_size']}\n"
-        f"  Min track width     {G._fmt(a['min_track_width_mm'])}\n"
-        f"  Min track spacing   {G._fmt(a['min_track_spacing_mm'])}\n"
-        f"  Min drill size      {G._fmt(a['min_drill_mm'])}\n"
-        f"  Number of drills    {a['drill_count']}\n")
-    if job["warnings"]:
-        brief += ("\nCaveats that must be repeated to the customer if they "
-                  "affect the answer:\n  - "
-                  + "\n  - ".join(job["warnings"]) + "\n")
+    brief = G.agent_brief(job, context)
     ui.info("🔒  Only the numbers above go to the agent. The Gerber files stay here.")
     run_query(cfg, brief, dry=False, attachments=[])
 

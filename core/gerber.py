@@ -1687,6 +1687,37 @@ def _rule_note(job: dict, key: str) -> str:
     return f"   (design rule allows {mm_to_mil(allowed):.2f} mil)"
 
 
+def agent_brief(job: dict, context: str = "") -> str:
+    """The instruction handed to a writing agent — numbers, never a file.
+
+    This is the one place this text is built. Both the terminal's /gerber and
+    the GUI's dialog call it, so a security-critical sentence like "the
+    Gerber files themselves are confidential and are NOT attached" cannot
+    drift into being worded — or omitted — differently in one of the two.
+    """
+    a = job["answers"]
+    text = (
+        f"{context}\n\n" if context else
+        "Reply with the measured figures below.\n\n"
+    ) + (
+        "These figures were MEASURED from the customer's Gerber files by "
+        "Prism, on our own machine. Use them exactly as given — do not "
+        "recalculate, round differently, or invent any number that is not "
+        "here. The Gerber files themselves are confidential and are NOT "
+        "attached.\n\n"
+        f"  PCB size            {a['pcb_size']}\n"
+        f"  Min track width     {_fmt(a['min_track_width_mm'])}\n"
+        f"  Min track spacing   {_fmt(a['min_track_spacing_mm'])}\n"
+        f"  Min drill size      {_fmt(a['min_drill_mm'])}\n"
+        f"  Number of drills    {a['drill_count']}\n"
+    )
+    if job["warnings"]:
+        text += ("\nCaveats that must be repeated to the customer if they "
+                 "affect the answer:\n  - "
+                 + "\n  - ".join(job["warnings"]) + "\n")
+    return text
+
+
 def answers_text(job: dict) -> str:
     """The five numbers, and nothing else. This is what gets quoted from."""
     a = job["answers"]
