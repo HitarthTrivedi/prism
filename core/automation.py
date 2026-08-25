@@ -355,6 +355,63 @@ def _prune_preferences() -> None:
         pass
 
 
+def _ensure_session_restore() -> None:
+    """Keep session-only login cookies alive across a full Prism restart.
+
+    Some tools (Kimi included) sign you in with a cookie that has no
+    Expires/Max-Age — a "session cookie". Chrome deletes those the moment the
+    browser process ends, UNLESS the profile's startup setting is "Continue
+    where you left off" rather than the default "Open the New Tab page". The
+    browser stays open across runs within one Prism session (nothing here
+    calls driver.quit() until the app itself quits — see shutdown()), so this
+    only bites after a full restart: everything else in the profile persisted
+    fine, but a tool using a session cookie silently needs a fresh login.
+    """
+    import json
+    path = os.path.join(PROFILE_DIR, "Default", "Preferences")
+    try:
+        with open(path) as f:
+            prefs = json.load(f)
+    except (OSError, ValueError):
+        prefs = {}
+    if prefs.get("session", {}).get("restore_on_startup") == 1:
+        return
+    prefs.setdefault("session", {})["restore_on_startup"] = 1
+    try:
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        tmp = path + ".restore-pref"
+        with open(tmp, "w") as f:
+            json.dump(prefs, f, separators=(",", ":"))
+        os.replace(tmp, path)
+    except OSError:
+        pass
+
+
+def _reset_to_blank_tab(driver) -> None:
+    """Collapse a restored session back down to the single blank tab the
+    pipeline expects a fresh launch to have.
+
+    _ensure_session_restore() sets "Continue where you left off" so
+    session-only login cookies survive a restart — but that setting also
+    makes Chrome reopen every tab left over from the last time Prism quit,
+    and stage one relies on a freshly launched browser opening on exactly
+    one blank tab (see `first_tab` in run())."""
+    handles = driver.window_handles
+    if len(handles) <= 1:
+        return
+    for h in handles[1:]:
+        try:
+            driver.switch_to.window(h)
+            driver.close()
+        except Exception:
+            pass
+    try:
+        driver.switch_to.window(handles[0])
+        driver.get("about:blank")
+    except Exception:
+        pass
+
+
 def _uc_cache_dir() -> str:
     """Where undetected-chromedriver keeps the driver it patched last time.
 
@@ -388,6 +445,7 @@ def _setup_chrome_driver(version_main=None, reseed: bool = False):
                 "between runs)")
     _clear_profile_locks()
     _prune_preferences()
+    _ensure_session_restore()
     tmp = PROFILE_DIR
 
     opts = uc.ChromeOptions()
@@ -456,8 +514,10 @@ def _setup_chrome_driver(version_main=None, reseed: bool = False):
                     pass
 
     try:
-        return uc.Chrome(options=opts, user_data_dir=tmp,
-                         version_main=version_main)
+        drv = uc.Chrome(options=opts, user_data_dir=tmp,
+                        version_main=version_main)
+        _reset_to_blank_tab(drv)
+        return drv
     except Exception as e:
         # Chrome updates itself about monthly, and for a day or two after a
         # major release there may be no matching driver to download — as there
@@ -1889,8 +1949,16 @@ def run(routing: dict, cfg: dict, attachments=None, on_event=None,
     # rules for that stage.
     machine_stages: dict[int, str] = {}
     if studio_at is not None:
+        # The stage that actually WRITES the reel — content's job by
+        # PIPELINE_ORDER's own description ("copy, docs, scripts"), brains
+        # the fallback this function's own warning below already promises.
+        # Not "whichever non-local stage sits closest to studio": visual
+        # routinely sits between content and media/studio, and asking visual
+        # — an image-direction stage, not a script one — to also carry the
+        # script instructions left the actual script (which content wrote
+        # correctly) stuck in prose with nothing to turn it into JSON.
         writer = next((i for i in range(studio_at - 1, -1, -1)
-                       if not (A.resolve_agent("", stages[i][1]) or {}).get("local")),
+                       if stages[i][0] in ("content", "brains")),
                       None)
         if writer is None:
             ui.warn("Prism Studio has no writing stage before it — turn on "
@@ -2012,8 +2080,12 @@ def run(routing: dict, cfg: dict, attachments=None, on_event=None,
                          None)
     spec_feeder = None      # stage index that must answer in JSON, not prose
     if local_reel_at is not None:
+        # Same fix as the Studio writer above, same reason: content is the
+        # stage that writes the script (visual only ever describes imagery),
+        # so search for content/brains specifically rather than accepting
+        # whatever non-local stage happens to sit nearest to media.
         feeder = next((i for i in range(local_reel_at - 1, -1, -1)
-                       if not (A.resolve_agent("", stages[i][1]) or {}).get("local")),
+                       if stages[i][0] in ("content", "brains")),
                       None)
         if feeder is None:
             ui.warn("Prism Reel has no writing stage before it — turn on content "
@@ -2400,8 +2472,14 @@ def run(routing: dict, cfg: dict, attachments=None, on_event=None,
                             textarea.send_keys(Keys.ENTER)
 
                         if idx < len(questions):
-                            # Let this answer finish before sending the next prompt.
-                            _smart_wait(driver, agent_cfg, 120)
+                            # Let this answer finish before sending the next
+                            # prompt. should_stop was missing here, unlike the
+                            # identical call below for the stage's final wait
+                            # — Stop went unpolled for up to 120s per gap in a
+                            # multi-prompt stage, which is where "Stop takes
+                            # minutes" was coming from.
+                            _smart_wait(driver, agent_cfg, 120,
+                                       should_stop=should_stop)
                     except Exception as e:
                         ui.err(f"   prompt error: {e}")
 
@@ -2547,9 +2625,19 @@ def run(routing: dict, cfg: dict, attachments=None, on_event=None,
                 # actually parses (the spec is often shorter than the prose
                 # around it), and if none does, ask once more in the same tab
                 # before the run reaches the renderer with nothing to draw.
-                if stage_idx == spec_feeder and texts:
+                #
+                # `texts` can be empty here even though the tab is still very
+                # much alive — a spec is long, and the base wait above is
+                # sized for an ordinary reply, not one that is also rendering
+                # a DALL-E image on the side. Gating this whole block on
+                # `and texts` meant that exact case — nothing captured yet,
+                # tool still typing — skipped the one retry that exists for
+                # it and fell straight through to the renderer with nothing
+                # to draw, instead of asking again in the tab that was right
+                # there.
+                if stage_idx == spec_feeder:
                     from . import reel as _reel
-                    spec_texts = [t for t in texts if _reel.has_spec(t)]
+                    spec_texts = [t for t in texts if _reel.has_spec(t)] if texts else []
                     if spec_texts:
                         # LAST, not longest: the prompt we typed carries an
                         # example spec, so "biggest thing that parses" can be
@@ -2591,8 +2679,14 @@ def run(routing: dict, cfg: dict, attachments=None, on_event=None,
                                     ui.info("   the second attempt was no "
                                             "better — keeping the first")
                     else:
-                        ui.warn(f"{agent_name} wrote about the reel instead of "
-                                "writing the spec — asking again for JSON only")
+                        if texts:
+                            ui.warn(f"{agent_name} wrote about the reel instead "
+                                    "of writing the spec — asking again for "
+                                    "JSON only")
+                        else:
+                            ui.warn(f"{agent_name} was still writing when "
+                                    "Prism stopped waiting — asking again for "
+                                    "JSON only")
                         emit("retry", {"stage": stage, "reason": "no scene spec"})
                         again = _reask(
                             driver, agent_cfg,

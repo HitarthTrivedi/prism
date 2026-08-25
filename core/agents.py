@@ -81,7 +81,7 @@ CATEGORIES = {
         # Perplexity earns a place for the "no-hallucination" half of this
         # category — source-cited factual copy — not for creative marketing.
         "agents": ["Jasper", "Copy.ai", "Kimi 2.6", "Writesonic", "Claude",
-                   "Perplexity", "LAZYCOOK"],
+                   "ChatGPT", "Perplexity", "LAZYCOOK"],
     },
     "visual": {
         "label": "Visual & Image",
