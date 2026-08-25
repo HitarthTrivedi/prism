@@ -22,7 +22,7 @@ import re
 from dataclasses import dataclass, field
 from datetime import date
 
-from . import inbox, register, sop, triage, ui
+from . import inbox, register, sop, triage, ui, worklist
 from .inbox import Message, State
 
 # Sub-folders under the company folder. Flat, obvious names — the owner will
@@ -44,6 +44,10 @@ class Paths:
     @property
     def register_csv(self) -> str:
         return os.path.join(self.root, register.FILENAME)
+
+    @property
+    def worklist_json(self) -> str:
+        return os.path.join(self.root, worklist.FILENAME)
 
     @property
     def sops(self) -> str:
