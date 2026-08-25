@@ -1,88 +1,175 @@
 """
-Prism — the pending-work file
-──────────────────────────────
-Three of the working dialog's tabs — what arrived, replies, purchase orders —
-used to show only what the LAST check happened to find. Each check's result
-was held in memory and nowhere else, so the moment the inbox's own read
-bookmark moved past a message, whatever had been shown for it was gone —
-switching tabs, or simply reopening the dialog the next morning, was enough
-to lose a customer's reply that still needed an answer, or a purchase order
-nobody had accepted yet.
+Prism — the pending-work files
+───────────────────────────────
+The working dialog's tabs used to show only what the LAST check happened to
+find. Each check's result was held in memory and nowhere else, so the moment
+the inbox's own read bookmark moved past a message, whatever had been shown
+for it was gone — switching tabs, or simply reopening the dialog the next
+morning, was enough to lose a customer's reply that still needed an answer,
+or a purchase order nobody had accepted yet.
 
-This is the fix: one JSON file per inquiry folder, appended to every time a
-check finds something, and read back every time a tab needs to draw itself —
-so what is on screen is never just "since the last check", it is "everything
-that has not been dealt with yet", however many checks ago it arrived.
+This is the fix: one plain JSON file per section, inside a `worklist/`
+folder next to the register, appended to every time a check finds something
+(or Prism sends something) and read back every time a tab needs to draw
+itself — so what is on screen is never just "since the last check", it is
+"everything that has not been dealt with yet", however many checks ago it
+arrived. The owner asked for exactly this — "a file for every section and
+every phase" — and one file per section is also what makes the folder
+readable by eye: open `replies.json` and it is the replies, nothing else.
 
-Three lists, one per tab:
+    <inquiry folder>/worklist/
+        arrived.json    every mail Prism sorted — a permanent log; nothing
+                        here is ever "done", it exists so a sender can be
+                        found again next week, not just glimpsed once
+        replies.json    a customer's answer to a quotation — resolved once
+                        it is applied to the register
+        orders.json     a purchase order read off the mail — resolved once
+                        it is accepted or otherwise dealt with
+        sent.json       every mail Prism sent on the owner's behalf — a
+                        quotation, a reminder, a win-back — so "Waiting on a
+                        reply" can say "reminder sent 24-08, 25-08" instead
+                        of just a count
 
-  · "arrived"  — every sorted message, kept as a permanent log (nothing here
-    is ever "done"; it exists so a customer's mail can be found again next
-    week, not just glimpsed once).
-  · "replies"  — a customer's answer to a quotation, cleared once you apply
-    it to the register.
-  · "orders"   — a purchase order read off the mail, cleared once you accept
-    or otherwise deal with it.
+An older Prism kept all of this in one `worklist.json`. migrate() folds that
+file into the four above the first time anything reads the folder, and
+leaves the original behind as `worklist.json.bak` — never deleted, never
+rewritten, because it might be the only copy of something.
 
-Written atomically, same discipline as register.py: a crash mid-write must
-never truncate the only record of what still needs a reply.
+Every write is atomic, same discipline as register.py: a crash mid-write
+must never truncate the only record of what still needs a reply.
 """
 from __future__ import annotations
 
 import json
 import os
+import uuid
+from datetime import datetime
 
-FILENAME = "worklist.json"
-KINDS = ("arrived", "replies", "orders")
+DIRNAME = "worklist"
+LEGACY_FILENAME = "worklist.json"
+# Kept under its old name too: mailflow.Paths.worklist_json still points at
+# the legacy file, which is exactly the path migrate() needs to find it.
+FILENAME = LEGACY_FILENAME
 
-# "arrived" never resolves — it is a log, not a todo list — so without a cap
-# it would grow forever. This is generous: a mailbox doing a few hundred
-# messages a month takes years to reach it. Only unresolved rows are ever
-# eligible for trimming in "replies"/"orders" — an unread purchase order from
-# three weeks ago is exactly the row this file exists to keep from vanishing,
-# so it is never trimmed for being old, only for being long since resolved.
+KINDS = ("arrived", "replies", "orders", "sent")
+# Logs never resolve — there is nothing to "deal with" about a mail that was
+# sorted, or one that was sent — so they carry no resolved flag and are
+# trimmed only by an outright cap. "replies" and "orders" are todo lists:
+# only rows long since resolved are ever eligible for trimming there. An
+# unread purchase order from three weeks ago is exactly the row this folder
+# exists to keep from vanishing, so it is never trimmed for being old.
+LOG_KINDS = ("arrived", "sent")
 ARRIVED_KEEP = 5000
+SENT_KEEP = 5000
 RESOLVED_KEEP = 500
 
 
+# ── where things are ──────────────────────────────────────────────────────────
+
+def dir_in(folder: str) -> str:
+    return os.path.join(folder, DIRNAME)
+
+
+def path_for(folder: str, kind: str) -> str:
+    if kind not in KINDS:
+        raise ValueError(f"unknown worklist kind {kind!r}")
+    return os.path.join(dir_in(folder), f"{kind}.json")
+
+
 def path_in(folder: str) -> str:
-    return os.path.join(folder, FILENAME)
+    """The pre-folder single file. Only migrate() has a reason to want it."""
+    return os.path.join(folder, LEGACY_FILENAME)
 
 
 def _blank() -> dict:
-    return {"arrived": [], "replies": [], "orders": []}
+    return {kind: [] for kind in KINDS}
 
 
-def load(folder: str) -> dict:
-    """The whole file, or an empty one if it has never been written — a
-    mailbox nobody has checked yet is not an error."""
-    path = path_in(folder)
+# ── reading and writing one kind ──────────────────────────────────────────────
+
+def _read_kind(folder: str, kind: str) -> list[dict]:
+    path = path_for(folder, kind)
     if not os.path.exists(path):
-        return _blank()
+        return []
     try:
         with open(path, "r", encoding="utf-8") as f:
-            data = json.load(f)
+            rows = json.load(f)
     except (OSError, ValueError):
-        return _blank()
-    out = _blank()
-    for kind in KINDS:
-        rows = data.get(kind)
-        out[kind] = rows if isinstance(rows, list) else []
-    return out
+        return []
+    return rows if isinstance(rows, list) else []
 
 
-def save(folder: str, data: dict) -> None:
-    """Atomic, like register.py's — this file is the only record of a
-    reply or a purchase order that has not been dealt with yet."""
-    os.makedirs(folder, exist_ok=True)
-    path = path_in(folder)
+def _write_kind(folder: str, kind: str, rows: list[dict]) -> None:
+    """Atomic: written beside, fsync'd, then swapped in — the only record of
+    a reply nobody has answered yet must never be half a file."""
+    os.makedirs(dir_in(folder), exist_ok=True)
+    path = path_for(folder, kind)
     tmp = f"{path}.tmp"
     with open(tmp, "w", encoding="utf-8") as f:
-        json.dump(data, f, indent=2, ensure_ascii=False)
+        json.dump(rows, f, indent=2, ensure_ascii=False)
         f.flush()
         os.fsync(f.fileno())
     os.replace(tmp, path)
 
+
+def load(folder: str) -> dict:
+    """Every section, or empty lists for a folder nothing has been written
+    to yet — a mailbox nobody has checked is not an error."""
+    migrate(folder)
+    return {kind: _read_kind(folder, kind) for kind in KINDS}
+
+
+def save(folder: str, data: dict, kinds=None) -> None:
+    """Write the sections named (default: every one present in `data`)."""
+    for kind in (kinds or [k for k in KINDS if k in data]):
+        _write_kind(folder, kind, list(data.get(kind) or []))
+
+
+# ── the one file from before the folder existed ───────────────────────────────
+
+def migrate(folder: str) -> bool:
+    """Fold an older single `worklist.json` into the per-section files.
+
+    Idempotent, and it never loses a row: each section is the union — by
+    _key() — of whatever the per-section file already holds and what the
+    old file holds, with the per-section row winning a tie (it may carry a
+    newer `resolved` flag or a correction). Only once every section has
+    been written is the old file moved aside to `.bak`, so a crash half-way
+    leaves both in place and the next call simply unions again. An old file
+    that cannot be read is left exactly where it is.
+
+    Returns True if something was migrated.
+    """
+    legacy = path_in(folder)
+    if not os.path.exists(legacy):
+        return False
+    try:
+        with open(legacy, "r", encoding="utf-8") as f:
+            old = json.load(f)
+    except (OSError, ValueError):
+        return False
+    if not isinstance(old, dict):
+        return False
+    for kind in KINDS:
+        incoming = old.get(kind)
+        if not isinstance(incoming, list):
+            continue
+        current = _read_kind(folder, kind)
+        seen = {_key(r) for r in current}
+        for row in incoming:
+            if isinstance(row, dict) and _key(row) not in seen:
+                seen.add(_key(row))
+                current.append(row)
+        _write_kind(folder, kind, current)
+    backup = legacy + ".bak"
+    if os.path.exists(backup):
+        stamp = datetime.now().strftime("%Y%m%d-%H%M%S")
+        backup = f"{legacy}.bak.{stamp}"
+    os.replace(legacy, backup)
+    return True
+
+
+# ── entries ───────────────────────────────────────────────────────────────────
 
 def _key(entry: dict) -> str:
     """A message-id when there is one — the one identifier that survives a
@@ -103,8 +190,8 @@ def append(folder: str, kind: str, entries: list[dict]) -> dict:
     not the next check's to quietly undo."""
     if kind not in KINDS:
         raise ValueError(f"unknown worklist kind {kind!r}")
-    data = load(folder)
-    rows = data[kind]
+    migrate(folder)
+    rows = _read_kind(folder, kind)
     seen = {_key(r) for r in rows}
     for entry in entries:
         k = _key(entry)
@@ -112,42 +199,75 @@ def append(folder: str, kind: str, entries: list[dict]) -> dict:
             continue
         seen.add(k)
         entry = dict(entry)
-        if kind != "arrived":
+        if kind not in LOG_KINDS:
             entry.setdefault("resolved", False)
         rows.append(entry)
-    data[kind] = _trimmed(kind, rows)
-    save(folder, data)
+    rows = _trimmed(kind, rows)
+    _write_kind(folder, kind, rows)
+    data = load(folder)
+    data[kind] = rows
     return data
 
 
 def _trimmed(kind: str, rows: list[dict]) -> list[dict]:
     if kind == "arrived":
         return rows[-ARRIVED_KEEP:] if len(rows) > ARRIVED_KEEP else rows
-    pending = [r for r in rows if not r.get("resolved")]
+    if kind == "sent":
+        return rows[-SENT_KEEP:] if len(rows) > SENT_KEEP else rows
+    pending_rows = [r for r in rows if not r.get("resolved")]
     resolved = [r for r in rows if r.get("resolved")]
     if len(resolved) > RESOLVED_KEEP:
         resolved = resolved[-RESOLVED_KEEP:]
     # Stable order: interleave back by original position rather than
     # pending-then-resolved, so the screen reads oldest-to-newest as typed.
-    kept_keys = {_key(r) for r in pending + resolved}
+    kept_keys = {_key(r) for r in pending_rows + resolved}
     return [r for r in rows if _key(r) in kept_keys]
 
 
 def update(folder: str, kind: str, message_id: str, changes: dict) -> dict:
     """Apply changes to one row, found by message id — a correction to how
     a sender is sorted, or marking a reply resolved once it is applied."""
-    data = load(folder)
-    for row in data.get(kind, []):
+    migrate(folder)
+    rows = _read_kind(folder, kind)
+    for row in rows:
         if row.get("message_id") == message_id:
             row.update(changes)
             break
-    save(folder, data)
+    _write_kind(folder, kind, rows)
+    data = load(folder)
+    data[kind] = rows
     return data
 
 
 def resolve(folder: str, kind: str, message_id: str) -> dict:
     return update(folder, kind, message_id, {"resolved": True})
 
+
+def log_sent(folder: str, kind: str, *, to: str, subject: str,
+             inquiry_no: str = "", quotation_no: str = "",
+             when: datetime | None = None) -> dict:
+    """Record one mail Prism sent on the owner's behalf.
+
+    `kind` is what it was — "quotation", "reminder", "winback". The id is
+    generated rather than taken off the mail, so two reminders sent on the
+    same day are two rows, not one de-duplicated into the other.
+    """
+    when = when or datetime.now()
+    entry = {
+        "message_id": f"<sent-{uuid.uuid4().hex}@prism>",
+        "kind": kind,
+        "date": when.strftime("%Y-%m-%d"),
+        "time": when.strftime("%H:%M"),
+        "to": to or "",
+        "subject": subject or "",
+        "inquiry_no": inquiry_no or "",
+        "quotation_no": quotation_no or "",
+    }
+    append(folder, "sent", [entry])
+    return entry
+
+
+# ── reading back ──────────────────────────────────────────────────────────────
 
 def pending(data: dict, kind: str) -> list[dict]:
     """Not yet dealt with, oldest first — the actionable list for "replies"
@@ -156,10 +276,10 @@ def pending(data: dict, kind: str) -> list[dict]:
 
 
 def history(data: dict, kind: str, days: int | None = None) -> list[dict]:
-    """Everything, newest first — the log view for "arrived", and the "show
-    what has already been handled too" view for the other two. `days`
-    filters on the entry's own "date" (a plain YYYY-MM-DD), inclusive of
-    today; None returns all of it."""
+    """Everything, newest first — the log view for "arrived" and "sent", and
+    the "show what has already been handled too" view for the other two.
+    `days` filters on the entry's own "date" (a plain YYYY-MM-DD), inclusive
+    of today; None returns all of it."""
     rows = list(data.get(kind, []))
     rows.reverse()
     if days is not None:
@@ -167,3 +287,13 @@ def history(data: dict, kind: str, days: int | None = None) -> list[dict]:
         cutoff = (date.today() - timedelta(days=days - 1)).isoformat()
         rows = [r for r in rows if (r.get("date") or "") >= cutoff]
     return rows
+
+
+def sent_for(data: dict, inquiry_no: str) -> list[dict]:
+    """Everything Prism sent about one inquiry, oldest first — what the
+    "Sent so far" line and the reminder column are drawn from."""
+    inquiry_no = (inquiry_no or "").strip()
+    if not inquiry_no:
+        return []
+    return [r for r in data.get("sent", [])
+            if (r.get("inquiry_no") or "").strip() == inquiry_no]

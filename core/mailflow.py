@@ -46,8 +46,15 @@ class Paths:
         return os.path.join(self.root, register.FILENAME)
 
     @property
+    def worklist_dir(self) -> str:
+        """One JSON file per section — see core/worklist.py."""
+        return os.path.join(self.root, worklist.DIRNAME)
+
+    @property
     def worklist_json(self) -> str:
-        return os.path.join(self.root, worklist.FILENAME)
+        """The single file an older Prism kept. Only worklist.migrate() has
+        a reason to want it; everything else reads worklist_dir."""
+        return os.path.join(self.root, worklist.LEGACY_FILENAME)
 
     @property
     def sops(self) -> str:
