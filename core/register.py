@@ -348,6 +348,50 @@ def _clock(when) -> str:
     return when.strftime("%H:%M")
 
 
+def _merge_key(row: dict):
+    """What makes two rows "the same inquiry" for merge_in().
+
+    Inquiry no first — it is the one column meant to be a unique key, and a
+    register kept in Excel before Prism will usually have re-typed Prism's
+    own numbers onto rows it re-exported. Falling back to (Email, Date
+    received, Product asked) covers a hand-kept sheet that never had a
+    numbering scheme of its own; falling back further to nothing at all —
+    rather than colliding every blank row into one "duplicate" — means a
+    sheet with several genuinely blank entries does not lose all but the
+    first of them.
+    """
+    no = (row.get("Inquiry no") or "").strip()
+    if no:
+        return ("no", no.lower())
+    triple = ((row.get("Email") or "").strip().lower(),
+              (row.get("Date received") or "").strip(),
+              (row.get("Product asked") or "").strip().lower())
+    return ("triple", triple) if any(triple) else None
+
+
+def merge_in(existing: list[dict], incoming: list[dict]) -> tuple[list, int, int]:
+    """Append rows from a CSV the owner kept before Prism, or one a colleague
+    built up separately — skipping any that are clearly already here.
+
+    Never rewrites or reorders a row already in `existing`; only adds. See
+    _merge_key() for what counts as "already here". Returns (merged rows,
+    how many were added, how many were left out as duplicates).
+    """
+    seen = {key for key in (_merge_key(r) for r in existing) if key is not None}
+    merged = list(existing)
+    added = skipped = 0
+    for row in incoming:
+        key = _merge_key(row)
+        if key is not None and key in seen:
+            skipped += 1
+            continue
+        if key is not None:
+            seen.add(key)
+        merged.append(dict(row))
+        added += 1
+    return merged, added, skipped
+
+
 def update(rows: list[dict], inquiry_no: str, changes: dict) -> dict | None:
     """Apply changes to one row in place. Returns the row, or None if unknown."""
     row = find(rows, inquiry_no)
