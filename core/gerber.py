@@ -1037,6 +1037,41 @@ def spacing(layer: GerberLayer, snap_mm: float = SNAP_MM, conductors=None,
             "snapped": snapped, "with_markings_mm": None, "note": ""}
 
 
+def outline_face(layers: list[GerberLayer]):
+    """The board's edge as one closed shape, and the layer it came from —
+    or (None, None) when no candidate layer closes.
+
+    Polygonise each layer's strokes and keep the largest closed face across
+    ALL of them: that is the only method that survives a fiducial, a legend
+    block or a title outside the board edge, and it is what board_outline()
+    measures and gerber_clean.py cuts against — one definition of "inside
+    the board", so the size we quote and the copper we keep can never
+    disagree.
+    """
+    best_face, best_layer = None, None
+    if not HAVE_SHAPELY:
+        return None, None
+    for layer in layers:
+        segs = [(a, b) for _, a, b in layer.draws]
+        if len(segs) < 3:
+            continue
+        try:
+            q = 1e-3        # 1 µm — under any tolerance, over any noise
+
+            def snap(pt):
+                return (round(pt[0] / q) * q, round(pt[1] / q) * q)
+            faces = [f for f in polygonize(
+                [LineString([snap(a), snap(b)]) for a, b in segs
+                 if snap(a) != snap(b)]) if f.area > 1.0]
+            if faces:
+                top = max(faces, key=lambda f: f.area)
+                if best_face is None or top.area > best_face.area:
+                    best_face, best_layer = top, layer
+        except Exception:
+            pass
+    return best_face, best_layer
+
+
 def board_outline(layers: list[GerberLayer]) -> dict:
     """The board's real size.
 
@@ -1053,26 +1088,12 @@ def board_outline(layers: list[GerberLayer]) -> dict:
     result = {"width_mm": None, "height_mm": None, "area_mm2": None,
               "method": "", "source": "", "confident": False, "shape": "",
               "origin": (0.0, 0.0)}
-    best_face, best_layer = None, None
+    best_face, best_layer = outline_face(layers)
     fallback = None
     for layer in layers:
         segs = [(a, b) for _, a, b in layer.draws]
         if len(segs) < 3:
             continue
-        if HAVE_SHAPELY:
-            try:
-                q = 1e-3        # 1 µm — under any tolerance, over any noise
-                def snap(pt):
-                    return (round(pt[0] / q) * q, round(pt[1] / q) * q)
-                faces = [f for f in polygonize(
-                    [LineString([snap(a), snap(b)]) for a, b in segs
-                     if snap(a) != snap(b)]) if f.area > 1.0]
-                if faces:
-                    top = max(faces, key=lambda f: f.area)
-                    if best_face is None or top.area > best_face.area:
-                        best_face, best_layer = top, layer
-            except Exception:
-                pass
         if fallback is None:
             xs = [p[0] for a, b in segs for p in (a, b)]
             ys = [p[1] for a, b in segs for p in (a, b)]
