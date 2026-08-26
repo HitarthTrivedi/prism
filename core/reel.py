@@ -1152,16 +1152,32 @@ def render(spec: dict, out_path: str, on_progress=None) -> str:
 def spec_instructions() -> str:
     """What an AI stage must produce. The agent decides the WORDS and the
     running order; this module decides the pixels — so the layout can never
-    be broken by a model having an off day."""
+    be broken by a model having an off day.
+
+    Appended, not sent alone: the router plans this stage's task before it
+    knows a local renderer is downstream, so the brief it writes routinely
+    specifies its own deliverable — a document, a table, sections of its
+    own. Naming "a handoff, a summary or a plan" isn't broad enough to void
+    that; a writer handed a fully-specified alternate deliverable and told
+    only that handoffs/summaries/plans don't count will produce the
+    deliverable anyway. The override has to say so explicitly, or a stage
+    fed a coherent competing brief will reasonably follow it instead of a
+    schema that shows up as an afterthought at the bottom.
+    """
     return (
         "OUTPUT FORMAT — THIS OVERRIDES EVERY OTHER FORMATTING INSTRUCTION "
         "YOU HAVE BEEN GIVEN, INCLUDING ANY RULE ASKING FOR A HANDOFF, A "
-        "SUMMARY OR A PLAN:\n"
-        "Your reply is read by a program, not a person. Reply with ONLY a "
-        "JSON object describing the reel — no preamble, no commentary, no "
-        "handoff section, no markdown fences. Do NOT describe the JSON you "
-        "would write; write it. The first character of your reply must be "
-        "'{' and the last must be '}'. Shape:\n"
+        "SUMMARY, A PLAN, OR A DIFFERENT DELIVERABLE SHAPE ENTIRELY (a "
+        "document, a table, named sections, a checklist — whatever was "
+        "described above):\n"
+        "Any deliverable specified earlier was written without knowing "
+        "this stage feeds a local renderer — it does not apply, including "
+        "its own list of sections or fields. Your reply is read by a "
+        "program, not a person. Reply with ONLY a JSON object describing "
+        "the reel — no preamble, no commentary, no handoff section, no "
+        "document, no markdown fences. Do NOT describe the JSON you would "
+        "write; write it. The first character of your reply must be '{' "
+        "and the last must be '}'. Shape:\n"
         '{"fps": 30, "scenes": [ … ]}\n\n'
         "SCENE TYPES — pick only the ones the story needs, in any order, and "
         "repeat any of them. There is no required running order.\n"

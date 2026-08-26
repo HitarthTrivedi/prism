@@ -776,13 +776,22 @@ def inspect(spec: dict, at: float = 0.75) -> list[str]:
 # pass may not mention appearance at all; the second may not change a word.
 
 def script_instructions() -> str:
+    # Appended to a router-written brief the same way spec_instructions() is
+    # in reel.py — see the note there. That brief routinely specifies its
+    # own deliverable (a document, a table, named sections) before this
+    # stage is known to feed the Studio pipeline, so the override has to
+    # void that deliverable shape by name, not just "a handoff or a summary".
     return (
         "OUTPUT FORMAT — THIS OVERRIDES EVERY OTHER FORMATTING INSTRUCTION "
-        "YOU HAVE BEEN GIVEN, INCLUDING ANY RULE ASKING FOR A HANDOFF OR A "
-        "SUMMARY. Your reply is read by a program. Reply with ONLY a JSON "
-        "object, wrapped in a ```json fenced code block and nothing else — "
-        "no prose before it, none after. The fence keeps the chat window from "
-        "reformatting what you wrote.\n\n"
+        "YOU HAVE BEEN GIVEN, INCLUDING ANY RULE ASKING FOR A HANDOFF, A "
+        "SUMMARY, OR A DIFFERENT DELIVERABLE SHAPE ENTIRELY (a document, a "
+        "table, named sections, a checklist — whatever was described "
+        "above; it was written without knowing this stage feeds a "
+        "renderer, so it does not apply). Your reply is read by a "
+        "program. Reply with ONLY a JSON object, wrapped in a ```json "
+        "fenced code block and nothing else — no prose before it, none "
+        "after. The fence keeps the chat window from reformatting what "
+        "you wrote.\n\n"
         "You are writing the SCRIPT for a short vertical brand reel. Words "
         "and running order only. You do not decide how it looks: a separate "
         "art-direction pass does that, and anything you say about colour, "
@@ -1289,6 +1298,27 @@ def parse_scene(text: str) -> dict | None:
     return None
 
 
+def _scene_count(text: str) -> int:
+    """How many scenes with real markup a reply actually contained.
+
+    parse_scene() above only ever keeps the first, silently — which means a
+    model that drifts from "one scene per turn" and answers three at once
+    gets no signal that the other two were thrown away. It just sees the
+    conversation move on, and answers the same over-eager way next turn too.
+    This is what lets the next prompt name the actual number instead of a
+    vague "slow down" that a model drifting once has no reason to believe.
+    """
+    n = 0
+    for got in _json_objects(text):
+        rows = got.get("scenes")
+        if isinstance(rows, list):
+            n += sum(1 for s in rows
+                     if isinstance(s, dict) and str(s.get("html", "")).strip())
+        elif str(got.get("html", "")).strip():
+            n += 1
+    return n
+
+
 def _first_asset(assets: str) -> str:
     """The first name on the asset list, for the usage example."""
     m = re.search(r"asset:([A-Za-z0-9_-]+)", assets or "")
@@ -1538,6 +1568,10 @@ def build_spec(first_reply: str, ask, script: str = "", assets: str = "",
 
     say(f"storyboard: {total} scene(s) — writing them one at a time")
     scenes: list[dict] = []
+    # Set whenever a turn answers more scenes than it was asked for, and
+    # prepended to the very next prompt so the drift gets named and corrected
+    # instead of silently repeating — see _scene_count().
+    overflow_notice = ""
     for i in range(total):
         if should_stop and should_stop():
             say("stopped — keeping the scenes written so far")
@@ -1547,8 +1581,11 @@ def build_spec(first_reply: str, ask, script: str = "", assets: str = "",
                 on_scene(i, total)
             except Exception:                        # noqa: BLE001
                 pass          # a progress listener must never fail the run
-        prompt = scene_instructions(i, total, board[i], lines[i], assets)
-        scene = parse_scene(ask(prompt, SCENE_EXPECT) or "")
+        prompt = overflow_notice + scene_instructions(i, total, board[i],
+                                                       lines[i], assets)
+        overflow_notice = ""
+        raw = ask(prompt, SCENE_EXPECT) or ""
+        scene = parse_scene(raw)
         if scene is None:
             # One retry, and a blunter ask. Almost always prose where JSON was
             # wanted, which a second, shorter prompt reliably fixes.
@@ -1557,6 +1594,16 @@ def build_spec(first_reply: str, ask, script: str = "", assets: str = "",
                 '\'{\', last \'}\', keys "seconds", "cut", "css", "html", '
                 "wrapped in a ```json fenced block. Nothing before or after.",
                 SCENE_EXPECT) or "")
+        elif _scene_count(raw) > 1:
+            n = _scene_count(raw)
+            say(f"scene {i + 1} came back with {n} scenes in it — only the "
+                "first was kept; telling it to slow down before the next ask")
+            overflow_notice = (
+                f"Before the next scene: that last reply answered {n} "
+                f"scenes at once. Only scene {i + 1} was kept — the rest "
+                "were discarded, not saved for later, so nothing from them "
+                "will appear in the reel. From here on, answer EXACTLY ONE "
+                "scene per reply, the one actually asked for.\n\n")
         if scene is None:
             say(f"scene {i + 1} never came back as JSON — using a plain one")
             scenes.append(fallback_scene(lines[i]))
