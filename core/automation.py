@@ -549,23 +549,40 @@ def _needed_stages(routing: dict, agents: dict):
         if stage == "summary":
             name = A.summary_agent_name(agents)
         else:
-            name = agents.get(stage)
+            # A guardrail (e.g. router.apply_studio_guardrail) may have
+            # picked a different tool for THIS run only — a structural
+            # mismatch between the brief and the configured tool, not
+            # something worth changing the user's saved setting over. Their
+            # own config still wins whenever no override was set.
+            name = data.get("agent_override") or agents.get(stage)
         if not name:
             continue
         yield stage, name, questions
 
 
-def _upload_files(driver, agent_cfg, attachments):
-    """Push any attached files into the tool's <input type='file'>, if present."""
+def _upload_files(driver, agent_cfg, attachments, agent_name: str = ""):
+    """Push any attached files into the tool's <input type='file'>, if present.
+
+    Returns the number of files that actually reached the page. A caller that
+    ignores the return value still gets the failure through the usual channel
+    — ui.warn() — because a customer's drawing or PO silently never reaching
+    the agent is exactly the kind of thing that must not fail quietly: the
+    pipeline would otherwise carry on as if the attachment had gone up, and
+    nobody finds out until the response makes no sense.
+    """
     if not attachments:
-        return
+        return 0
     from selenium.webdriver.common.by import By
     from . import files as F
 
+    who = agent_name or "this tool"
     sel = agent_cfg.get("upload_selector", "input[type='file']")
     inputs = driver.find_elements(By.CSS_SELECTOR, sel)
     if not inputs:
-        return
+        ui.warn(f"   ⚠️   {who} has no file-upload field on this page — "
+                f"{len(attachments)} attachment(s) were NOT sent; it will "
+                "answer blind to them")
+        return 0
     paths = F.upload_paths(attachments)
     target = inputs[0]
     uploaded = 0
@@ -574,20 +591,37 @@ def _upload_files(driver, agent_cfg, attachments):
         target.send_keys("\n".join(paths))
         uploaded = len(paths)
         ui.info(f"   📎  uploaded {uploaded} file(s)")
-    except Exception:
+    except Exception as e:
         # Fall back to one-at-a-time (input may be replaced between sends).
+        # Every failure here used to vanish into a bare `except: pass` — the
+        # short reason is kept now so a customer wondering why a file never
+        # showed up has something better than silence to go on.
+        bulk_reason = str(e).strip().splitlines()[0][:120] if str(e).strip() else "no detail"
+        reasons = []
         for p in paths:
             try:
                 for inp in driver.find_elements(By.CSS_SELECTOR, sel):
                     inp.send_keys(p)
                     uploaded += 1
                     break
-            except Exception:
-                pass
+            except Exception as pe:
+                detail = str(pe).strip().splitlines()[0][:120] if str(pe).strip() else "no detail"
+                reasons.append(f"{os.path.basename(p)} ({detail})")
         if uploaded:
             ui.info(f"   📎  uploaded {uploaded} file(s)")
+        if reasons:
+            ui.warn(f"   couldn't upload {len(reasons)} of {len(paths)} "
+                    f"file(s) to {who} — bulk upload failed ({bulk_reason}), "
+                    "then one-at-a-time failed too: "
+                    + "; ".join(reasons[:3])
+                    + (f" (+{len(reasons) - 3} more)" if len(reasons) > 3 else ""))
     if not uploaded:
-        return   # nothing reached the page — no ingest to wait for
+        ui.warn(f"   ⚠️   0 of {len(paths)} attachment(s) reached {who} — "
+                "it will answer without ever seeing them")
+        return 0   # nothing reached the page — no ingest to wait for
+    if uploaded < len(paths):
+        ui.warn(f"   ⚠️   only {uploaded} of {len(paths)} attachment(s) "
+                f"uploaded to {who} — the rest never reached the page")
     # Big files / multiple files take a while to ingest — submitting before the
     # upload finishes silently drops the attachment. Wait a size-scaled floor,
     # then keep waiting while the page still shows an upload spinner/progress
@@ -611,6 +645,7 @@ def _upload_files(driver, agent_cfg, attachments):
             break
         time.sleep(2)
     ui.info(f"   📎  upload settled after {int(time.time() - start)}s")
+    return uploaded
 
 
 def _fast_type(driver, element, text: str) -> bool:
@@ -728,6 +763,143 @@ def _harvest_images(driver, agent_cfg, stage: str) -> list[dict]:
         if len(out) >= 4:
             break
     return out
+
+
+# A link that plainly points at a real file — a document, deck, spreadsheet,
+# archive or source file — rather than an ordinary navigational link. Kept
+# narrow and shape-based on purpose, the same way _harvest_images only takes
+# an <img> sized like a real picture: a chat reply that merely TALKS about a
+# file must not count, only a link that plainly IS one.
+_HARVESTABLE_EXTS = (
+    ".pdf", ".docx", ".doc", ".pptx", ".ppt", ".xlsx", ".xls", ".csv",
+    ".odt", ".odp", ".ods", ".zip", ".rar", ".7z", ".tar", ".gz",
+    ".py", ".js", ".ts", ".tsx", ".jsx", ".json", ".html", ".css",
+    ".java", ".c", ".cpp", ".h", ".go", ".rb", ".php", ".sh", ".sql",
+    ".ipynb", ".md", ".txt", ".rtf",
+)
+
+
+def _harvest_files(driver, agent_cfg, stage: str) -> list[dict]:
+    """Non-image sibling of _harvest_images. A code, presentation or format
+    stage's real deliverable is a DOCUMENT, DECK, CODE file or ARCHIVE, not a
+    picture — that can't travel in a text handoff either, only the file
+    itself can, and it joins the same pipeline_files list _harvest_images
+    already feeds so a later producer stage receives it the same way.
+
+    _harvest_images finds its candidates by shape — an <img> sized like a
+    real picture rather than an icon or avatar. There is no equivalent
+    universal signal for a document, so the candidate test is different (a
+    link whose href plainly points at a file: a real extension, an explicit
+    `download` attribute, or a `blob:` URL — how Code-Interpreter-style
+    "Download" buttons usually work), but everything around that test is the
+    SAME mechanism reused rather than reinvented: search the response area
+    first, fall back to the whole page (a tool's download UI can sit outside
+    the message bubble the same way ChatGPT's image canvas does), fetch the
+    bytes through the page's OWN session so an auth-gated link still
+    resolves, and hand back an attachment record built the normal way
+    (core.files.attach, the same function a user's own upload goes through).
+
+    Unlike an image, there is no "screenshot the element" fallback when the
+    fetch fails — a rendered pixel grid can stand in for a picture; nothing
+    can stand in for a PDF. A candidate that can't be fetched is skipped.
+    """
+    import base64
+    from selenium.webdriver.common.by import By
+    from . import files as F
+
+    sel = agent_cfg.get("response_selector", "")
+    links = []
+    try:
+        if sel:
+            links = driver.find_elements(By.CSS_SELECTOR, f"{sel} a[href]")
+        if not links:
+            links = driver.find_elements(By.CSS_SELECTOR, "a[href]")
+    except Exception:
+        return []
+
+    out, seen = [], set()
+    try:
+        driver.set_script_timeout(20)
+    except Exception:
+        pass
+    for a in links:
+        try:
+            href = a.get_attribute("href") or ""
+            download_attr = a.get_attribute("download")
+        except Exception:
+            continue
+        if not href or href in seen:
+            continue
+        clean = href.split("?")[0].split("#")[0]
+        href_ext = os.path.splitext(clean)[1].lower()
+        # The `download` attribute is the site's own suggested filename and,
+        # when present, a more reliable source for the real extension than
+        # the URL — a download endpoint's href is often extension-less.
+        ext = os.path.splitext(download_attr or "")[1].lower() or href_ext
+        if not (href.startswith("blob:") or download_attr is not None
+                or href_ext in _HARVESTABLE_EXTS):
+            continue   # an ordinary navigational link, not a deliverable
+        seen.add(href)
+
+        raw = None
+        try:
+            data = driver.execute_async_script(
+                """
+                const src = arguments[0], done = arguments[arguments.length - 1];
+                fetch(src, {credentials: 'include'})
+                    .then(r => r.blob())
+                    .then(b => { const fr = new FileReader();
+                                 fr.onloadend = () => done(fr.result);
+                                 fr.readAsDataURL(b); })
+                    .catch(() => done(null));
+                """, href)
+            if data and data.startswith("data:"):
+                header, b64 = data.split(",", 1)
+                raw = base64.b64decode(b64)
+        except Exception:
+            raw = None
+        if not raw:
+            continue
+
+        name = f"{stage}_file{len(out) + 1}{ext}"
+        path = os.path.join(tempfile.gettempdir(), f"prism_{name}")
+        try:
+            with open(path, "wb") as f:
+                f.write(raw)
+            att = F.attach(path)
+        except Exception:
+            continue
+        if att["kind"] == "image":
+            continue   # _harvest_images already owns real pictures
+        # Marked so a later stage can tell a file a model produced from one
+        # the client actually supplied — same convention _harvest_images uses.
+        att["_generated"] = True
+        out.append(att)
+        if len(out) >= 4:
+            break
+    return out
+
+
+def _save_artifacts(items: list[dict], query: str, stage: str) -> None:
+    """Copy what a stage just generated out of the temp directory `items`
+    were harvested into, and into the one folder a customer can still find
+    once Prism is closed — see config.ARTIFACTS_DIR.
+
+    Best-effort and silent per item: a full disk or a permissions slip here
+    must not cost the run its actual result, which the harvested temp file
+    (and, for a producer stage with a next step, `pipeline_files`) already
+    holds regardless of whether this copy succeeds.
+    """
+    from . import config
+    for item in items:
+        path = item.get("path")
+        if not path:
+            continue
+        try:
+            saved = config.save_artifact(path, query, kind=stage)
+        except Exception:                               # noqa: BLE001
+            continue
+        ui.info(f"   💾  saved to {saved}")
 
 
 # Phrases that only ever appear in what Prism types, never in a tool's answer.
@@ -1839,7 +2011,7 @@ def run(routing: dict, cfg: dict, attachments=None, on_event=None,
         query: str = "", chatgpt_analysis: bool = True,
         custom_stages: list[tuple[str, str, list[str]]] | None = None,
         should_stop=None, failover: bool = True,
-        reel_design_stage: str = ""):
+        reel_design_stage: str = "", pipeline_files_out: list | None = None):
     """Execute the pipeline. Returns (responses, links).
 
     attachments: list of records from core.files.attach() — uploaded to each
@@ -1879,6 +2051,13 @@ def run(routing: dict, cfg: dict, attachments=None, on_event=None,
                  out at the last stage of a forty-minute run — otherwise costs
                  the whole run. Set False for the retry itself, so a category
                  where every tool is having a bad afternoon cannot recurse.
+    pipeline_files_out: a caller-owned list that images/files generated during
+                 this run are appended into, on top of being used internally.
+                 Exists so a failover retry — which runs this whole function
+                 again from scratch for one stage via `custom_stages` — can get
+                 the images that ONE stage generated back out, when otherwise
+                 they would be harvested into this function's own local
+                 `pipeline_files` and vanish with it when the call returns.
     """
     from selenium.webdriver.common.by import By
     from selenium.webdriver.common.keys import Keys
@@ -2115,7 +2294,12 @@ def run(routing: dict, cfg: dict, attachments=None, on_event=None,
     driver, fresh = _get_driver(cfg)
     all_responses: dict[str, list[str]] = {}
     all_links: dict[str, str] = {}
-    pipeline_files: list[dict] = []   # images GENERATED by earlier stages
+    # images/docs/decks/code GENERATED by earlier stages. Caller-supplied when
+    # given, and mutated in place (never rebound) from here down, so a caller
+    # holding onto pipeline_files_out sees every harvest as it happens rather
+    # than only whatever this function's own local name pointed to last.
+    pipeline_files: list[dict] = (
+        pipeline_files_out if pipeline_files_out is not None else [])
     # A freshly launched browser opens on one blank tab — reuse it for stage
     # one. A REUSED browser still has the previous run's result tabs open;
     # always open a new tab in that case so nothing gets navigated away.
@@ -2127,6 +2311,14 @@ def run(routing: dict, cfg: dict, attachments=None, on_event=None,
     # Stages that produced nothing, and why. Read by the failover pass after
     # the loop; see _retry_failed_stages().
     failures: dict[str, dict] = {}
+    # Stages that DID produce something, but the cap ran out while the tool
+    # was still writing — see the `timed_out` branch of _smart_wait's caller
+    # below. Kept separate from `failures`: the answer is real and stays in
+    # all_responses (never thrown away just for arriving at the deadline),
+    # but "got something" and "got the finished answer" are not the same
+    # claim, and this is what lets the run say so instead of quietly calling
+    # a partial answer done.
+    incomplete: dict[str, dict] = {}
 
     for stage_idx, (stage, agent_name, questions) in enumerate(stages):
         if stopped():
@@ -2218,7 +2410,7 @@ def run(routing: dict, cfg: dict, attachments=None, on_event=None,
             send_files = (attachments if include_attachment else []) + \
                          (pipeline_files if producer else [])
             if send_files:
-                _upload_files(driver, agent_cfg, send_files)
+                _upload_files(driver, agent_cfg, send_files, agent_name)
 
             # Relay hand-off: forward ONLY the most recent stage's output.
             # Every agent is instructed (below) to fold the key findings of
@@ -2231,9 +2423,15 @@ def run(routing: dict, cfg: dict, attachments=None, on_event=None,
             context = _intent_block(query)
             context += attach_ctx if include_attachment else ""
             if producer and pipeline_files:
+                # Not always pictures any more — _harvest_files also lands
+                # generated documents, decks, code and archives here, so the
+                # wording has to fit whatever actually came through rather
+                # than always saying "image".
                 names = ", ".join(f["name"] for f in pipeline_files)
+                kinds = {f.get("kind", "image") for f in pipeline_files}
+                noun = "image file(s)" if kinds == {"image"} else "file(s)"
                 context += (
-                    f"An earlier pipeline stage GENERATED these image file(s), "
+                    f"An earlier pipeline stage GENERATED these {noun}, "
                     f"uploaded to this chat: {names}. Use them as assets in "
                     "what you produce — do not recreate them from scratch.\n\n"
                 )
@@ -2719,8 +2917,15 @@ def run(routing: dict, cfg: dict, attachments=None, on_event=None,
             all_responses[stage] = stage_responses
 
             # Image-making stages: pull the generated images off the page so
-            # later stages can actually use them (text handoffs can't).
-            if stage in ("visual", "media", "artwork") and stage_idx + 1 < len(stages):
+            # later stages can actually use them (text handoffs can't) —
+            # and, regardless of whether a later stage exists, so the file
+            # itself survives. It used to only be harvested when there was a
+            # next stage to hand it to (or a failover retry's
+            # pipeline_files_out asked explicitly), which meant a plain
+            # "generate me an image" task — one stage, no retry — never had
+            # its output downloaded at all: only the tool's own hosted link
+            # remained, gone the moment that browser tab or session closed.
+            if stage in ("visual", "media", "artwork"):
                 made = _harvest_images(driver, agent_cfg, stage)
                 if stage == "artwork":
                     # A reel wants a few strong images, not a contact sheet —
@@ -2729,9 +2934,22 @@ def run(routing: dict, cfg: dict, attachments=None, on_event=None,
                     from . import reel_web as _rw
                     made = made[:_rw.MAX_GENERATED]
                 if made:
-                    pipeline_files = (pipeline_files + made)[-6:]
+                    # In place, never rebound — see pipeline_files_out above.
+                    pipeline_files[:] = (pipeline_files + made)[-6:]
                     ui.info(f"   🖼️   harvested {len(made)} generated image(s) "
                             "for the next stages")
+                    _save_artifacts(made, query, stage)
+            # Same idea for the producer stages whose deliverable is a
+            # document, deck or code file rather than a picture — without
+            # this, only their scraped TEXT reply ever reached a later stage,
+            # and a genuinely generated PDF/DOCX/PPTX/code file/zip never did.
+            elif stage in ("development", "presentation", "format"):
+                made_files = _harvest_files(driver, agent_cfg, stage)
+                if made_files:
+                    pipeline_files[:] = (pipeline_files + made_files)[-6:]
+                    ui.info(f"   📎  harvested {len(made_files)} generated "
+                            "file(s) for the next stages")
+                    _save_artifacts(made_files, query, stage)
 
             if stage_responses:
                 ui.ok(f"captured {len(stage_responses)} response(s)")
@@ -2739,6 +2957,14 @@ def run(routing: dict, cfg: dict, attachments=None, on_event=None,
                                     "snippet": stage_responses[0][:200],
                                     "texts": stage_responses, "url": driver.current_url,
                                     "timed_out": timed_out})
+                if timed_out:
+                    # Real output, kept in all_responses above — but the cap,
+                    # not the tool, ended this wait, so what got captured may
+                    # be a sentence cut off mid-word rather than the finished
+                    # answer. Flagged here rather than silently treated as a
+                    # normal "done" stage; see the summary after the loop.
+                    incomplete[stage] = {"agent": agent_name,
+                                         "questions": questions}
             else:
                 # Nothing came back. Before reporting that as a scrape miss,
                 # ask the three far more likely questions: has this tool run
@@ -2794,11 +3020,26 @@ def run(routing: dict, cfg: dict, attachments=None, on_event=None,
             failures[stage] = {"agent": agent_name, "questions": questions,
                                "reason": str(ex), "exhausted": False}
 
+    if incomplete:
+        # A transient ui.warn already fired for each of these the moment its
+        # cap ran out (mid-run, easy to miss); this is the persistent version
+        # — printed once, right where the CLI's "Results" summary and the
+        # GUI's completion state read from next — so a partial answer is
+        # never confused for a finished one just because it showed up on
+        # time. The text itself is untouched: it is already sitting in
+        # all_responses, kept rather than thrown away.
+        ui.warn(f"{len(incomplete)} stage(s) may be incomplete — the tool's "
+                "time ran out before its answer finished (its tab is still "
+                "open and may finish there): "
+                + ", ".join(f"{s} ({i['agent']})" for s, i in incomplete.items()))
+        emit("run_incomplete", {"stages": incomplete})
+
     if failover and failures and not stopped():
         _retry_failed_stages(
             failures, cfg, all_responses, all_links,
             attachments=attachments, query=query, emit=emit,
-            should_stop=should_stop)
+            should_stop=should_stop, stages=stages,
+            pipeline_files=pipeline_files, brand=studio_brand)
 
     return all_responses, all_links
 
@@ -2807,7 +3048,8 @@ def run(routing: dict, cfg: dict, attachments=None, on_event=None,
 
 def _retry_failed_stages(failures: dict, cfg: dict, all_responses: dict,
                          all_links: dict, *, attachments, query, emit,
-                         should_stop) -> None:
+                         should_stop, stages=None, pipeline_files=None,
+                         brand=None) -> None:
     """Give each empty stage to a different tool.
 
     The failure this exists for: forty minutes into a run, the free tier on
@@ -2824,9 +3066,18 @@ def _retry_failed_stages(failures: dict, cfg: dict, all_responses: dict,
     maps (machine_stages, spec_feeder, design_feeder) all shift if the stage
     list changes underneath it.
 
+    One case of that limitation IS fixed here, though, because it doesn't need
+    the restructuring: a LOCAL renderer (Prism Reel, Prism Studio) runs as one
+    self-contained function call, not a browser tab holding its place in the
+    stage list — so if `visual` failed and only came back through this retry,
+    the renderer already ran without the images it was waiting on, and calling
+    that same function again is safe. See `_rerender_local_after_recovery()`,
+    called at the end of this function once every stage here has been tried.
+
     Never raises: this is a rescue attempt, and a rescue that takes down the
     results it was rescuing would be worse than not trying.
     """
+    recovered: set[str] = set()
     for stage, info in list(failures.items()):
         if should_stop and should_stop():
             return
@@ -2845,6 +3096,10 @@ def _retry_failed_stages(failures: dict, cfg: dict, all_responses: dict,
                 "stage": stage, "failed": info.get("agent"),
                 "agent": alternative, "reason": info["reason"],
                 "exhausted": info.get("exhausted", False)})
+            # This stage's own harvested images, pulled back out of the
+            # nested run() below rather than lost with its own local
+            # pipeline_files when that call returns — see pipeline_files_out.
+            recovered_files: list = []
             try:
                 responses, links = run(
                     {}, cfg,
@@ -2857,7 +3112,8 @@ def _retry_failed_stages(failures: dict, cfg: dict, all_responses: dict,
                     should_stop=should_stop,
                     # One level only. Without this a category where every tool
                     # is having a bad afternoon retries itself forever.
-                    failover=False)
+                    failover=False,
+                    pipeline_files_out=recovered_files)
             except Exception as e:                       # noqa: BLE001
                 ui.err(f"   {alternative} also failed: {e}")
                 continue
@@ -2867,6 +3123,9 @@ def _retry_failed_stages(failures: dict, cfg: dict, all_responses: dict,
                 all_responses[stage] = texts
                 if links.get(stage):
                     all_links[stage] = links[stage]
+                if recovered_files and pipeline_files is not None:
+                    pipeline_files[:] = (pipeline_files + recovered_files)[-6:]
+                recovered.add(stage)
                 ui.ok(f"   ✅  {alternative} finished the {stage} step")
                 emit("stage_recovered", {
                     "stage": stage, "agent": alternative,
@@ -2878,6 +3137,68 @@ def _retry_failed_stages(failures: dict, cfg: dict, all_responses: dict,
             emit("stage_unrecovered", {
                 "stage": stage, "failed": info.get("agent"),
                 "reason": info["reason"]})
+
+    if recovered and stages:
+        _rerender_local_after_recovery(recovered, stages, cfg, all_responses,
+                                       all_links, attachments=attachments,
+                                       pipeline_files=pipeline_files,
+                                       brand=brand, emit=emit)
+
+
+def _rerender_local_after_recovery(recovered: set, stages, cfg: dict,
+                                   all_responses: dict, all_links: dict, *,
+                                   attachments, pipeline_files, brand, emit):
+    """Give a local renderer a second pass once a stage feeding it has been
+    recovered by failover.
+
+    A LOCAL stage (Prism Reel, Prism Studio) runs synchronously, in its own
+    turn in the main loop — so if `visual` failed there, the renderer already
+    ran, without the images `visual` was going to hand it. `_retry_failed_stages`
+    may then go on to recover `visual` through a different tool, but that
+    happens after the whole pipeline finished; nothing about a plain text/URL
+    handoff makes a video that already rendered start using pictures that
+    showed up afterwards. Calling the same renderer function again is cheap
+    and safe — unlike the browser stages, it isn't holding a tab or an index
+    into `stages` that a second pass could disturb — so it is what gets called
+    here rather than left as the limitation the rest of this failover accepts.
+
+    Walks `stages` in order rather than jumping straight to the renderer, so a
+    LOCAL stage only gets redone when something that actually ran BEFORE it
+    was among the ones just recovered — a renderer with no recovered stage
+    upstream of it has nothing new to draw from and is left alone.
+    """
+    seen_recovered: set[str] = set()
+    for stage, agent_name, _questions in stages:
+        if stage in recovered:
+            seen_recovered.add(stage)
+            continue
+        if not seen_recovered or stage not in all_links:
+            continue                    # nothing upstream recovered, or this
+                                         # stage never ran in the first place
+        agent_cfg = A.resolve_agent(stage, agent_name)
+        if not (agent_cfg and agent_cfg.get("local")):
+            continue
+        ui.rule(f"{stage.upper()}  ·  re-rendering", style="yellow")
+        ui.info(f"   🔁  {', '.join(sorted(seen_recovered))} came back after "
+                f"{stage} finished the first time — rendering it again with "
+                "what showed up")
+        prior_text = [t for ts in reversed(list(all_responses.values()))
+                      for t in ts if t.strip()]
+        try:
+            out, note = _run_local(agent_cfg["local"], prior_text,
+                                   (attachments or []) + (pipeline_files or []),
+                                   cfg, stage, brand=brand)
+        except Exception as e:                            # noqa: BLE001
+            ui.err(f"   re-render failed: {e}")
+            continue
+        if out:
+            all_responses[stage] = [note]
+            all_links[stage] = out
+            ui.ok(f"   {note}")
+            emit("stage_done", {"stage": stage, "count": 1, "texts": [note],
+                                "url": out, "timed_out": False})
+        else:
+            ui.err(f"   re-render failed: {note}")
 
 
 def open_login_tabs(urls: list[str]):

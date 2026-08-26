@@ -11,6 +11,14 @@ import json
 CONFIG_DIR = os.path.join(os.path.expanduser("~"), ".prism")
 CONFIG_PATH = os.path.join(CONFIG_DIR, "config.json")
 RUNS_DIR = os.path.join(CONFIG_DIR, "runs")
+# Where a generated file goes to be found again. RUNS_DIR is hidden on macOS
+# and easy to walk past on Windows/Linux, and anything only harvested
+# mid-pipeline used to land in the OS temp directory — gone the moment Prism,
+# or the OS, cleans up. A rendered video, a generated image, a written
+# document: all of it belongs somewhere a customer looks without being told
+# where — same idea as gerber_dialog.py's own "Prism Gerber" folder on the
+# Desktop, generalised past just Gerber's CSVs.
+ARTIFACTS_DIR = os.path.join(os.path.expanduser("~/Desktop"), "Prism Artifacts")
 
 DEFAULT = {
     "api_key": "",        # Groq key (gsk_...)
@@ -109,4 +117,37 @@ def save_run(record: dict, runs_dir: str = "") -> str:
     path = os.path.join(runs_dir, f"run_{int(time.time())}.json")
     with open(path, "w", encoding="utf-8") as f:
         json.dump(record, f, indent=2, ensure_ascii=False)
+    return path
+
+
+def _artifact_stem(prompt: str, kind: str) -> str:
+    """A filename that says what made it, not just when — same sanitising
+    rule gerber_dialog.py already uses for its CSV names, so a customer
+    scanning the folder sees "quote 500 pcs for Acme" rather than a hash."""
+    import time
+    stem = "".join(c if c.isalnum() or c in "-_" else "_"
+                   for c in (prompt or "").strip())[:60].strip("_")
+    return f"{stem or kind}_{int(time.time())}"
+
+
+def save_artifact(src_path: str, prompt: str, kind: str = "artifact") -> str:
+    """Copy a file an agent generated into the one folder a customer will
+    actually look in again — see ARTIFACTS_DIR above for why this exists.
+
+    A copy, not a move: whatever already has `src_path` (a pipeline stage,
+    the render worker) keeps working with the path it knows, and losing this
+    copy afterwards (a full disk, a permissions slip) never breaks the
+    caller's own view of what it produced.
+    """
+    os.makedirs(ARTIFACTS_DIR, exist_ok=True)
+    _, ext = os.path.splitext(src_path)
+    stem = _artifact_stem(prompt, kind)
+    dest = os.path.join(ARTIFACTS_DIR, f"{stem}{ext}")
+    n = 1
+    while os.path.exists(dest):
+        n += 1
+        dest = os.path.join(ARTIFACTS_DIR, f"{stem}_{n}{ext}")
+    import shutil
+    shutil.copy2(src_path, dest)
+    return dest
     return path
