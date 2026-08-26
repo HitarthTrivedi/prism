@@ -3208,6 +3208,42 @@ def run(routing: dict, cfg: dict, attachments=None, on_event=None,
                         else:
                             ui.err("   still no scene spec — the renderer will "
                                    "have nothing to draw")
+
+                    # Groq API fallback (browser-first, API-backstop). The
+                    # browser is tried exactly as before; only if it STILL has
+                    # no renderable spec here — the model refused the JSON
+                    # contract, wrote prose, or was cut off — do we ask Groq for
+                    # it. json_mode forces one JSON object and the call returns
+                    # the moment it is done (a real completion signal, no 300s
+                    # stability guess, no refusal), so a run reaches the renderer
+                    # with something to draw instead of nothing. Browser output
+                    # is always preferred; this never runs when it succeeded.
+                    have_spec = bool(stage_responses) and _reel.has_spec(
+                        stage_responses[-1])
+                    if not have_spec and cfg.get("api_key"):
+                        ui.info("   ⚡  no usable spec from the browser — asking "
+                                "Groq (API) for the JSON")
+                        emit("retry", {"stage": stage,
+                                       "reason": "groq spec fallback"})
+                        api_prompt = (
+                            (context or "")
+                            + "\n\n".join(questions)
+                            + "\n\n" + _reel.spec_instructions()
+                            + "\n\nReply with ONLY the JSON object — first "
+                              "character '{', last '}'.")
+                        try:
+                            from . import router as _router
+                            got = _router.groq_chat(
+                                cfg.get("api_key", ""), cfg.get("model", ""),
+                                api_prompt, json_mode=True, timeout=90)
+                            if _reel.has_spec(got):
+                                stage_responses = [got]
+                                ui.ok("   ✓  Groq produced a valid scene spec")
+                            else:
+                                ui.warn("   Groq's reply still wasn't a usable "
+                                        "spec — nothing to render")
+                        except Exception as e:
+                            ui.warn(f"   Groq spec fallback failed: {e}")
             # The artwork exists and is good. NOW make it editable — a second
             # prompt in the same chat rather than a different first prompt.
             stage_responses, canva_url = _make_editable(

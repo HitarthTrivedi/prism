@@ -128,13 +128,22 @@ def _model_is_gone(status: int, body: dict) -> bool:
 
 
 def groq_chat(api_key: str, model: str, prompt: str, *, temperature: float = 0.3,
-              timeout: int = 60, retries: int = 1) -> str:
+              timeout: int = 60, retries: int = 1, json_mode: bool = False) -> str:
     """One Groq completion, with the two failures a daily user actually hits.
 
     Rate limits are retried after the wait Groq asks for; a retired model falls
     through to the next in the chain and the working one is saved. Everything
     else raises with the server's own words, because those are usually
     actionable ("invalid api key") and paraphrasing them loses that.
+
+    `json_mode` asks Groq to constrain the whole reply to a single JSON object
+    (`response_format={"type": "json_object"}`). This is the point of the API
+    path for machine-consumed stages: unlike a scraped browser answer, the
+    model cannot wrap the JSON in prose, refuse the format as an "injection",
+    or trail off — so a renderer/parser downstream gets valid JSON or a clean
+    error, with a real completion signal instead of a 300s stability guess.
+    The prompt must itself mention JSON somewhere or Groq rejects the request;
+    Prism's machine-stage prompts already say "reply with only a JSON object".
     """
     headers = {"Authorization": f"Bearer {api_key}",
                "Content-Type": "application/json"}
@@ -142,12 +151,13 @@ def groq_chat(api_key: str, model: str, prompt: str, *, temperature: float = 0.3
     for candidate in model_chain(model):
         for attempt in range(retries + 1):
             try:
+                payload = {"model": candidate,
+                           "messages": [{"role": "user", "content": prompt}],
+                           "temperature": temperature}
+                if json_mode:
+                    payload["response_format"] = {"type": "json_object"}
                 resp = requests.post(
-                    GROQ_URL, headers=headers,
-                    json={"model": candidate,
-                          "messages": [{"role": "user", "content": prompt}],
-                          "temperature": temperature},
-                    timeout=timeout)
+                    GROQ_URL, headers=headers, json=payload, timeout=timeout)
             except requests.RequestException as e:
                 raise RuntimeError(
                     f"Couldn't reach Groq — check your internet connection. "
