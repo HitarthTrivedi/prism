@@ -267,11 +267,17 @@ _MAKE_LABEL = {
 
 
 def _mentions(text_lc: str, terms: list[str]) -> bool:
+    """Every list this checks (_BUILD_VERBS, _ARTEFACT_STAGES) is written in
+    the singular/base form — "image", "generate" — but real requests say
+    "images" or "it generates images" as often as not. \\b alone treats the
+    plural 's' as a boundary violation and misses those entirely, which is
+    how "also use Images ... in the reel too" fails to trigger the visual
+    guardrail even though it says exactly what it means."""
     for t in terms:
         if " " in t or "-" in t:
             if t in text_lc:
                 return True
-        elif re.search(r"\b" + re.escape(t) + r"\b", text_lc):
+        elif re.search(r"\b" + re.escape(t) + r"s?\b", text_lc):
             return True
     return False
 
@@ -332,6 +338,51 @@ def apply_script_guardrail(routing: dict, agents: dict) -> bool:
         "itself — output the words only; a later stage builds it."
     ]}
     return True
+
+
+# Prism Reel's whole house style is icons and typography, drawn in code —
+# real photographs never appear in a frame, only their pixels sampled once for
+# an accent colour. A brief that needs actual photography ON SCREEN (a grid
+# mockup, a before/after comparison, real product or lifestyle shots) is
+# asking for something that renderer structurally cannot draw. Prism Studio
+# can: it places images by a real `asset:name` reference. Terms are about
+# photography APPEARING in the video, not about "make an image" as a
+# separate deliverable — that is _ARTEFACT_STAGES["visual"]'s job, a
+# different question with a different answer.
+_PHOTO_REEL_TERMS = [
+    "instagram grid", "grid mockup", "mockup", "before/after",
+    "before and after", "lifestyle photo", "lifestyle shot",
+    "product photo", "product shot", "stock photo", "real photo",
+    "photograph", "photoshoot", "phone mockup",
+]
+
+
+def apply_studio_guardrail(query: str, routing: dict, agents: dict) -> str:
+    """Swap Prism Reel for Prism Studio when the brief clearly needs real
+    photography drawn INTO the reel, not just brand colour sampled off one.
+
+    Deterministic for the same reason apply_make_guardrail is: this is a
+    structural mismatch between what was asked for and what the configured
+    tool can physically draw, not a judgment call worth leaving to whichever
+    way an LLM router happens to read the brief that day.
+
+    A per-run swap only — mutates `routing`, not `agents` or the user's saved
+    config, so the next run still defaults back to whatever they configured.
+    Returns the message to log, or "" if nothing changed."""
+    if agents.get("media") != "Prism Reel":
+        return ""                          # nothing to swap, or already Studio
+    if "Prism Studio" not in A.CATEGORIES.get("media", {}).get("agents", []):
+        return ""
+    m = routing.get("media") or {}
+    if not (m.get("needed") and m.get("questions")):
+        return ""
+    if not _mentions(query.lower(), _PHOTO_REEL_TERMS):
+        return ""
+    routing["media"]["agent_override"] = "Prism Studio"
+    return ("this brief needs real photography in the reel, which Prism "
+            "Reel's code-drawn house style can't display — using Prism "
+            "Studio instead for this run")
+
 
 # One-line description of what each stage is FOR, injected into the prompt only
 # for the stages the user actually enabled.
@@ -769,6 +820,9 @@ def route(query: str, cfg: dict, attachments: list | None = None) -> dict:
     if apply_script_guardrail(routing, agents):
         ui.info(f"🛡️  guardrail enabled content ({agents['content']}) — "
                 "the reel/deck's script is a content job, not a brains job")
+    studio_swap = apply_studio_guardrail(query, routing, agents)
+    if studio_swap:
+        ui.info(f"🛡️  guardrail: {studio_swap}")
     # Surface the enrichment brief so the UI can show the full transformation
     # chain (raw words → brief → stage prompts). Consumers iterate
     # PIPELINE_ORDER, so this extra key is invisible to them.
