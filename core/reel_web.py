@@ -245,6 +245,36 @@ window.__check = function () {
         out.push('"' + label + '" is ' + Math.round(fs) +
                  'px — under the %dpx minimum for video');
       }
+
+      // A box can be inside the frame and still be unusable: a later opaque
+      // panel, image or decorative layer may be painted on top of it. Sample
+      // the centre and inset corners. If every sample resolves to a sibling
+      // above the text, report the occlusion before the scene is filmed.
+      const pts = [
+        [r.left + r.width * .50, r.top + r.height * .50],
+        [r.left + r.width * .18, r.top + r.height * .35],
+        [r.left + r.width * .82, r.top + r.height * .35],
+        [r.left + r.width * .18, r.top + r.height * .70],
+        [r.left + r.width * .82, r.top + r.height * .70]
+      ];
+      let covered = 0;
+      for (const [x, y] of pts) {
+        const top = document.elementFromPoint(x, y);
+        if (top && top !== el && !el.contains(top) && !top.contains(el)) {
+          const tc = getComputedStyle(top);
+          if (tc.visibility !== 'hidden' && parseFloat(tc.opacity) >= .08) {
+            covered++;
+          }
+        }
+      }
+      if (covered === pts.length && !seen.has(key + 'occluded')) {
+        seen.add(key + 'occluded');
+        const by = document.elementFromPoint(r.left + r.width / 2,
+                                              r.top + r.height / 2);
+        out.push('"' + label + '" is covered by a higher layer (' +
+                 ((by && by.tagName) || 'element').toLowerCase() +
+                 ') — raise the text z-index or move the covering layer');
+      }
     }
 
     // Images are checked too: a logo half off the frame is exactly as broken
@@ -1199,6 +1229,22 @@ def design_instructions(brand: dict | None = None, request: str = "",
         "`.scene` is already a full-frame absolutely-positioned layer, and "
         "`--safe-x`/`--safe-y` (90px/130px) are the margins to keep text "
         "inside.\n\n"
+        "THE LAYER CONTRACT — obey this in every scene:\n"
+        "· Establish an explicit stack: background z-index 0; textures and "
+        "decorations 10; image assets 20; cards and colour panels 30; all "
+        "headlines, body copy and required script words 50; tiny labels, "
+        "counters and brand marks 60. Give positioned elements an explicit "
+        "z-index instead of relying on DOM order.\n"
+        "· Required words are always above decorative shapes and image assets. "
+        "A panel may sit behind copy, never across it. If copy sits over an "
+        "image, give it a solid or translucent backing with enough contrast "
+        "to read at arm's length.\n"
+        "· Do not let a circle, rule, crop, image, card or entering scene "
+        "cross a headline or support line unless the overlap is deliberate, "
+        "brief, and the text remains fully readable.\n"
+        "· Keep the primary headline and support in a dedicated content layer "
+        "with its own z-index. Check the settled frame, not only the entrance "
+        "frame: animation must never leave copy behind an opaque sibling.\n\n"
         "WHAT WILL BE REJECTED — the page is measured before it is filmed:\n"
         "· any text whose box falls outside the 1080x1920 frame\n"
         f"· any text rendered under {T_LABEL}px; headlines want "
@@ -1415,7 +1461,11 @@ def scene_instructions(idx: int, total: int, line: dict, script_scene: dict,
         "(a field, a gradient, a rule system, a drawn line), the thing the "
         "scene is about in the middle, and something small and quiet at an "
         "edge that grounds it — a source, a unit, a count, a label. Three "
-        "depths, not one centred block.\n\n"
+        "depths, not one centred block. Use an explicit z-index for each "
+        "depth: background 0, artwork 20, panels 30, required copy 50, "
+        "labels 60. Required copy must be the top readable layer. Never let "
+        "a panel or image cover it; if text crosses artwork, add a solid or "
+        "translucent backing and verify contrast.\n\n"
 
         "MOTION — the part that makes it move rather than appear:\n"
         "· Ordinary CSS @keyframes. The renderer pauses the page and sets "
