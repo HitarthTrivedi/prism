@@ -1482,6 +1482,115 @@ def _reel_designed(cfg, request, brand, images, writer_agent, director_agent):
                          "designed": True}})
 
 
+def cmd_motion(cfg: dict, request: str, attachments: list | None = None):
+    if not request.strip():
+        ui.warn("Please specify what motion graphic you want to generate.")
+        ui.info("Example: /motion Create an animated architecture diagram of our distributed crawler")
+        return
+
+    try:
+        from core import motion
+    except ImportError as e:
+        ui.err(f"Motion Graphics Engine not installed: {e}")
+        return
+
+    ok, err = motion.is_available()
+    if not ok:
+        ui.err(f"Motion Graphics requirement missing: {err}")
+        return
+
+    from core.motion.prompts import MOTION_SYSTEM_PROMPT, parse_motion_reply
+    from core.automation import execute_stages
+
+    prompt = f"{MOTION_SYSTEM_PROMPT}\n\nUSER REQUEST: {request}"
+
+    # ── Multi-agent fallback routing ───────────────────────────────────────────
+    # Build a prioritized provider chain:
+    #   1. Configured motion_agent (user preference)
+    #   2. Default agent
+    #   3. All other configured agents in order
+    # On empty response or parse failure, cascade to the next provider.
+    preferred = cfg.get("motion_agent") or cfg.get("default_agent") or "claude"
+    all_agents = list(cfg.get("agents", {}).keys()) if "agents" in cfg else []
+    fallback_chain: list[str] = []
+    fallback_chain.append(preferred)
+    for name in ["claude", "chatgpt", "gpt4o", "groq", "gemini", "openai"]:
+        if name not in fallback_chain and (name in (all_agents or [])):
+            fallback_chain.append(name)
+    # Append any remaining configured agents not yet in chain
+    for name in all_agents:
+        if name not in fallback_chain:
+            fallback_chain.append(name)
+
+    spec = None
+    used_agent = None
+    last_error = ""
+
+    for agent in fallback_chain:
+        try:
+            ui.rule(f"Visual Director ({agent})", "magenta")
+            ui.info(f"Designing motion graphic: {request}")
+
+            responses, links = execute_stages(
+                cfg,
+                custom_stages=[("motion_plan", agent, [prompt])],
+                query=f"motion graphic — {request}")
+
+            texts = [t for t in (responses.get("motion_plan") or []) if t.strip()]
+            if not texts:
+                last_error = f"{agent}: returned empty response"
+                ui.warn(f"   {last_error} — trying next provider…")
+                continue
+
+            spec = parse_motion_reply(texts[-1])
+            used_agent = agent
+            break
+
+        except ValueError as e:
+            last_error = f"{agent}: could not parse motion spec — {e}"
+            ui.warn(f"   {last_error} — trying next provider…")
+            continue
+        except Exception as e:
+            last_error = f"{agent}: {e}"
+            ui.warn(f"   {last_error} — trying next provider…")
+            continue
+
+    if spec is None:
+        ui.err(f"All AI providers failed to produce a valid motion specification.")
+        ui.err(f"Last error: {last_error}")
+        return
+
+    import time, json
+    os.makedirs(C.RUNS_DIR, exist_ok=True)
+    stamp = int(time.time())
+    out = os.path.join(C.RUNS_DIR, f"motion_{stamp}.mp4")
+    spec_path = os.path.join(C.RUNS_DIR, f"motion_{stamp}.json")
+    with open(spec_path, "w", encoding="utf-8") as f:
+        json.dump(spec, f, indent=2)
+
+    dur = float((spec.get("project") or {}).get("duration", 10.0))
+    ui.info(f"rendering motion graphic ({dur:.1f}s, 1080x1920 @ 30fps) via {used_agent}…")
+
+    _last_reported = [-1]
+    def _progress(done: int, total: int):
+        pct = int(done / total * 100) if total else 0
+        bucket = pct // 10
+        if bucket != _last_reported[0]:
+            _last_reported[0] = bucket
+            ui.info(f"   frame {done}/{total} ({pct}%)")
+
+    try:
+        motion.render(spec, out, on_progress=_progress)
+    except Exception as e:
+        ui.err(f"Motion rendering failed: {e}")
+        return
+
+    ui.ok(f"Motion Graphic ready → {out}")
+    ui.info(f"   specification saved → {spec_path}")
+    C.save_run({"query": f"/motion {request}", "responses": responses, "links": links,
+                "motion": {"mp4": out, "spec": spec_path}})
+
+
 def reel_available() -> tuple[bool, str]:
     try:
         from PIL import Image  # noqa: F401
@@ -1592,6 +1701,8 @@ def _dispatch(cfg: dict, line: str, attachments: list) -> tuple[dict, bool]:
         cmd_gerber(cfg, line[len("/gerber"):].strip(), attachments)
     elif line.startswith("/reel"):
         cmd_reel(cfg, line[len("/reel"):].strip(), attachments)
+    elif line.startswith("/motion"):
+        cmd_motion(cfg, line[len("/motion"):].strip(), attachments)
     elif line.startswith("/dry"):
         run_query(cfg, line[4:].strip(), dry=True, attachments=attachments)
     elif line.startswith("/"):

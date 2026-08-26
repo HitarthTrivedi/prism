@@ -69,7 +69,10 @@ def tools_dir() -> str:
     than to the team.
     """
     path = os.path.join(os.path.expanduser("~"), ".prism", "tools")
-    os.makedirs(path, exist_ok=True)
+    try:
+        os.makedirs(path, exist_ok=True)
+    except OSError:
+        pass
     return path
 
 

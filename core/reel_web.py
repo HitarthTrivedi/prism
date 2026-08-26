@@ -94,15 +94,16 @@ html, body {{
 #stage {{ position: relative; width: {W}px; height: {H}px; overflow: hidden; }}
 /* A scene is a full-frame layer. Only the ones in play are painted, so an
    off-screen scene can never leak a stray pixel into the frame. */
-.scene {{ position: absolute; inset: 0; visibility: hidden; }}
-.scene.on {{ visibility: visible; }}
+#stage > .scene {{ position: absolute; inset: 0; visibility: hidden; }}
+#stage > .scene.on {{ visibility: visible; }}
+#stage > .scene.on .scene, #stage > .scene.on * {{ visibility: visible; }}
 /* The safe area is advisory for the designer and enforced by the checker. */
 :root {{ --safe-x: {SAFE_X}px; --safe-y: {SAFE_Y}px; --W: {W}px; --H: {H}px; }}
 .safe {{ position: absolute; inset: var(--safe-y) var(--safe-x); }}
 /* Default cut, overridable: whatever the design says about .leaving and
    .entering wins, because these are the weakest possible rules. */
-.scene.leaving {{ opacity: calc(1 - var(--x, 0)); }}
-.scene.entering {{ opacity: var(--e, 1); }}
+#stage > .scene.leaving {{ opacity: calc(1 - var(--x, 0)); }}
+#stage > .scene.entering {{ opacity: var(--e, 1); }}
 img, svg, video {{ max-width: 100%; }}
 
 /* ── the cut library ──────────────────────────────────────────────────────

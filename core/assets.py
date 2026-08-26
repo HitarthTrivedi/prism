@@ -170,8 +170,23 @@ def collect(images: list, out_dir: str | None = None,
     paths = []
     for item in images or []:
         p = item.get("path") if isinstance(item, dict) else item
-        if p and str(p).lower().endswith((".png", ".jpg", ".jpeg", ".webp", ".bmp")):
+        if not p:
+            continue
+        p_low = str(p).lower()
+        if p_low.endswith((".png", ".jpg", ".jpeg", ".webp", ".bmp")):
             paths.append(p)
+        elif p_low.endswith((".pptx", ".docx")):
+            try:
+                import zipfile
+                with zipfile.ZipFile(p, "r") as z:
+                    for name in z.namelist():
+                        if name.startswith(("ppt/media/", "word/media/")) and name.lower().endswith((".png", ".jpg", ".jpeg", ".webp", ".bmp")):
+                            extracted = os.path.join(out_dir, f"doc_{os.path.basename(name)}")
+                            with open(extracted, "wb") as ef:
+                                ef.write(z.read(name))
+                            paths.append(extracted)
+            except Exception:
+                pass
     if not paths:
         return {}
 
