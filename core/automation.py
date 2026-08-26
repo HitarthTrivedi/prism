@@ -2358,6 +2358,14 @@ def run(routing: dict, cfg: dict, attachments=None, on_event=None,
                                    (attachments or []) + pipeline_files,
                                    cfg, stage, brand=studio_brand)
             if out:
+                # Keep the internal reel_<timestamp> working name, but make
+                # the customer-facing artifact describe the original request.
+                try:
+                    from . import config as _config
+                    saved = _config.save_artifact(out, query, kind="reel")
+                    ui.info(f"   💾  saved to {saved}")
+                except Exception:                       # noqa: BLE001
+                    pass       # rendering succeeded; copying is best-effort
                 all_responses[stage] = [note]
                 all_links[stage] = out
                 ui.ok(note)
@@ -3231,4 +3239,3 @@ def open_login_tabs(urls: list[str]):
         # instead of racing it and getting dropped.
         time.sleep(3.5 if first else 0.5)
         first = False
-
