@@ -22,12 +22,19 @@ scrapped panel, and nobody can undo that:
     the file's meaning, and whether to cut or delete is the operator's call.
   · A small margin (default 0.05 mm) around the edge counts as inside, so a
     pad that kisses the board edge is not thrown away for a rounding error.
-  · If NOTHING on a layer lands on the board — or the layer's whole extent
-    sits almost entirely off it — nothing on that layer is removed and the
-    layer is flagged: that pattern means the outline and the layer disagree
-    about where the origin is, not that the board is junk. (Counting
-    objects would not do: a legend beside the board is hundreds of tiny
-    strokes, the board itself may be eighty pads.)
+  · An ARRAY is cleaned against the whole panel, not one board of it: the
+    rails, fiducials and tooling holes between the boards are wanted, and
+    the other boards are certainly wanted. The first run on the real panel
+    took one 184 x 39 board as "the outline" and removed the other four.
+  · If NOTHING on a layer lands on the board, or the layer's whole extent
+    sits almost entirely off it, or more than a third of the layer's copper
+    BY AREA would go — nothing on that layer is removed and the layer is
+    flagged. Those patterns mean the outline and the layer disagree about
+    where the board is, not that the board is junk. (Counting objects would
+    not do: a legend beside the board is hundreds of tiny strokes, the board
+    itself may be eighty pads — so the guard is on area, and it caught an
+    outline taken from a drill drawing that would have deleted 60% of a
+    twelve-layer board.)
   · Only image layers are cleaned — copper, mask, silkscreen, paste, pad
     master. The outline itself, mechanical layers, drill files and reports
     are copied through as they are.
@@ -75,6 +82,9 @@ DEFAULT_MARGIN_MM = 0.05
 # Below this share of a layer's own extent lying over the board, the outline
 # and the layer disagree about the origin; removing would destroy the layer.
 MIN_ON_BOARD_SHARE = 0.10
+# Above this share of a layer's drawn AREA lying outside, what is outside is
+# not junk — the outline is wrong — and nothing is removed.
+MAX_REMOVED_AREA_SHARE = 0.35
 REPORT_TXT = "cleaning_report.txt"
 REPORT_CSV = "cleaning_report.csv"
 PREVIEW_DIR = "previews"
@@ -101,11 +111,34 @@ def outline_for(files: list[dict], on_progress=None):
                     say(f"  could not read {entry['name']}: {e}")
         return layers
 
-    face, layer = G.outline_face(parse({"outline"}))
+    layers = parse({"outline"})
     source = "outline layer"
+    face, layer = G.outline_face(layers)
     if face is None:
-        face, layer = G.outline_face(parse({"drill_guide", "drill_drawing"}))
+        layers = parse({"drill_guide", "drill_drawing"})
         source = "drill guide/drawing (no outline layer in the job)"
+        face, layer = G.outline_face(layers)
+    if face is None:
+        return None, source
+    array = G.panel(layers)
+    if array["is_array"]:
+        # The whole panel, rails included — see the module docstring.
+        x0, y0 = array["origin"]
+        frame = None
+        for l in layers:
+            for f in (G.closed_faces(l, *G._CLOSE_LADDER[0])
+                      or G.closed_faces(l, *G._CLOSE_LADDER[1])):
+                b = f.bounds
+                if (b[2] - b[0] >= array["array_w"] - 1e-6
+                        and b[3] - b[1] >= array["array_h"] - 1e-6):
+                    frame = f if frame is None or f.area > frame.area else frame
+        if frame is not None:
+            face = frame
+        else:
+            face = _box(x0, y0, x0 + array["array_w"], y0 + array["array_h"])
+        source = (f"{source} — a panel of {array['count']} boards of "
+                  f"{array['pcb_w']:.2f} x {array['pcb_h']:.2f} mm; cleaned "
+                  "against the whole panel")
     return face, source
 
 
@@ -184,6 +217,7 @@ def clean_job(paths: list[str], out_dir: str, *,
 
         total = len(layer.objects)
         on_board = _on_board_share(extents, face)
+        removed_area = _area_share([w for _, w in removed], extents)
         result = {
             "name": name, "role": entry["role"], "label": entry.get("label", ""),
             "objects": total, "kept": len(kept), "removed": len(removed),
@@ -193,16 +227,25 @@ def clean_job(paths: list[str], out_dir: str, *,
             "suspicious": False,
         }
         if total and (not kept or on_board < MIN_ON_BOARD_SHARE):
-            # Not a cleaning job — an origin mismatch. Refuse rather than
-            # destroy the layer, and say so loudly.
+            reason = (f"only {on_board:.0%} of this layer sits over the "
+                      "outline. That is an origin mismatch between the layer "
+                      "and the outline, not junk")
+        elif total and removed_area > MAX_REMOVED_AREA_SHARE:
+            reason = (f"{removed_area:.0%} of this layer's copper BY AREA "
+                      f"lies outside the outline ({len(removed)} objects, "
+                      f"{len(crossing)} crossing the edge). That much is not "
+                      "junk — the outline is wrong for this layer")
+        else:
+            reason = ""
+        if reason:
+            # Not a cleaning job. Refuse rather than destroy the layer, and
+            # say so loudly.
             result.update(kept=total, removed=0, crossing=0, suspicious=True,
                           removed_list=[], crossing_list=[])
             shutil.copy2(entry["path"], out_path)
             report["warnings"].append(
-                f"{entry['name']}: only {on_board:.0%} of this layer sits over "
-                f"the outline. That is an origin mismatch between the layer "
-                f"and the outline, not junk — NOTHING was removed from it. "
-                f"Check the outline layer with the customer.")
+                f"{entry['name']}: {reason} — NOTHING was removed from it. "
+                "Check the outline layer with the customer.")
         else:
             before = _svg(layer)
             layer.objects = kept
@@ -258,6 +301,19 @@ def _on_board_share(extents: list[tuple], face) -> float:
         return 1.0
     extent = _box(x0, y0, x1, y1)
     return extent.intersection(face.envelope).area / extent.area
+
+
+def _area_share(removed: list[tuple], all_extents: list[tuple]) -> float:
+    """The removed objects' share of the layer's drawn area, 0..1, by
+    bounding box — coarse, and exactly the right coarseness: a legend of
+    hairline strokes is nothing by area, a board's worth of tracks and
+    pads is most of it."""
+    def area(e):
+        return max(e[2] - e[0], 1e-3) * max(e[3] - e[1], 1e-3)
+    total = sum(area(e) for e in all_extents)
+    if total <= 0:
+        return 0.0
+    return sum(area(e) for e in removed) / total
 
 
 def _describe(obj, where) -> dict:

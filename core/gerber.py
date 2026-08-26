@@ -1037,6 +1037,111 @@ def spacing(layer: GerberLayer, snap_mm: float = SNAP_MM, conductors=None,
             "snapped": snapped, "with_markings_mm": None, "note": ""}
 
 
+def _pad_dims(layer: GerberLayer, dcode: int, at) -> tuple | None:
+    """(width, height) of one flashed pad in mm, or None when the aperture
+    has no size we can read."""
+    shape, params = layer.apertures.get(dcode, (None, []))
+    if shape == "C" and params:
+        return params[0], params[0]
+    if shape in ("R", "O") and params:
+        return params[0], (params[1] if len(params) > 1 else params[0])
+    if shape == "P" and params:
+        return params[0], params[0]
+    if shape:
+        g = aperture_shape(shape, params, at, layer)
+        if g is not None and not g.is_empty:
+            x0, y0, x1, y1 = g.bounds
+            if x1 > x0 and y1 > y0:
+                return x1 - x0, y1 - y0
+    return None
+
+
+def pad_pitch(layer: GerberLayer, snap_mm: float = SNAP_MM) -> dict | None:
+    """The smallest centre-to-centre distance between two SEPARATE pads on
+    one layer — what a fab means by "min pitch" (a 0.5 mm QFP, a 0.4 mm
+    BGA).
+
+    Two flashes at one point are one pad drawn twice; two flashes whose
+    shapes touch are one pad drawn in pieces (an oval from two circles, a
+    pad with its thermal). Neither is a pitch, and both would otherwise be
+    the headline. So the nearest pairs are walked in order of distance and
+    the first whose shapes are apart is the answer."""
+    if not HAVE_SHAPELY:
+        return None
+    pads, seen = [], set()
+    for dcode, at in layer.flashes:
+        key = (round(at[0], 3), round(at[1], 3))
+        if key in seen:
+            continue
+        seen.add(key)
+        pads.append((at, dcode))
+    if len(pads) < 2:
+        return None
+    pts = [Point(*at) for at, _ in pads]
+    tree = STRtree(pts)
+    try:
+        idx, dist = tree.query_nearest(pts, exclusive=True, all_matches=False,
+                                       return_distance=True)
+    except Exception:                                   # pragma: no cover
+        return None
+    pairs: dict[tuple[int, int], float] = {}
+    for i, j, d in zip(idx[0].tolist(), idx[1].tolist(), dist.tolist()):
+        if i != j:
+            pairs[(i, j) if i < j else (j, i)] = d
+    shapes: dict[int, object] = {}
+
+    def shape_of(i):
+        if i not in shapes:
+            at, dcode = pads[i]
+            sh, pr = layer.apertures.get(dcode, (None, []))
+            shapes[i] = aperture_shape(sh, pr, at, layer) if sh else None
+        return shapes[i]
+    for (i, j), d in sorted(pairs.items(), key=lambda kv: kv[1]):
+        gi, gj = shape_of(i), shape_of(j)
+        if gi is not None and gj is not None and gi.distance(gj) <= snap_mm:
+            continue                    # one pad in pieces, not two pads
+        at_min = sum(1 for v in pairs.values() if abs(v - d) < 1e-3)
+        return {"min_mm": d, "at": pads[i][0], "pairs_at_min": at_min,
+                "pads": len(pads)}
+    return None
+
+
+def smt_pads(layer: GerberLayer, holes: list[tuple]) -> dict:
+    """The pads on this layer with no hole under them, and the smallest.
+
+    "SMT pad size" on a fab's sheet is the narrow side of the smallest
+    surface-mount pad — the number that sets the etch tolerance. A pad is
+    through-hole when a drill hit lies within its own half-extent of the
+    pad centre; with no drill positions at all every pad counts, and the
+    caller says so."""
+    dims = []
+    for dcode, at in layer.flashes:
+        d = _pad_dims(layer, dcode, at)
+        if d:
+            dims.append((min(d), d[0], d[1], at))
+    out = {"all": len(dims), "count": 0, "min_mm": None, "holes_known": bool(holes)}
+    if not dims:
+        return out
+    if holes and HAVE_SHAPELY:
+        tree = STRtree([Point(x, y) for x, y in holes])
+        pts = [Point(*d[3]) for d in dims]
+        try:
+            idx, dist = tree.query_nearest(pts, all_matches=False,
+                                           return_distance=True)
+            nearest = dict(zip(idx[0].tolist(), dist.tolist()))
+        except Exception:                               # pragma: no cover
+            nearest = {}
+        smt = [d for n, d in enumerate(dims)
+               if nearest.get(n, float("inf")) > max(d[1], d[2]) / 2]
+    else:
+        smt = dims
+    out["count"] = len(smt)
+    if smt:
+        m = min(smt, key=lambda d: (d[0], d[1] * d[2]))
+        out.update(min_mm=m[0], w=m[1], h=m[2], at=m[3])
+    return out
+
+
 def outline_face(layers: list[GerberLayer]):
     """The board's edge as one closed shape, and the layer it came from —
     or (None, None) when no candidate layer closes.
@@ -1051,25 +1156,53 @@ def outline_face(layers: list[GerberLayer]):
     best_face, best_layer = None, None
     if not HAVE_SHAPELY:
         return None, None
-    for layer in layers:
-        segs = [(a, b) for _, a, b in layer.draws]
-        if len(segs) < 3:
-            continue
-        try:
-            q = 1e-3        # 1 µm — under any tolerance, over any noise
-
-            def snap(pt):
-                return (round(pt[0] / q) * q, round(pt[1] / q) * q)
-            faces = [f for f in polygonize(
-                [LineString([snap(a), snap(b)]) for a, b in segs
-                 if snap(a) != snap(b)]) if f.area > 1.0]
+    for q, join in _CLOSE_LADDER:
+        for layer in layers:
+            faces = closed_faces(layer, q, join)
             if faces:
                 top = max(faces, key=lambda f: f.area)
                 if best_face is None or top.area > best_face.area:
                     best_face, best_layer = top, layer
-        except Exception:
-            pass
+        if best_face is not None:
+            break
     return best_face, best_layer
+
+
+# Exact first: a 1 µm grid, under any tolerance and over any noise, and no
+# gap-closing. Only when NOTHING closes at that, loose stroke ends within
+# 0.15 mm of each other are joined: one real export (2580043B) leaves gaps
+# of 0.06 mm between the strokes of its outline, and a board whose edge is
+# a hair open is still a board with an edge.
+_CLOSE_LADDER = ((1e-3, 0.0), (1e-3, 0.15))
+
+
+def closed_faces(layer: GerberLayer, q: float = 1e-3, join_mm: float = 0.0) -> list:
+    """Every closed shape the strokes of one layer form, snapped to a grid
+    of `q` mm and NODED where they cross before polygonising.
+
+    The noding is what makes a panel readable: its V-score lines run right
+    across the frame without sharing a vertex with it, and un-noded
+    polygonize closes nothing at all on such a layer — the one real panel
+    job read as one 196 x 195 mm board for that reason. Faces under 1 mm²
+    are drill symbols and drawing noise.
+
+    `join_mm` > 0 also joins each stroke end that meets nothing to the
+    nearest other such end within that distance."""
+    if not HAVE_SHAPELY:
+        return []
+
+    def snap(pt):
+        return (round(pt[0] / q) * q, round(pt[1] / q) * q)
+    segs = [(snap(a), snap(b)) for _, a, b in layer.draws if snap(a) != snap(b)]
+    if join_mm > 0:
+        segs = _join_loose_ends(segs, join_mm)
+    lines = [LineString([a, b]) for a, b in segs]
+    if len(lines) < 3:
+        return []
+    try:
+        return [f for f in polygonize(unary_union(lines)) if f.area > 1.0]
+    except Exception:
+        return []
 
 
 def board_outline(layers: list[GerberLayer]) -> dict:
@@ -1089,6 +1222,8 @@ def board_outline(layers: list[GerberLayer]) -> dict:
               "method": "", "source": "", "confident": False, "shape": "",
               "origin": (0.0, 0.0)}
     best_face, best_layer = outline_face(layers)
+    joined = best_face is not None and not any(
+        closed_faces(l, *_CLOSE_LADDER[0]) for l in layers)
     fallback = None
     for layer in layers:
         segs = [(a, b) for _, a, b in layer.draws]
@@ -1104,7 +1239,9 @@ def board_outline(layers: list[GerberLayer]) -> dict:
         corners = len(best_face.exterior.coords) - 1
         result.update(
             width_mm=x1 - x0, height_mm=y1 - y0, area_mm2=best_face.area,
-            method="closed outline path", source=best_layer.name,
+            method=("closed outline path (gaps under 0.15 mm joined)"
+                    if joined else "closed outline path"),
+            source=best_layer.name,
             confident=True, origin=(x0, y0),
             shape=("rectangular" if corners <= 4 else
                    f"{corners}-sided (chamfered or routed profile)"))
@@ -1115,6 +1252,123 @@ def board_outline(layers: list[GerberLayer]) -> dict:
                       method="outline layer extents (no closed path found)",
                       source=name, confident=False, shape="")
     return result
+
+
+# A board is at least this big; anything smaller closing on an outline or
+# drill layer is a fiducial, a symbol or a title.
+_UNIT_MIN_MM2 = 25.0
+# Two copies of the same board match to this in width and height.
+_UNIT_TOL_MM = 0.05
+# The boards of an array cover at least this much of the panel.
+_PANEL_FILL = 0.4
+
+
+def _join_loose_ends(segs: list, join_mm: float) -> list:
+    """Move each stroke end that meets no other stroke onto the nearest
+    other loose end within `join_mm`, so a hair-open outline closes."""
+    count: dict[tuple, int] = {}
+    for a, b in segs:
+        count[a] = count.get(a, 0) + 1
+        count[b] = count.get(b, 0) + 1
+    loose = [pt for pt, n in count.items() if n == 1]
+    if len(loose) < 2:
+        return segs
+    moved: dict[tuple, tuple] = {}
+    taken: set[tuple] = set()
+    for pt in loose:
+        if pt in taken:
+            continue
+        best, best_d = None, join_mm
+        for other in loose:
+            if other is pt or other in taken:
+                continue
+            d = math.hypot(pt[0] - other[0], pt[1] - other[1])
+            if d <= best_d:
+                best, best_d = other, d
+        if best is not None:
+            mid = ((pt[0] + best[0]) / 2, (pt[1] + best[1]) / 2)
+            moved[pt] = moved[best] = mid
+            taken.update((pt, best))
+    if not moved:
+        return segs
+    return [(moved.get(a, a), moved.get(b, b)) for a, b in segs
+            if moved.get(a, a) != moved.get(b, b)]
+
+
+def panel(layers: list[GerberLayer]) -> dict:
+    """Is this job an ARRAY — several copies of one board on a panel?
+
+    The customer's own word for it is "array", and the question behind it
+    is money: a panel of five is quoted per board and per panel, and a
+    reader that calls it one 196 x 195 mm board prices it as one board.
+
+    The test is on the outline layer: several closed faces of the same
+    size, not overlapping, adding up to most of the drawn area. That
+    catches a V-scored panel (units tiling the frame) and a routed panel
+    (units inside rails) alike; it does NOT fire on a board plus its
+    legend boxes (too small) or a board plus a ring inside it (overlaps).
+
+    Returns {"is_array": False, "count": 1} for a single board, else the
+    unit size, the count, the grid, and the panel size."""
+    none = {"is_array": False, "count": 1}
+    if not HAVE_SHAPELY:
+        return none
+    best = None
+    for layer in layers:
+        faces = (closed_faces(layer, *_CLOSE_LADDER[0])
+                 or closed_faces(layer, *_CLOSE_LADDER[1]))
+        if len(faces) < 2:
+            continue
+        big = max(f.area for f in faces)
+        cands = [f for f in faces if f.area >= max(_UNIT_MIN_MM2, 0.02 * big)]
+        groups: dict[tuple, list] = {}
+        for f in cands:
+            x0, y0, x1, y1 = f.bounds
+            key = (round((x1 - x0) / _UNIT_TOL_MM), round((y1 - y0) / _UNIT_TOL_MM))
+            groups.setdefault(key, []).append(f)
+        if not groups:
+            continue
+        units = max(groups.values(), key=lambda g: (len(g), g[0].area))
+        if len(units) < 2:
+            continue
+        if sum(f.area for f in units) < 0.5 * big:
+            continue                    # the repeats are decoration, not boards
+        overlapping = any(a.intersection(b).area > 0.01 * a.area
+                          for i, a in enumerate(units) for b in units[i + 1:])
+        if overlapping:
+            continue
+        xs = sorted({round(f.bounds[0], 1) for f in units})
+        ys = sorted({round(f.bounds[1], 1) for f in units})
+        ux0 = min(f.bounds[0] for f in units)
+        uy0 = min(f.bounds[1] for f in units)
+        ux1 = max(f.bounds[2] for f in units)
+        uy1 = max(f.bounds[3] for f in units)
+        # The panel is the frame around the units when one is drawn (the
+        # rails close as a face whose extent holds every unit), else the
+        # units' own extent.
+        frames = [f for f in faces
+                  if f.bounds[0] <= ux0 + 1e-6 and f.bounds[1] <= uy0 + 1e-6
+                  and f.bounds[2] >= ux1 - 1e-6 and f.bounds[3] >= uy1 - 1e-6
+                  and f not in units]
+        if frames:
+            fb = max(frames, key=lambda f: f.area).bounds
+            ax0, ay0, ax1, ay1 = fb
+        else:
+            ax0, ay0, ax1, ay1 = ux0, uy0, ux1, uy1
+        w = units[0].bounds[2] - units[0].bounds[0]
+        h = units[0].bounds[3] - units[0].bounds[1]
+        # Boards fill most of their panel. Two rows of a title block inside
+        # a drawing frame do not — one drill drawing offered exactly that.
+        if sum(f.area for f in units) < _PANEL_FILL * (ax1 - ax0) * (ay1 - ay0):
+            continue
+        found = {"is_array": True, "count": len(units),
+                 "pcb_w": w, "pcb_h": h,
+                 "cols": len(xs), "rows": len(ys),
+                 "array_w": ax1 - ax0, "array_h": ay1 - ay0,
+                 "origin": (ux0, uy0), "source": layer.name}
+        if best is None or found["count"] > best["count"]:
+            best = found
+    return best or none
 
 
 _ROUT = re.compile(r"^(M15|M16|G0[123])\b", re.M)
@@ -1198,6 +1452,7 @@ def excellon(path: str) -> dict:
         return -v if neg else v
 
     hits: dict[int, int] = {}
+    last_x = last_y = None
     positions: dict[int, list] = {}
     current: int | None = None
     routing = False
@@ -1229,16 +1484,24 @@ def excellon(path: str) -> dict:
             if routing:
                 continue                    # a point on a milling path
             hits[current] = hits.get(current, 0) + 1
-            if pos.group(1) and pos.group(2):
-                positions.setdefault(current, []).append(
-                    (coord(pos.group(1)), coord(pos.group(2))))
+            # X and Y are modal: a line giving only Y keeps the last X.
+            # Recording only lines with both left half the holes with no
+            # position, and a pad over an unrecorded hole read as SMT.
+            if pos.group(1):
+                last_x = coord(pos.group(1))
+            if pos.group(2):
+                last_y = coord(pos.group(2))
+            if last_x is not None and last_y is not None:
+                positions.setdefault(current, []).append((last_x, last_y))
             rep = re.search(r"R(\d+)", line)
             if rep:
                 hits[current] += int(rep.group(1))
     used = [{"tool": t, "dia_mm": tools[t], "hits": hits.get(t, 0),
              "plated": plated} for t in sorted(tools)]
     return {"tools": used, "total": sum(h for h in hits.values()),
-            "positions": positions, "source": os.path.basename(path),
+            "positions": positions,
+            "holes": [pt for pts in positions.values() for pt in pts],
+            "source": os.path.basename(path),
             "as_gerber": False, "plated": plated, "is_rout": is_rout}
 
 
@@ -1266,7 +1529,9 @@ def merge_drills(files: list[dict]) -> dict:
                 row["plated"] = None            # both kinds at this size
     tools = sorted(by_dia.values(), key=lambda r: r["dia_mm"])
     return {"tools": tools, "total": sum(t["hits"] for t in tools),
-            "positions": {}, "as_gerber": False,
+            "positions": {},
+            "holes": [pt for f in real for pt in f.get("holes", [])],
+            "as_gerber": False,
             "source": ", ".join(f["source"] for f in real),
             "rout_files": [f["source"] for f in routs]}
 
@@ -1288,7 +1553,10 @@ def drill_from_gerber(layer: GerberLayer) -> dict:
             used.append({"tool": dcode, "dia_mm": params[0], "hits": n})
     used.sort(key=lambda r: r["dia_mm"])
     return {"tools": used, "total": sum(r["hits"] for r in used),
-            "positions": {}, "source": layer.name, "as_gerber": True}
+            "positions": {},
+            "holes": [at for dcode, at in layer.flashes
+                      if layer.apertures.get(dcode, ("", []))[0] == "C"],
+            "source": layer.name, "as_gerber": True}
 
 
 # ── the whole job ─────────────────────────────────────────────────────────────
@@ -1362,6 +1630,29 @@ def analyse(paths: list[str], snap_mm: float = SNAP_MM, on_progress=None) -> dic
                 "tooling hole or legend sits outside the board edge — on one "
                 "real job that was a 10% error in area. Ask for the outline "
                 "layer before quoting.")
+
+    # ── array ──
+    array = panel(outline_layers) if outline_layers else {"is_array": False, "count": 1}
+    if array["is_array"]:
+        say(f"array: {array['count']} boards on {array['source']}")
+        board.update(
+            width_mm=array["pcb_w"], height_mm=array["pcb_h"],
+            area_mm2=array["pcb_w"] * array["pcb_h"], origin=array["origin"],
+            method=f"one board of a {array['count']}-up array "
+                   f"({array['cols']} across x {array['rows']} up)",
+            source=array["source"], confident=True, shape="rectangular")
+        warnings.append(
+            f"This job is an ARRAY (panel): {array['count']} boards of "
+            f"{array['pcb_w']:.2f} x {array['pcb_h']:.2f} mm, {array['cols']} "
+            f"across x {array['rows']} up, on a {array['array_w']:.2f} x "
+            f"{array['array_h']:.2f} mm panel. PCB size is ONE board; the "
+            "array size is listed separately. Per-board and per-panel prices "
+            "differ — confirm which the customer wants.")
+    elif any(l.has_step_repeat for l in parsed.values()):
+        warnings.append(
+            "A layer uses step-and-repeat (%SR), which is how some CAM tools "
+            "write a panel — but the outline layer shows one board, so the "
+            "array count could not be read. Ask the customer how many up.")
 
     # ── copper ──
     copper_results = []
@@ -1460,6 +1751,36 @@ def analyse(paths: list[str], snap_mm: float = SNAP_MM, on_progress=None) -> dic
         warnings.append("No drill file found — hole size and count could not "
                         "be measured. Ask for the .DRL/.TXT drill output.")
 
+    # ── pads: pitch and SMT size ──
+    holes = list(drills.get("holes", [])) if drills else []
+    pitch_rows, smt_rows = [], []
+    for entry in to_measure:
+        layer = parsed[entry["path"]]
+        if not layer.flashes:
+            continue
+        say(f"pads on {entry['name']}  ({len(layer.flashes)} flashes)")
+        try:
+            p = pad_pitch(layer, snap_mm)
+            if p:
+                pitch_rows.append({"name": entry["name"], **p})
+            if entry["role"] in ("copper_top", "copper_bottom"):
+                s = smt_pads(layer, holes)
+                if s["all"]:
+                    smt_rows.append({"name": entry["name"], **s})
+        except Exception as e:                          # pragma: no cover
+            warnings.append(f"{entry['name']}: pads not measured ({e}).")
+    if to_measure and not pitch_rows and not smt_rows:
+        warnings.append(
+            "The copper layers flash no pads (pads are drawn as regions or "
+            "strokes), so pad pitch and SMT pad size could not be measured.")
+    if smt_rows and not holes:
+        warnings.append(
+            "No drill positions in this job, so through-hole pads could not "
+            "be told from SMT pads — the min pad size below counts EVERY pad.")
+    best_pitch = min(pitch_rows, key=lambda r: r["min_mm"]) if pitch_rows else None
+    with_smt = [r for r in smt_rows if r["min_mm"] is not None]
+    best_smt = min(with_smt, key=lambda r: r["min_mm"]) if with_smt else None
+
     used_tools = [t for t in (drills["tools"] if drills else []) if t["hits"]]
     unused = [t for t in (drills["tools"] if drills else []) if not t["hits"]]
     if unused:
@@ -1485,12 +1806,31 @@ def analyse(paths: list[str], snap_mm: float = SNAP_MM, on_progress=None) -> dic
         "files": files,
         "rules": rules,
         "board": board,
+        "array": array,
         "copper": copper_results,
         "drills": drills,
+        "pitch": pitch_rows,
+        "smt": smt_rows,
         "answers": {
             "pcb_size": (f"{board['width_mm']:.2f} x {board['height_mm']:.2f} mm"
                          if board["width_mm"] else None),
             "pcb_size_mm": (board["width_mm"], board["height_mm"]),
+            "array_size": (f"{array['array_w']:.2f} x {array['array_h']:.2f} mm"
+                           if array["is_array"] else None),
+            "array_size_mm": ((array["array_w"], array["array_h"])
+                              if array["is_array"] else None),
+            "pcbs_per_array": array["count"],
+            "array_grid": (f"{array['cols']} x {array['rows']}"
+                           if array["is_array"] else None),
+            "min_pitch_mm": best_pitch["min_mm"] if best_pitch else None,
+            "min_pitch_layer": best_pitch["name"] if best_pitch else None,
+            "min_pitch_pairs": best_pitch["pairs_at_min"] if best_pitch else 0,
+            "min_smt_pad_mm": best_smt["min_mm"] if best_smt else None,
+            "min_smt_pad": (f"{best_smt['w']:.2f} x {best_smt['h']:.2f} mm"
+                            if best_smt else None),
+            "min_smt_pad_layer": best_smt["name"] if best_smt else None,
+            "smt_pad_count": sum(r["count"] for r in smt_rows),
+            "smt_pads_known": bool(holes),
             "min_track_width_mm": min_width,
             "min_track_spacing_mm": min_gap,
             "spacing_pairs_at_min": _pairs_at(copper_results, min_gap),
@@ -1727,10 +2067,14 @@ def agent_brief(job: dict, context: str = "") -> str:
         "here. The Gerber files themselves are confidential and are NOT "
         "attached.\n\n"
         f"  PCB size            {a['pcb_size']}\n"
+        f"  Array size          {a.get('array_size') or 'not an array (single board)'}\n"
+        f"  PCBs per array      {a.get('pcbs_per_array', 1)}\n"
         f"  Min track width     {_fmt(a['min_track_width_mm'])}\n"
         f"  Min track spacing   {_fmt(a['min_track_spacing_mm'])}\n"
         f"  Min drill size      {_fmt(a['min_drill_mm'])}\n"
         f"  Number of drills    {a['drill_count']}\n"
+        f"  Min pad pitch       {_fmt(a.get('min_pitch_mm'))}\n"
+        f"  Min SMT pad         {_smt_text(a)}\n"
     )
     if job["warnings"]:
         text += ("\nCaveats that must be repeated to the customer if they "
@@ -1739,8 +2083,17 @@ def agent_brief(job: dict, context: str = "") -> str:
     return text
 
 
+def _smt_text(a: dict) -> str:
+    if a.get("min_smt_pad_mm"):
+        return (f"{a['min_smt_pad']} ({mm_to_mil(a['min_smt_pad_mm']):.1f} mil "
+                "narrow side)")
+    if a.get("smt_pad_count") == 0 and a.get("smt_pads_known"):
+        return "none — every pad has a hole (no SMT)"
+    return "not measured"
+
+
 def answers_text(job: dict) -> str:
-    """The five numbers, and nothing else. This is what gets quoted from."""
+    """The nine numbers, and nothing else. This is what gets quoted from."""
     a = job["answers"]
     b = job["board"]
     size = a["pcb_size"] or "not measured"
@@ -1752,18 +2105,37 @@ def answers_text(job: dict) -> str:
     if a.get("plane_layers"):
         layer_txt += (f"   ({a['routed_layers']} routed + "
                       f"{a['plane_layers']} solid plane)")
+    if a.get("array_size"):
+        array_txt = a["array_size"]
+        aw, ah = a["array_size_mm"]
+        array_txt += f"   [{aw / MM_PER_INCH:.3f} x {ah / MM_PER_INCH:.3f} in]"
+        count_txt = f"{a['pcbs_per_array']}   ({a['array_grid']} — across x up)"
+    else:
+        array_txt = "not an array — a single board"
+        count_txt = "1"
+    pitch_txt = _fmt(a.get("min_pitch_mm"))
+    if a.get("min_pitch_mm"):
+        pitch_txt += (f"   — centre to centre, {a['min_pitch_pairs']} pair(s), "
+                      f"on {a['min_pitch_layer']}")
+    smt_txt = _smt_text(a)
+    if a.get("min_smt_pad_mm"):
+        smt_txt += f"   — on {a['min_smt_pad_layer']}"
     lines = [
         f"0. Copper layers        {layer_txt}",
         f"1. PCB size             {size}",
-        f"2. Min track width      {_fmt(a['min_track_width_mm'])}"
+        f"2. Array size           {array_txt}",
+        f"3. PCBs in the array    {count_txt}",
+        f"4. Min track width      {_fmt(a['min_track_width_mm'])}"
         + _rule_note(job, "min_track_width_mm"),
-        f"3. Min track spacing    {_fmt(a['min_track_spacing_mm'])}"
+        f"5. Min track spacing    {_fmt(a['min_track_spacing_mm'])}"
         + (f"   — {a['spacing_pairs_at_min']} place(s) on the board are this "
            f"tight" if a.get("spacing_pairs_at_min") else "")
         + _rule_note(job, "min_track_spacing_mm"),
-        f"4. Min drill size       {_fmt(a['min_drill_mm'])}",
-        f"5. Number of drills     "
+        f"6. Min drill size       {_fmt(a['min_drill_mm'])}",
+        f"7. Number of drills     "
         f"{a['drill_count'] if a['drill_count'] is not None else 'not measured'}",
+        f"8. Min pad pitch        {pitch_txt}",
+        f"9. Min SMT pad          {smt_txt}",
     ]
     return "\n".join(lines)
 
@@ -1877,6 +2249,16 @@ def write_report_csv(job: dict, path: str) -> None:
                     "mm", b.get("source", ""), b.get("method", "")])
         w.writerow(["pcb_height", f"{b['height_mm']:.4f}" if b["height_mm"] else "",
                     "mm", b.get("source", ""), b.get("shape", "")])
+        arr = job.get("array") or {}
+        w.writerow(["array_width", f"{arr['array_w']:.4f}" if arr.get("is_array") else "",
+                    "mm", arr.get("source", ""),
+                    "the panel the boards sit on" if arr.get("is_array")
+                    else "not an array — a single board"])
+        w.writerow(["array_height", f"{arr['array_h']:.4f}" if arr.get("is_array") else "",
+                    "mm", arr.get("source", ""), ""])
+        w.writerow(["pcbs_per_array", a.get("pcbs_per_array", 1), "boards",
+                    arr.get("source", ""),
+                    f"{arr['cols']} across x {arr['rows']} up" if arr.get("is_array") else ""])
         w.writerow(["min_track_width",
                     f"{a['min_track_width_mm']:.4f}" if a["min_track_width_mm"] else "",
                     "mm", "copper layers",
@@ -1893,6 +2275,17 @@ def write_report_csv(job: dict, path: str) -> None:
                     "smallest tool with at least one hit"])
         w.writerow(["drill_count", a["drill_count"] if a["drill_count"] is not None else "",
                     "holes", job["drills"]["source"] if job["drills"] else "", ""])
+        w.writerow(["min_pad_pitch",
+                    f"{a['min_pitch_mm']:.4f}" if a.get("min_pitch_mm") else "",
+                    "mm", a.get("min_pitch_layer") or "",
+                    "centre to centre between two separate pads; "
+                    f"{a.get('min_pitch_pairs', 0)} pair(s) at this pitch"])
+        w.writerow(["min_smt_pad",
+                    f"{a['min_smt_pad_mm']:.4f}" if a.get("min_smt_pad_mm") else "",
+                    "mm", a.get("min_smt_pad_layer") or "",
+                    (f"narrow side of a {a['min_smt_pad']} pad with no hole under it; "
+                     f"{a.get('smt_pad_count', 0)} SMT pad(s) on the outer layers")
+                    if a.get("min_smt_pad_mm") else _smt_text(a)])
         # The designer's stated limits, where the job ships them. Not the
         # same question as the measurement above, and the note says so.
         rules = job.get("rules") or {}
@@ -2020,7 +2413,9 @@ def write_summary_csv(jobs: list[tuple[str, dict]], path: str) -> None:
         w.writerow(["JOB", "LAYERS", "ROUTED", "PCB SIZE X (in)",
                     "PCB SIZE Y (in)", "PCB SIZE (mm)", "TRACK WIDTH (mil)",
                     "TRACK SPACING (mil)", "MIN DRILL SIZE (mil)",
-                    "TOTAL DRILL", "RULE ALLOWS WIDTH (mil)",
+                    "TOTAL DRILL", "ARRAY SIZE (mm)", "PCBS PER ARRAY",
+                    "MIN PITCH (mil)", "MIN SMT PAD (mil)",
+                    "RULE ALLOWS WIDTH (mil)",
                     "RULE ALLOWS SPACING (mil)", "FILES", "CHECKED AGAINST"])
         for name, job in jobs:
             a = job["answers"]
@@ -2045,6 +2440,10 @@ def write_summary_csv(jobs: list[tuple[str, dict]], path: str) -> None:
                 m(a.get("min_track_spacing_mm")),
                 m(a.get("min_drill_mm"), 2),
                 a.get("drill_count", ""),
+                (a.get("array_size") or "").replace(" mm", ""),
+                a.get("pcbs_per_array", 1),
+                m(a.get("min_pitch_mm")),
+                m(a.get("min_smt_pad_mm")),
                 m((job.get("rules") or {}).get("min_track_width_mm"), 2),
                 m((job.get("rules") or {}).get("min_track_spacing_mm"), 2),
                 len(job["files"]),
