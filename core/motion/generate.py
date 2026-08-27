@@ -84,13 +84,30 @@ EASING VALUES:
   distinct easings in this scene."""
 
 
-def storyboard_instructions(request: str) -> str:
+def storyboard_instructions(request: str, brand: dict | None = None) -> str:
     """Turn one: the look, the camera's overall intent, and a storyboard
-    row per scene. Mirrors core.reel_web.design_instructions()'s split."""
+    row per scene. Mirrors core.reel_web.design_instructions()'s split.
+
+    `brand`: colours already measured off the client's own artwork (see
+    core.reel.sample_brand — the same pixel-level measurement Reel/Studio
+    use, not re-implemented here). Unlike Reel's Pillow renderer, nothing
+    here applies these automatically — Motion's palette is the model's own
+    choice — so it's told to use them as ITS accent rather than inventing
+    one, the same way Studio is told to.
+    """
+    brand_note = ""
+    if brand:
+        brand_note = (
+            f"\n\nThe brand colours have already been measured from the "
+            f"client's own artwork: accent {brand.get('accent')}, deep "
+            f"{brand.get('deep')}. Use these as the accent colour running "
+            "through the piece rather than inventing your own — this is "
+            "their actual brand, not a suggestion.")
     return (
         "You are Prism's Senior Visual Director and Motion Designer, "
         "planning a short vertical motion graphic.\n\n"
-        f"WHAT THE CLIENT ASKED FOR:\n{request}\n\n"
+        f"WHAT THE CLIENT ASKED FOR:\n{request}"
+        + brand_note + "\n\n"
         + _PALETTE_GUIDANCE + "\n\n"
         "This is turn one of a conversation. Right now, name the project "
         "settings, the camera's overall intent, and a STORYBOARD — one row "

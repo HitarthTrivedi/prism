@@ -1503,7 +1503,25 @@ def cmd_motion(cfg: dict, request: str, attachments: list | None = None):
     from core import automation
     import json
 
-    prompt = motion_generate.storyboard_instructions(request)
+    # Same measurement Reel/Studio use — a logo or business card among the
+    # attachments gets the brand's real colours read off it, not guessed.
+    brand: dict = {}
+    if attachments:
+        imgs = [a["path"] for a in attachments
+                if a.get("path", "").lower().endswith(
+                    (".png", ".jpg", ".jpeg", ".webp", ".bmp"))]
+        if imgs:
+            try:
+                from core import reel as _pillow
+                brand = _pillow.sample_brand(imgs) or {}
+                if brand:
+                    ui.info(f"🎨  brand colours read from the artwork — "
+                            f"accent {brand.get('accent')}, "
+                            f"deep {brand.get('deep')}")
+            except Exception:
+                pass
+
+    prompt = motion_generate.storyboard_instructions(request, brand)
 
     # ── Multi-agent fallback routing ───────────────────────────────────────────
     # Build a prioritized provider chain from the agents the user actually
