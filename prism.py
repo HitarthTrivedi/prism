@@ -1500,27 +1500,26 @@ def cmd_motion(cfg: dict, request: str, attachments: list | None = None):
         return
 
     from core.motion.prompts import MOTION_SYSTEM_PROMPT, parse_motion_reply
-    from core.automation import execute_stages
+    from core import automation
 
     prompt = f"{MOTION_SYSTEM_PROMPT}\n\nUSER REQUEST: {request}"
 
     # ── Multi-agent fallback routing ───────────────────────────────────────────
-    # Build a prioritized provider chain:
-    #   1. Configured motion_agent (user preference)
-    #   2. Default agent
-    #   3. All other configured agents in order
-    # On empty response or parse failure, cascade to the next provider.
-    preferred = cfg.get("motion_agent") or cfg.get("default_agent") or "claude"
-    all_agents = list(cfg.get("agents", {}).keys()) if "agents" in cfg else []
-    fallback_chain: list[str] = []
-    fallback_chain.append(preferred)
-    for name in ["claude", "chatgpt", "gpt4o", "groq", "gemini", "openai"]:
-        if name not in fallback_chain and (name in (all_agents or [])):
+    # Build a prioritized provider chain from the agents the user actually
+    # configured, strongest first — the same "brains" > "content" preference
+    # reel_web's director selection uses. "media" is excluded on purpose:
+    # that category holds the local renderers (Prism Reel/Prism Studio),
+    # which render video and cannot hold a text conversation. On empty
+    # response or parse failure, cascade to the next provider.
+    active = C.active_agents(cfg)
+    preferred = cfg.get("motion_agent") or active.get("brains") or active.get("content")
+    fallback_chain: list[str] = [preferred] if preferred else []
+    for category, name in active.items():
+        if category != "media" and name not in fallback_chain:
             fallback_chain.append(name)
-    # Append any remaining configured agents not yet in chain
-    for name in all_agents:
-        if name not in fallback_chain:
-            fallback_chain.append(name)
+    if not fallback_chain:
+        ui.err("No agent is configured to write the motion plan — set one up first.")
+        return
 
     spec = None
     used_agent = None
@@ -1531,8 +1530,8 @@ def cmd_motion(cfg: dict, request: str, attachments: list | None = None):
             ui.rule(f"Visual Director ({agent})", "magenta")
             ui.info(f"Designing motion graphic: {request}")
 
-            responses, links = execute_stages(
-                cfg,
+            responses, links = automation.run(
+                {}, cfg, attachments=attachments, chatgpt_analysis=False,
                 custom_stages=[("motion_plan", agent, [prompt])],
                 query=f"motion graphic — {request}")
 

@@ -168,7 +168,7 @@ def _render_via_playwright(
             page.evaluate(f"""
                 (() => {{
                     const spec = {spec_json};
-                    const canvas = document.getElementById('canvas');
+                    const canvas = document.getElementById('motionCanvas');
                     if (!canvas) {{
                         window.__motionError = 'No canvas element found';
                         return;
@@ -189,7 +189,7 @@ def _render_via_playwright(
                 # Capture canvas as JPEG via JS
                 jpeg_b64: str = page.evaluate("""
                     (() => {
-                        const canvas = document.getElementById('canvas');
+                        const canvas = document.getElementById('motionCanvas');
                         return canvas.toDataURL('image/jpeg', 0.92).split(',')[1];
                     })()
                 """)
@@ -202,7 +202,12 @@ def _render_via_playwright(
 
             browser.close()
 
+        # communicate() unconditionally flushes self.stdin if it isn't None,
+        # even with no input to send — that raises "flush of closed file" on
+        # a pipe we already closed ourselves. Clearing the attribute (not
+        # just closing the file) is what makes communicate() skip it.
         ff_proc.stdin.close()
+        ff_proc.stdin = None
         _, ff_err = ff_proc.communicate()
 
         if ff_proc.returncode != 0:
