@@ -133,6 +133,52 @@ def _entrance_faults(node: dict, scene_duration: float) -> list[str]:
     return faults
 
 
+def _layer_faults(scene: dict) -> list[str]:
+    """Only fires for scenes actually using the "layer" doctrine (the
+    brand_launch skeleton in generate.py) — a plain freeform scene has no
+    node with a "layer" key and this returns nothing, exactly as before.
+    Checks the two REQUIRED facts that doctrine promises, not taste: a
+    background layer must have ongoing motion (else the scene is a held
+    slide with a moving foreground on top, not a shot), and a foreground
+    layer must actually enter AND exit (else it's not the scene's subject,
+    it's decoration).
+    """
+    nodes = [n for n in scene.get("nodes", []) or [] if isinstance(n, dict)]
+    if not any(n.get("layer") for n in nodes):
+        return []
+    faults: list[str] = []
+
+    backgrounds = [n for n in nodes if n.get("layer") == "background"]
+    if backgrounds and not any(
+            isinstance(n.get("animation"), dict)
+            and isinstance(n["animation"].get("secondary_motion"), dict)
+            for n in backgrounds):
+        faults.append(
+            'the "background" layer node has no "secondary_motion" — it '
+            "will sit still once it's in, which is what makes a scene "
+            "read as a held slide instead of a shot")
+
+    # A foreground node either LEAVES (a real exit) or keeps some life in
+    # it while it holds (secondary_motion) — both read as a directed shot.
+    # Only "enters once, then is completely inert for the rest of the
+    # scene" is the actual fault: that's the held-slide problem. A closing
+    # scene intentionally settling on a logo is the former case, not this.
+    def _lives_or_leaves(n: dict) -> bool:
+        anim = n.get("animation")
+        if not isinstance(anim, dict) or not isinstance(anim.get("enter"), dict):
+            return False
+        return isinstance(anim.get("exit"), dict) or isinstance(
+            anim.get("secondary_motion"), dict)
+
+    foregrounds = [n for n in nodes if n.get("layer") == "foreground"]
+    if foregrounds and not any(_lives_or_leaves(n) for n in foregrounds):
+        faults.append(
+            'no "foreground" layer node has a real "enter" paired with '
+            'either an "exit" or "secondary_motion" — it appears once '
+            "and then sits completely still until the cut")
+    return faults
+
+
 def inspect(spec: dict[str, Any]) -> list[str]:
     """Check one scene (spec["scenes"] has exactly one, the shape
     core.motion.generate.build_spec() checks with) and report concrete,
@@ -152,6 +198,7 @@ def inspect(spec: dict[str, Any]) -> list[str]:
             duration = float(scene.get("duration", 0.0) or 0.0)
         except (TypeError, ValueError):
             duration = 0.0
+        faults.extend(_layer_faults(scene))
         for node in scene.get("nodes", []) or []:
             if not isinstance(node, dict):
                 continue

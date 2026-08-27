@@ -90,7 +90,76 @@ EASING VALUES:
   distinct easings in this scene."""
 
 
-def storyboard_instructions(request: str, brand: dict | None = None) -> str:
+SCENE_ROLES = ("HOOK", "REVEAL", "PROOF", "SIGNOFF")
+
+_LAYER_DOCTRINE = """LAYERS — give every node a "layer" (not just a z_index guess):
+  background — full-bleed wash, glow or gradient behind everything else.
+               MUST carry "secondary_motion" running for the WHOLE scene
+               (not just enter/exit) — a slow drift, pulse or rotation.
+               A background that just sits there once it's in is exactly
+               what makes a scene read as a held slide, not a shot.
+  midground  — a supporting shape or glass panel that gives the scene
+               depth. Move it slower than the foreground (a smaller
+               secondary_motion amount, or a longer enter duration) so it
+               reads as further back, not flat with everything else.
+  foreground — the hero of the scene: the headline, the product/logo
+               image. MUST either really "exit" or carry its own
+               "secondary_motion" while it holds — appearing once and then
+               going completely still until the cut is the one thing this
+               layer is not allowed to do. A closing scene settling on a
+               logo is fine; settling DEAD is not — give it a slow
+               breathe/drift even then.
+  accent     — small floating detail(s): a badge, a stat, a short label.
+               Fast, energetic motion — this is what makes a frame feel
+               busy/alive without competing with the foreground.
+  finish     — an overlay (vignette, radial darken at the edges) that sits
+               on top of everything. Static — it's a treatment, not a
+               character.
+
+Not every layer needs a node every scene, but background and foreground
+are required — a scene with no background layer has no depth, and a
+scene with no foreground has no subject."""
+
+
+def _scene_role(idx: int) -> str:
+    return SCENE_ROLES[idx] if 0 <= idx < len(SCENE_ROLES) else "SCENE"
+
+
+_ROLE_BRIEF = {
+    "HOOK": "The cold open. One bold claim or the brand/product name, "
+            "nothing else competing for attention. Fast — this scene "
+            "should feel like it's already moving when it appears.",
+    "REVEAL": "The payoff. Whatever the hook promised, shown large — the "
+              "product, the logo, the number. This is the scene the "
+              "other three exist to set up and close out.",
+    "PROOF": "One supporting detail that earns the claim — a benefit, a "
+             "stat, a second angle. Calmer than the hook, still moving.",
+    "SIGNOFF": "Logo lockup and/or a short tagline/CTA. The close — "
+               "energy settles here, it does not spike.",
+}
+
+
+def _scene_handoff(scene: dict) -> dict | None:
+    """What the LAST foreground node in a finished scene exits with — fed
+    to the next scene's instructions so the cut continues a motion/colour
+    instead of resetting cold. Returns None if there's nothing to hand
+    off (no foreground node, or it never exits)."""
+    best = None
+    for node in scene.get("nodes", []) or []:
+        if not isinstance(node, dict) or node.get("layer") != "foreground":
+            continue
+        anim = node.get("animation")
+        exit_ = anim.get("exit") if isinstance(anim, dict) else None
+        if isinstance(exit_, dict):
+            best = {
+                "type": exit_.get("type", "fade_in"),
+                "fill": node.get("fill") or node.get("accent_color"),
+            }
+    return best
+
+
+def storyboard_instructions(request: str, brand: dict | None = None,
+                            skeleton: str | None = None) -> str:
     """Turn one: the look, the camera's overall intent, and a storyboard
     row per scene. Mirrors core.reel_web.design_instructions()'s split.
 
@@ -140,17 +209,41 @@ def storyboard_instructions(request: str, brand: dict | None = None) -> str:
         'is still moving when the scene hands over"}\n'
         "  ]\n"
         "}\n\n"
+        + (_brand_launch_storyboard_close() if skeleton == "brand_launch"
+           else
         "3-6 scenes, 6-15 seconds total. ONE STORYBOARD ROW PER SCENE. Give "
         "each one a different job and a different composition — several "
         "scenes that are all a centred headline over the same background "
         "is the failure this stage exists to prevent. `camera.tracks` is "
-        "for the WHOLE graphic — rule 3 below still applies."
+        "for the WHOLE graphic — rule 3 below still applies.")
     )
 
 
-def scene_instructions(idx: int, total: int, row: dict, assets: str = "") -> str:
+def _brand_launch_storyboard_close() -> str:
+    roles = "\n".join(f'  {i + 1}. {r} — {_ROLE_BRIEF[r]}'
+                       for i, r in enumerate(SCENE_ROLES))
+    return (
+        "EXACTLY 4 scenes, in this fixed order, 8-14 seconds total — do "
+        "not add, drop, reorder or rename them:\n" + roles + "\n\n"
+        '"job" for each row IS its role above, in your own words for this '
+        "brand. `camera.tracks` is for the WHOLE graphic — rule 3 below "
+        "still applies."
+    )
+
+
+def scene_instructions(idx: int, total: int, row: dict, assets: str = "",
+                       skeleton: str | None = None,
+                       handoff: dict | None = None) -> str:
     """Ask for ONE scene's nodes. The rest of the conversation already
-    knows the palette and camera from turn one; this only needs the row."""
+    knows the palette and camera from turn one; this only needs the row.
+
+    `skeleton="brand_launch"` swaps the freeform node catalogue for the
+    layer doctrine (background/midground/foreground/accent/finish) and
+    pins this scene to its fixed HOOK/REVEAL/PROOF/SIGNOFF role.
+    `handoff` is what core.motion.generate._scene_handoff() read off the
+    PREVIOUS scene — how it exited — so this one can continue that motion
+    or colour instead of cutting cold; None for the first scene.
+    """
     job = str(row.get("job", "")).strip() or "carry the argument forward"
     look = str(row.get("look", "")).strip()
     motion = str(row.get("motion", "")).strip()
@@ -158,14 +251,8 @@ def scene_instructions(idx: int, total: int, row: dict, assets: str = "") -> str
         seconds = float(row.get("seconds") or 3.0)
     except (TypeError, ValueError):
         seconds = 3.0
-    return (
-        f"SCENE {idx + 1} of {total}.\n\n"
-        f"ITS JOB: {job}\n"
-        + (f"THE LOOK: {look}\n" if look else "")
-        + (f"THE MOTION: {motion}\n" if motion else "")
-        + f"\nDuration: {seconds:g} seconds. All this scene's animation "
-        "times count from 0 at this scene's own start.\n\n"
-        + _NODE_CATALOGUE + "\n\n"
+    catalogue = _NODE_CATALOGUE
+    rules = (
         "DESIGN RULES FOR THIS SCENE:\n"
         "1. 3-7 nodes. Do not overcrowd.\n"
         "2. Vary the text mode — use at most 2 different modes.\n"
@@ -182,6 +269,35 @@ def scene_instructions(idx: int, total: int, row: dict, assets: str = "") -> str
         "   word instead of a whole line, a filled shape instead of an\n"
         "   outline, a background wash instead of just text — same brand,\n"
         "   different weight each time.\n\n"
+    )
+    role_header = ""
+    if skeleton == "brand_launch":
+        role = _scene_role(idx)
+        catalogue = _NODE_CATALOGUE + "\n\n" + _LAYER_DOCTRINE
+        rules = rules + (
+            '7. Give every node a "layer" (see LAYERS above) — background '
+            "and foreground are both required this scene.\n"
+        )
+        role_header = f"ROLE: {role} — {_ROLE_BRIEF[role]}\n\n"
+        if handoff:
+            role_header += (
+                f'CONTINUING FROM THE LAST SCENE: it exited with a '
+                f'"{handoff["type"]}"'
+                + (f' in {handoff["fill"]}' if handoff.get("fill") else "")
+                + ". Open THIS scene picking that motion or colour up — "
+                "reverse the exit direction, or carry the colour into "
+                "this scene's foreground — rather than starting cold.\n\n"
+            )
+    return (
+        f"SCENE {idx + 1} of {total}.\n\n"
+        + role_header
+        + f"ITS JOB: {job}\n"
+        + (f"THE LOOK: {look}\n" if look else "")
+        + (f"THE MOTION: {motion}\n" if motion else "")
+        + f"\nDuration: {seconds:g} seconds. All this scene's animation "
+        "times count from 0 at this scene's own start.\n\n"
+        + catalogue + "\n\n"
+        + rules
         + (f"ARTWORK YOU MAY USE:\n{assets}\n\n" if assets else "")
         + "Reply with ONLY this JSON object, in a ```json fenced code "
         "block, nothing before or after it:\n"
@@ -264,7 +380,8 @@ def fallback_scene(row: dict) -> dict:
 
 def build_spec(first_reply: str, ask: Callable[..., str], assets: str = "",
                assets_table: dict | None = None,
-               check=None, log=None, should_stop=None, on_scene=None) -> dict:
+               check=None, log=None, should_stop=None, on_scene=None,
+               skeleton: str | None = None) -> dict:
     """Run the rest of the design conversation and return the finished spec.
 
     `ask(prompt, expect) -> str` sends a follow-up in the tab turn one is
@@ -281,6 +398,12 @@ def build_spec(first_reply: str, ask: Callable[..., str], assets: str = "",
     those names — stashed on the returned spec as `_assets` (same
     convention core.reel_web uses) so resolve_motion_spec() can swap each
     `asset:name` for the real file before anything tries to render it.
+
+    `skeleton="brand_launch"` must match what storyboard_instructions() was
+    called with for `first_reply` — it switches each scene's prompt to the
+    layer doctrine and pins the fixed HOOK/REVEAL/PROOF/SIGNOFF roles, and
+    threads each finished scene's exit into the next scene's prompt as a
+    handoff so consecutive cuts continue a motion instead of resetting.
     """
     def say(msg):
         if log:
@@ -295,6 +418,7 @@ def build_spec(first_reply: str, ask: Callable[..., str], assets: str = "",
     say(f"storyboard: {total} scene(s) — writing them one at a time")
     scenes: list[dict] = []
     overflow_notice = ""
+    handoff: dict | None = None
     for i in range(total):
         if should_stop and should_stop():
             say("stopped — keeping the scenes written so far")
@@ -304,7 +428,8 @@ def build_spec(first_reply: str, ask: Callable[..., str], assets: str = "",
                 on_scene(i, total)
             except Exception:                        # noqa: BLE001
                 pass          # a progress listener must never fail the run
-        prompt = overflow_notice + scene_instructions(i, total, board[i], assets)
+        prompt = overflow_notice + scene_instructions(
+            i, total, board[i], assets, skeleton=skeleton, handoff=handoff)
         overflow_notice = ""
         raw = ask(prompt, SCENE_EXPECT) or ""
         scene = parse_scene(raw)
@@ -369,6 +494,8 @@ def build_spec(first_reply: str, ask: Callable[..., str], assets: str = "",
                         say("   the correction was no better — keeping the "
                             "first")
         scenes.append(scene)
+        if skeleton == "brand_launch":
+            handoff = _scene_handoff(scene) or handoff
         say(f"scene {i + 1}/{total} written — "
             f"{len(scene.get('nodes', []))} node(s)")
 

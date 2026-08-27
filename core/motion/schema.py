@@ -31,6 +31,21 @@ SUPPORTED_EASINGS = {
 # lowercased, so "top-left", "top_left", "Top Left" and "topleft" all match
 # the same entry — an LLM asked for an anchor is about as likely to write
 # any of those forms as the others.
+# A node's "layer" is an optional semantic label — background / midground /
+# foreground / accent / finish — that, if given, sets a sensible z_index
+# band automatically so the model can say WHAT something is instead of
+# picking an arbitrary stacking number. Entirely opt-in: a node with no
+# "layer" behaves exactly as before (z_index still defaults to 0). This
+# only exists to back the "brand_launch" skeleton in generate.py — every
+# other request path never sets it and is unaffected.
+_LAYER_Z_DEFAULT = {
+    "background": 0,
+    "midground": 10,
+    "foreground": 20,
+    "accent": 30,
+    "finish": 40,
+}
+
 _ANCHOR_KEYWORDS = {
     "center": (0.5, 0.5), "middle": (0.5, 0.5),
     "top": (0.5, 0.0), "topcenter": (0.5, 0.0), "topmiddle": (0.5, 0.0),
@@ -185,6 +200,15 @@ def validate_motion_spec(data: Union[str, Dict[str, Any]]) -> Dict[str, Any]:
         node.setdefault("scale",    [1.0, 1.0])
         node.setdefault("rotation", 0.0)
         node.setdefault("opacity",  1.0)
+        # Layer-based z_index default has to run BEFORE the plain
+        # setdefault below, since setdefault only fills a missing key —
+        # whichever runs first wins. An unrecognized "layer" string is
+        # dropped rather than guessed at, same as an invalid easing name.
+        layer = node.get("layer")
+        if isinstance(layer, str) and layer in _LAYER_Z_DEFAULT:
+            node.setdefault("z_index", _LAYER_Z_DEFAULT[layer])
+        elif "layer" in node:
+            del node["layer"]
         node.setdefault("z_index",  0)
         # setdefault alone isn't enough for anchor — it only fills a MISSING
         # key, and a wrong-TYPE one (present, just broken) sails through
