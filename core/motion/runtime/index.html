@@ -54,6 +54,15 @@
       runtime.seek(frame);
       return true;
     };
+
+    // 0 once every ImageNode has either loaded or errored — see
+    // MotionRuntime.pendingImageCount()'s comment in runtime.js. A capture
+    // loop must poll this down to 0 before seeking frame 0, or a slow
+    // network image can still be showing its loading placeholder on a
+    // frame where it should already be fully visible.
+    window.__pendingImages = function() {
+      return runtime.pendingImageCount();
+    };
   </script>
 </body>
 </html>

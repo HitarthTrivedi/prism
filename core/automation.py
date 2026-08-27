@@ -2859,6 +2859,7 @@ def run(routing: dict, cfg: dict, attachments=None, on_event=None,
                     from . import motion as _motion_pkg
                     from .motion import generate as _motion
                     from .motion import inspect as _motion_inspect
+                    from . import assets as _assets
 
                     scene_wait = max(int(agent_cfg.get("wait_time", 60)), 180)
 
@@ -2867,9 +2868,26 @@ def run(routing: dict, cfg: dict, attachments=None, on_event=None,
                                      wait=scene_wait)
                         return got[-1] if got else ""
 
+                    # Same extraction Studio's design_feeder uses — logo/
+                    # brand marks cut out of whatever the user attached, so
+                    # the model can place the REAL mark via an "image" node
+                    # rather than approximate one out of shapes and text.
+                    motion_assets_table = {}
+                    try:
+                        motion_assets_table = _assets.collect(attachments or [])
+                        if motion_assets_table:
+                            ui.info(f"   🖼️   {len(motion_assets_table)} "
+                                    "asset(s) prepared from the artwork: "
+                                    + ", ".join(motion_assets_table))
+                    except Exception as e:
+                        ui.warn(f"   couldn't prepare the artwork ({e})")
+                    motion_assets_listing = _assets.manifest(motion_assets_table)
+
                     try:
                         spec = _motion.build_spec(
                             texts[-1], _ask,
+                            assets=motion_assets_listing,
+                            assets_table=motion_assets_table,
                             check=_motion_inspect.inspect,
                             log=lambda m: ui.info(f"   {m}"),
                             should_stop=should_stop,

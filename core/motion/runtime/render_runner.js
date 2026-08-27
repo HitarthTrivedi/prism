@@ -43,6 +43,15 @@ app.whenReady().then(async () => {
 
   await win.webContents.executeJavaScript(`window.__loadSpec(${JSON.stringify(specData)})`);
 
+  // Same wait as the Playwright path in render.py — every ImageNode loads
+  // its `src` asynchronously, and nothing else here blocks on that.
+  const imageWaitStart = Date.now();
+  while (Date.now() - imageWaitStart < 15000) {
+    const pending = await win.webContents.executeJavaScript("window.__pendingImages()");
+    if (pending === 0) break;
+    await new Promise((r) => setTimeout(r, 100));
+  }
+
   for (let frame = 0; frame < totalFrames; frame++) {
     await win.webContents.executeJavaScript(`window.__seek(${frame})`);
 

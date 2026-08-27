@@ -44,6 +44,11 @@ _NODE_CATALOGUE = """NODE TYPES (put these in "nodes"):
   domain_chart     — chart_type (bar|line|ring|area|sparkline|metric), data, accent_color
   domain_ui_mockup — position, width, height, title, elements, cursor_actions
   domain_diagram   — nodes (id/label/position/shape/color), edges (from/to/pulse)
+  image            — position, width, height, radius (corner rounding), anchor;
+                      "src" is `asset:<name>` for one of the client's own images
+                      below (never write a real URL or invent a name) — a logo,
+                      a product photo, a screenshot. Drawn clipped to a rounded
+                      rect; SVG marks work the same way as photos.
 
 TEXT MODES (set on any text node via "mode"):
   word_stagger   — words pop in sequentially with spring overshoot (default, versatile)
@@ -227,6 +232,7 @@ def fallback_scene(row: dict) -> dict:
 
 
 def build_spec(first_reply: str, ask: Callable[..., str], assets: str = "",
+               assets_table: dict | None = None,
                check=None, log=None, should_stop=None, on_scene=None) -> dict:
     """Run the rest of the design conversation and return the finished spec.
 
@@ -237,6 +243,13 @@ def build_spec(first_reply: str, ask: Callable[..., str], assets: str = "",
     docstring, which this mirrors exactly. `on_scene(index, total)` fires
     before each scene is asked for, for the same reason: this loop takes
     minutes, and nothing here raises once turn one has parsed.
+
+    `assets` is the text description (core.assets.manifest()'s output)
+    telling the model what `asset:<name>` it may put in an "image" node's
+    "src". `assets_table` is the real {name: {"path": ...}} table behind
+    those names — stashed on the returned spec as `_assets` (same
+    convention core.reel_web uses) so resolve_motion_spec() can swap each
+    `asset:name` for the real file before anything tries to render it.
     """
     def say(msg):
         if log:
@@ -333,4 +346,6 @@ def build_spec(first_reply: str, ask: Callable[..., str], assets: str = "",
     spec: dict[str, Any] = {"project": project, "scenes": scenes}
     if camera:
         spec["camera"] = camera
+    if assets_table:
+        spec["_assets"] = assets_table
     return spec

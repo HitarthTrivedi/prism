@@ -538,6 +538,26 @@ class MotionRuntime {
     }
   }
 
+  // ImageNode loads its `src` asynchronously (new Image().onload) — nothing
+  // else here waits for that. Without this, a headless capture loop that
+  // starts seeking immediately after loadSpec() can screenshot the loading
+  // placeholder even at a frame where the image should already be fully
+  // visible, because the network fetch/decode simply hasn't finished yet
+  // by wall-clock time. render.py polls this (0 = every image has either
+  // loaded or errored — not "succeeded", since a broken asset must not
+  // hang the render forever) before starting to capture frames, the same
+  // "wait for everything to be ready before frame 0" discipline
+  // core.reel_web's own harness uses for web fonts.
+  pendingImageCount() {
+    let pending = 0;
+    const walk = (node) => {
+      if (node instanceof ImageNode && node._state === "loading") pending++;
+      for (const child of node.children || []) walk(child);
+    };
+    for (const root of this.rootNodes) walk(root);
+    return pending;
+  }
+
   seek(frame) {
     const time = frame / this.fps;
     this.camera.evaluate(time);

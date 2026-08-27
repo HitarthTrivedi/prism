@@ -9,6 +9,26 @@ from __future__ import annotations
 from typing import Any, Dict, List, Optional, Tuple
 
 
+def _resolve_asset_srcs(node: Dict[str, Any], uris: Dict[str, str]) -> None:
+    """Swap an `image` node's `src: "asset:<name>"` for the real data: URI,
+    in place, recursively. Naturally idempotent — once resolved, `src` no
+    longer starts with `asset:`, so re-running this (e.g. re-rendering an
+    already-resolved saved spec) is a no-op, unlike the time-offset step
+    below, which needs an explicit guard because it's additive rather than
+    a plain replace.
+    """
+    src = node.get("src")
+    if isinstance(src, str) and src.startswith("asset:"):
+        name = src[len("asset:"):]
+        if name in uris:
+            node["src"] = uris[name]
+    children = node.get("children")
+    if isinstance(children, list):
+        for child in children:
+            if isinstance(child, dict):
+                _resolve_asset_srcs(child, uris)
+
+
 def _offset_node_times(node: Dict[str, Any], offset: float) -> None:
     """Shift a node's (and its children's) authored animation times by
     `offset`, in place. Scenes are written scene-local (a node's `enter`/
@@ -55,10 +75,26 @@ def resolve_motion_spec(spec: Dict[str, Any]) -> Dict[str, Any]:
       clock of its own, it plays one continuous timeline and uses
       `start`/`duration` only to decide which scene's nodes are visible
       when.
+    - Swaps every `image` node's `src: "asset:<name>"` for the real file,
+      inlined as a data: URI (same reasoning as core.reel_web's
+      _asset_uris(): the runtime has no base URL to resolve a file:// path
+      or bare filename against, and inlining means a saved spec is the
+      whole motion graphic — re-render it later with no AI or filesystem
+      dependency).
     """
     spec = dict(spec)
     scenes = spec.get("scenes", [])
     camera = spec.get("camera", {})
+
+    assets_table = spec.get("_assets")
+    if assets_table:
+        from .. import reel_web as _web
+        uris = _web._asset_uris(assets_table)
+        if uris:
+            for scene in scenes:
+                for node in scene.get("nodes", []) or []:
+                    if isinstance(node, dict):
+                        _resolve_asset_srcs(node, uris)
 
     # Guarded the same way camera focus_target resolution already is below
     # (`if target and "position" not in track`) — a saved spec is meant to

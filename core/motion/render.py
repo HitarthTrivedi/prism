@@ -182,6 +182,18 @@ def _render_via_playwright(
             if err:
                 raise MotionRenderError(f"Runtime init error: {err}")
 
+            # Every ImageNode loads its `src` asynchronously — wait for
+            # each one to settle (loaded OR errored, a broken asset must
+            # not hang forever) before seeking frame 0. Without this, a
+            # slow-loading brand asset can still be showing its loading
+            # placeholder on frames where it should already be visible,
+            # since nothing else here waits on the network fetch.
+            try:
+                page.wait_for_function(
+                    "window.runtime.pendingImageCount() === 0", timeout=15_000)
+            except Exception:
+                pass  # best-effort — a genuinely stuck image renders as its placeholder, not a crash
+
             # Seek frame-by-frame and capture JPEG
             for frame_idx in range(total_frames):
                 page.evaluate(f"window.runtime.seek({frame_idx})")
