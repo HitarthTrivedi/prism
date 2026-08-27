@@ -2298,6 +2298,33 @@ def run(routing: dict, cfg: dict, attachments=None, on_event=None,
             except Exception:
                 pass
 
+    # A routed run that picked "Prism Motion" itself (typed on Home, not
+    # opened from Motion's own dialog — that path names motion_design_stage
+    # explicitly above and never reaches here, since it uses the real tool
+    # name, not this display name). Simpler than Studio's studio_at block:
+    # Motion doesn't need a separate script-writing pass first —
+    # generate.storyboard_instructions() already asks for the words and the
+    # plan in one turn, the same way core.reel.build_prompt() does for plain
+    # Prism Reel — so the media stage's own prompt is rewritten in place
+    # rather than a new stage being inserted before it.
+    motion_at = next((i for i, (_, an, _) in enumerate(stages)
+                      if (A.resolve_agent("", an) or {}).get("local") == "motion"),
+                     None)
+    if motion_at is not None and motion_feeder is None:
+        from .motion import generate as _motion_gen
+        st, an, _qs = stages[motion_at]
+        stages[motion_at] = (st, an, [_motion_gen.storyboard_instructions(query)])
+        motion_feeder = motion_at
+        machine_stages[motion_at] = (
+            "\n\nSTRICT PIPELINE RULES:\n"
+            "Your answer is parsed by a program, not read by a person. Obey "
+            "the OUTPUT FORMAT block above exactly: the whole reply is one "
+            "JSON object and nothing else. Do NOT add a handoff section, a "
+            "summary, an explanation or a follow-up question. If any "
+            "earlier instruction asked for one, it does not apply here — "
+            "this is the only formatting rule that counts.")
+        ui.info(f"🎬  {an} plans a motion graphic — one scene at a time")
+
     # Before the browser, not after: launching Chrome is the single slowest
     # and most visible thing this function does, and a run cancelled while the
     # plan was still being assembled would otherwise still throw a window onto

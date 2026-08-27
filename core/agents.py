@@ -99,8 +99,8 @@ CATEGORIES = {
         "emoji": "🎬",
         "color": "media",
         "desc": "Generated footage, reels from your own clips & AI avatars",
-        "agents": ["Prism Studio", "Prism Reel", "Google Flow", "Claude Design",
-                   "InVideo AI", "Runway", "Pika Labs", "HeyGen"],
+        "agents": ["Prism Studio", "Prism Reel", "Prism Motion", "Google Flow",
+                   "Claude Design", "InVideo AI", "Runway", "Pika Labs", "HeyGen"],
     },
     # Split out from video on purpose: a voice-over and a reel are different
     # jobs with different tools, and a run often needs BOTH — one stage each,
@@ -556,6 +556,15 @@ AGENT_REGISTRY = {
         "and never surprising, but every reel shares one look",
         "Included", "15–30s", 60,
         local="reel",
+    ),
+    "Prism Motion": _agent(
+        "local://motion",
+        "a real scene graph and camera, not a filmed web page: charts, "
+        "diagrams, UI mockups and a real camera move, drawn frame by frame. "
+        "One turn per scene, same as Studio. Best for explaining something —"
+        " an architecture, a process, a number — rather than a brand story",
+        "Included", "40–90s", 60,
+        local="motion",
     ),
     "Google Flow": _agent(
         "https://labs.google/fx/tools/flow",
