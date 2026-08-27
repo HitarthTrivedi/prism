@@ -2858,6 +2858,7 @@ def run(routing: dict, cfg: dict, attachments=None, on_event=None,
                 if stage_idx == motion_feeder and texts:
                     from . import motion as _motion_pkg
                     from .motion import generate as _motion
+                    from .motion import inspect as _motion_inspect
 
                     scene_wait = max(int(agent_cfg.get("wait_time", 60)), 180)
 
@@ -2869,6 +2870,7 @@ def run(routing: dict, cfg: dict, attachments=None, on_event=None,
                     try:
                         spec = _motion.build_spec(
                             texts[-1], _ask,
+                            check=_motion_inspect.inspect,
                             log=lambda m: ui.info(f"   {m}"),
                             should_stop=should_stop,
                             on_scene=lambda i, n: emit(
