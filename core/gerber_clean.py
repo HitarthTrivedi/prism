@@ -170,8 +170,8 @@ def clean_job(paths: list[str], out_dir: str, *,
     os.makedirs(out_dir, exist_ok=True)
     report = {
         "out_dir": out_dir,
-        "outline": {"width_mm": round(x1 - x0, 3),
-                    "height_mm": round(y1 - y0, 3), "source": source},
+        "outline": {"width_mm": round(x1 - x0, 2),
+                    "height_mm": round(y1 - y0, 2), "source": source},
         "margin_mm": margin_mm,
         "layers": [],
         "copied": [],
@@ -277,7 +277,7 @@ def _place(obj, face, inside) -> tuple[str, tuple]:
     # gerbonara answers ((min x, min y), (max x, max y)).
     (bx0, by0), (bx1, by1) = obj.bounding_box(unit="mm")
     bb = _box(bx0, by0, bx1, by1)
-    extent = (round(bx0, 3), round(by0, 3), round(bx1, 3), round(by1, 3))
+    extent = (round(bx0, 2), round(by0, 2), round(bx1, 2), round(by1, 2))
     if not inside.intersects(bb):
         return "outside", extent
     if inside.contains(bb):
