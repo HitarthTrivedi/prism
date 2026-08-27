@@ -2762,6 +2762,22 @@ def run(routing: dict, cfg: dict, attachments=None, on_event=None,
             if answer_language and not machine_shaped:
                 handoff += "\n\n" + answer_language
 
+            # Keep the answer in the CHAT, not in a side artifact. Claude and
+            # ChatGPT increasingly move a long answer into a document/canvas
+            # pane Prism's scraper cannot see — so the chat holds only a
+            # preamble ("I'll build you a document…"), the stage looks finished
+            # on that stub, and the real work never reaches the next stage.
+            # (Live-seen 27-08: a Claude DOCX artifact was captured as its
+            # one-line preamble.) Machine-shaped stages already demand the whole
+            # answer inline, so this only guards prose stages. Belt to the
+            # capture-side fix that follows.
+            if not machine_shaped:
+                handoff += ("\n\nIMPORTANT — write your COMPLETE answer "
+                            "directly in this chat message. Do NOT put it in a "
+                            "separate document, canvas, or artifact: only the "
+                            "chat text is read, so anything placed outside it "
+                            "is lost.")
+
             if agent_cfg.get("search_tool") == "apollo":
                 # Deliberately does NOT get `context`. That blob opens with
                 # "Context from the previous pipeline stage (RESEARCH) —" and
