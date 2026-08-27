@@ -1936,6 +1936,63 @@ def _run_studio(prior_text, attachments, cfg: dict, brand: dict | None = None):
     return out, f"reel filmed — {os.path.basename(out)}"
 
 
+def _run_motion(prior_text, attachments, cfg: dict, brand: dict | None = None):
+    """Render the motion graphic the storyboard stage built.
+
+    Same shape as _run_studio(): the spec was already fully assembled —
+    every scene written, checked and corrected, one browser turn at a time
+    — by core.motion.generate.build_spec() inside the storyboard stage's
+    own handling (see the motion_feeder block further down this file).
+    This just finds that JSON among the completed stages and renders it.
+    Unlike _run_studio()'s web.parse_spec(), a plain json.loads() is
+    correct here rather than a corner-cutting shortcut: build_spec()
+    already did the messy-LLM-reply repair work upstream and its own
+    output (json.dumps() of a validated spec) is clean by construction.
+    """
+    import json as _json
+    try:
+        from . import motion as _motion_pkg
+    except Exception as e:
+        return "", f"The motion renderer isn't available ({e})."
+    ok, why = _motion_pkg.is_available()
+    if not ok:
+        return "", why
+
+    sources = [prior_text] if isinstance(prior_text, str) else list(prior_text)
+    spec, why_bad = None, None
+    for text in sources:
+        try:
+            candidate = _json.loads(text)
+        except Exception as e:
+            why_bad = why_bad or e
+            continue
+        if isinstance(candidate, dict) and isinstance(candidate.get("scenes"), list):
+            spec = candidate
+            break
+    if spec is None:
+        kept = _keep_failed_spec(sources)
+        return "", (f"{why_bad or 'Nothing was written for the renderer.'} "
+                    "The storyboard stage has to return the assembled JSON."
+                    + (f" What came back was saved to {kept}" if kept else ""))
+
+    import time as _time
+    from . import config as C
+    os.makedirs(C.RUNS_DIR, exist_ok=True)
+    stamp = int(_time.time())
+    out = os.path.join(C.RUNS_DIR, f"motion_{stamp}.mp4")
+    _json.dump(spec, open(os.path.join(C.RUNS_DIR, f"motion_{stamp}.json"), "w"),
+               indent=2)
+
+    dur = float((spec.get("project") or {}).get("duration", 8.0) or 8.0)
+    ui.info(f"   🎬  rendering {len(spec.get('scenes', []))} scenes, "
+            f"~{dur:.0f}s, 1080x1920 — locally")
+    try:
+        _motion_pkg.render(spec, out)
+    except Exception as e:
+        return "", f"Render failed: {e}"
+    return out, f"motion graphic rendered — {os.path.basename(out)}"
+
+
 def _run_local(kind: str, prior_text, attachments, cfg: dict, stage: str,
                brand: dict | None = None):
     """Execute an agent that lives in Prism rather than in a browser.
@@ -1950,6 +2007,8 @@ def _run_local(kind: str, prior_text, attachments, cfg: dict, stage: str,
     """
     if kind == "reel_web":
         return _run_studio(prior_text, attachments, cfg, brand)
+    if kind == "motion":
+        return _run_motion(prior_text, attachments, cfg, brand)
     if kind != "reel":
         return "", f"Unknown local agent {kind!r}."
     try:
@@ -2301,29 +2360,49 @@ def run(routing: dict, cfg: dict, attachments=None, on_event=None,
     # A routed run that picked "Prism Motion" itself (typed on Home, not
     # opened from Motion's own dialog — that path names motion_design_stage
     # explicitly above and never reaches here, since it uses the real tool
-    # name, not this display name). Simpler than Studio's studio_at block:
-    # Motion doesn't need a separate script-writing pass first —
-    # generate.storyboard_instructions() already asks for the words and the
-    # plan in one turn, the same way core.reel.build_prompt() does for plain
-    # Prism Reel — so the media stage's own prompt is rewritten in place
-    # rather than a new stage being inserted before it.
+    # name, not this display name).
+    #
+    # "Prism Motion" is a LOCAL renderer, same as "Prism Studio"/"Prism
+    # Reel" — not a real chat tool. It can't hold the storyboard
+    # conversation itself; the stage loop dispatches its slot straight to
+    # _run_local() (a Python call, never a browser — see the "local agent
+    # runs inside Prism" branch below), so rewriting THAT stage's own
+    # prompt is a no-op nobody reads. This mirrors studio_at above instead:
+    # a NEW stage is inserted on a real configured tool, which becomes
+    # motion_feeder; the original "Prism Motion" stage is left in place to
+    # do what it already does — get dispatched to _run_local("motion", …),
+    # which searches the completed stages (including the new one) for the
+    # assembled spec. Simpler than studio_at in one way: Motion doesn't
+    # need a separate script-writing pass or an imagery stage first —
+    # generate.storyboard_instructions() asks for the words and the plan
+    # in one turn, and its "image" nodes reference the client's own
+    # attachments by name rather than needing anything AI-generated.
     motion_at = next((i for i, (_, an, _) in enumerate(stages)
                       if (A.resolve_agent("", an) or {}).get("local") == "motion"),
                      None)
     if motion_at is not None and motion_feeder is None:
-        from .motion import generate as _motion_gen
-        st, an, _qs = stages[motion_at]
-        stages[motion_at] = (st, an, [_motion_gen.storyboard_instructions(query)])
-        motion_feeder = motion_at
-        machine_stages[motion_at] = (
-            "\n\nSTRICT PIPELINE RULES:\n"
-            "Your answer is parsed by a program, not read by a person. Obey "
-            "the OUTPUT FORMAT block above exactly: the whole reply is one "
-            "JSON object and nothing else. Do NOT add a handoff section, a "
-            "summary, an explanation or a follow-up question. If any "
-            "earlier instruction asked for one, it does not apply here — "
-            "this is the only formatting rule that counts.")
-        ui.info(f"🎬  {an} plans a motion graphic — one scene at a time")
+        planner = agents.get("brains") or agents.get("content")
+        if not planner:
+            ui.warn("Prism Motion needs a content or brains agent turned on "
+                    "to plan the motion graphic.")
+        else:
+            from .motion import generate as _motion_gen
+            stages.insert(motion_at, ("motion_plan", planner,
+                                      [_motion_gen.storyboard_instructions(query)]))
+            motion_at += 1
+            motion_feeder = motion_at - 1
+            machine_stages[motion_feeder] = (
+                "\n\nSTRICT PIPELINE RULES:\n"
+                "Your answer is parsed by a program, not read by a person. "
+                "Obey the OUTPUT FORMAT block above exactly: the whole "
+                "reply is one JSON object and nothing else. Do NOT add a "
+                "handoff section, a summary, an explanation or a follow-up "
+                "question. If any earlier instruction asked for one, it "
+                "does not apply here — this is the only formatting rule "
+                "that counts.")
+            ui.info(f"🎬  {stages[motion_at][1]} renders locally — "
+                    f"{planner} plans the motion graphic, one scene at a "
+                    "time")
 
     # Before the browser, not after: launching Chrome is the single slowest
     # and most visible thing this function does, and a run cancelled while the
