@@ -1020,7 +1020,8 @@ def _smart_wait(driver, agent_cfg, cap: int, poll: int = 5,
     return int(time.time() - start), settled
 
 
-def _wait_for_images(driver, agent_cfg, want: int, cap: int = 240) -> int:
+def _wait_for_images(driver, agent_cfg, want: int, cap: int = 240,
+                     grace: int | None = None) -> int:
     """Wait for generated images to actually appear, then stop growing.
 
     _smart_wait watches TEXT, and during image generation the text is finished
@@ -1028,6 +1029,12 @@ def _wait_for_images(driver, agent_cfg, want: int, cap: int = 240) -> int:
     then renders for another minute. Waiting on text alone scrapes the page
     while every canvas is still empty, which looks exactly like a stage that
     produced nothing.
+
+    `grace`, when set, gives up early if nothing has appeared at all within
+    that many seconds — for a stage where a picture is possible but not
+    guaranteed, most turns never produce one, and waiting out the full `cap`
+    for an image that was never coming would stall every plain-text turn on
+    that stage.
     """
     sel = agent_cfg.get("response_selector", "")
     # The WHOLE page, not just the reply element. ChatGPT's image UI opens a
@@ -1060,6 +1067,8 @@ def _wait_for_images(driver, agent_cfg, want: int, cap: int = 240) -> int:
             # Two images that have been sitting there for 20s are all there is.
             if steady >= 20:
                 break
+        elif grace is not None and time.time() - start >= grace:
+            break   # nothing ever appeared — not this turn's kind of reply
     return last
 
 
@@ -2865,19 +2874,30 @@ def run(routing: dict, cfg: dict, attachments=None, on_event=None,
                     ui.warn(f"still generating after {took}s — scraping what "
                             f"is on the page and keeping the link")
 
-                if stage == "artwork":
+                if stage in ("artwork", "visual", "media"):
                     # The images are the deliverable here, not the text, so
                     # this stage gets its own budget ON TOP of the agent's —
                     # long only where it needs to be, rather than making every
                     # ChatGPT stage in the pipeline wait like an image render.
                     from . import reel_web as _rw
-                    ui.info("   ⏳  waiting for the pictures to finish "
-                            "rendering (up to 5 more minutes)…")
-                    got = _wait_for_images(driver, agent_cfg,
-                                           _rw.MAX_GENERATED, cap=300)
+                    if stage == "artwork":
+                        # Reel's dedicated image-batch stage: a picture is
+                        # always the point, so it gets the full budget.
+                        want, cap, grace = _rw.MAX_GENERATED, 300, None
+                    else:
+                        # visual/media also cover plain non-image turns (a
+                        # Studio design turn answers with a CSS/JSON spec,
+                        # never a picture) — grace gives up fast when this
+                        # turn was never going to render one, instead of
+                        # stalling every text-only turn on these stages.
+                        want, cap, grace = 1, 60, 12
+                    ui.info(f"   ⏳  waiting for the pictures to finish "
+                            f"rendering (up to {cap}s)…")
+                    got = _wait_for_images(driver, agent_cfg, want,
+                                           cap=cap, grace=grace)
                     if got:
                         timed_out = False
-                    else:
+                    elif stage == "artwork":
                         ui.warn("   no images appeared — the reel will be "
                                 "type and colour only")
 
