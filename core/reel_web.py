@@ -45,6 +45,46 @@ DEFAULT_FPS = 30
 # The agent may design anything it likes above these.
 T_HEADLINE, T_SUPPORT, T_LABEL = 84, 44, 32
 
+# A menu of named curves for the motion doctrine in design_instructions()/
+# scene_instructions() — deliberately a menu, not a mandate; see the note by
+# `cut` in design_instructions() about prohibitions making these reels
+# blander. Measured on a real reel: showing only ONE worked example of
+# `both` fill-mode everywhere in this prompt anchored the model to that
+# exact curve for 88% of every animation in the whole reel. A fixed
+# illustration is not a neutral example, it is training data. ease_pick()
+# rotates which curve illustrates the syntax so consecutive scenes are never
+# shown the same one twice running; the full menu is still offered every
+# time so the model has somewhere to reach beyond whichever one it was shown.
+EASE_MENU = [
+    ("settle", "cubic-bezier(.16,1,.3,1)",
+     "a confident, unhurried arrival — the default for a headline or a "
+     "panel that owns the frame"),
+    ("snap", "cubic-bezier(.34,1.56,.64,1)",
+     "quick with a touch of overshoot — counters, chips, small labels, "
+     "anything that should feel tapped into place"),
+    ("firm", "cubic-bezier(.22,1,.36,1)",
+     "weighted and fast, no overshoot — a second or third element "
+     "following a `settle` so the scene does not read as one move repeated"),
+    ("glide", "cubic-bezier(.37,0,.63,1)",
+     "symmetric — for motion still running when the scene hands over: a "
+     "drift, a slow scale, a counter"),
+    ("exit", "cubic-bezier(.64,0,.78,0)",
+     "accelerating — for anything leaving rather than arriving; entrances "
+     "and exits should not share a curve"),
+]
+
+
+def ease_pick(idx: int) -> tuple[str, str]:
+    """Rotate EASE_MENU by scene index — never the same worked-example
+    curve two scenes running (see EASE_MENU's note)."""
+    name, curve, _ = EASE_MENU[idx % len(EASE_MENU)]
+    return name, curve
+
+
+def _ease_menu_text() -> str:
+    return "; ".join(f"`{name}` ({curve}) — {why}"
+                      for name, curve, why in EASE_MENU)
+
 
 class ReelError(Exception):
     pass
@@ -1197,10 +1237,14 @@ def design_instructions(brand: dict | None = None, request: str = "",
         "renderer PAUSES the page and sets each animation's time by hand for "
         "every frame, so the result is identical on every render.\n"
         "· Every animation MUST use `both` fill-mode "
-        "(`animation: rise 900ms cubic-bezier(.16,1,.3,1) both`) or it will "
+        f"(`animation: rise 900ms {EASE_MENU[0][1]} both`) or it will "
         "snap when the frame is seeked.\n"
         "· Animation time restarts at 0 for each scene. Stagger with "
         "`animation-delay`.\n"
+        "· A curve is not neutral — one easing reused for everything that "
+        "moves is the fastest way to look like a slide deck, however many "
+        "elements are on screen. Reach for at least three of these across a "
+        f"scene, by what the thing is doing, not by habit: {_ease_menu_text()}.\n"
         "· Never use transitions, JavaScript, `:hover`, or anything that "
         "depends on real time — none of it will be filmed.\n"
         "· Each scene element gets `--p` (0→1 through the scene) and `--ms` "
@@ -1472,11 +1516,14 @@ def scene_instructions(idx: int, total: int, line: dict, script_scene: dict,
         "· Ordinary CSS @keyframes. The renderer pauses the page and sets "
         "every animation's time by hand, so it films identically every run.\n"
         "· Every animation MUST end in `both` "
-        "(`animation: rise 800ms cubic-bezier(.16,1,.3,1) both`) or it snaps "
+        f"(`animation: rise 800ms {ease_pick(idx)[1]} both`) or it snaps "
         "when the frame is seeked.\n"
         "· Time restarts at 0 for this scene. Stagger arrivals with "
         "`animation-delay` — things that arrive together read as one block, "
         "things that arrive 80-120ms apart read as choreography.\n"
+        "· One curve for everything that moves is a slide deck no matter how "
+        "much is on screen. Pick by what the thing is doing, not by habit, "
+        f"and use at least three of these in this scene: {_ease_menu_text()}.\n"
         "· Something should still be moving when the scene hands over. A "
         "scene that finishes its motion and then sits there for two seconds "
         "is where 'slide deck' comes from — let a slow drift, a scale, or a "

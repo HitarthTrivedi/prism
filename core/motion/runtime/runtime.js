@@ -95,12 +95,34 @@ const EASINGS = {
     return 0.5 * ((t -= 2) * t * ((s + 1) * t + s) + 2);
   },
   "elastic.out": (t, p = 0.3) => Math.pow(2, -10 * t) * Math.sin((t - p / 4) * (2 * Math.PI) / p) + 1,
+  // elastic.in/.inOut, bounce.in/.inOut and "smooth" were listed in
+  // schema.py's SUPPORTED_EASINGS but had no entry here, so getEase()
+  // silently collapsed all five to easeOutCubic — the schema promised the
+  // AI 20 curves and the renderer only ever drew 15 of them.
+  "elastic.in": (t, p = 0.3) => t === 0 ? 0 : t === 1 ? 1 :
+    -Math.pow(2, 10 * (t - 1)) * Math.sin((t - 1 - p / 4) * (2 * Math.PI) / p),
+  "elastic.inOut": (t, p = 0.45) => {
+    if (t === 0) return 0;
+    if (t === 1) return 1;
+    if ((t *= 2) < 1) {
+      return -0.5 * Math.pow(2, 10 * (t - 1)) * Math.sin((t - 1 - p / 4) * (2 * Math.PI) / p);
+    }
+    t -= 1;
+    return 0.5 * Math.pow(2, -10 * t) * Math.sin((t - p / 4) * (2 * Math.PI) / p) + 1;
+  },
   "bounce.out": t => {
     if (t < (1 / 2.75)) return 7.5625 * t * t;
     if (t < (2 / 2.75)) return 7.5625 * (t -= (1.5 / 2.75)) * t + 0.75;
     if (t < (2.5 / 2.75)) return 7.5625 * (t -= (2.25 / 2.75)) * t + 0.9375;
     return 7.5625 * (t -= (2.625 / 2.75)) * t + 0.984375;
   },
+  "bounce.in": t => 1 - EASINGS["bounce.out"](1 - t),
+  "bounce.inOut": t => t < 0.5
+    ? 0.5 * (1 - EASINGS["bounce.out"](1 - 2 * t))
+    : 0.5 * EASINGS["bounce.out"](2 * t - 1) + 0.5,
+  // Standard smoothstep (3t²-2t³) — a gentler, more "settled" alternative
+  // to easeInOutCubic with no inflection snap at the midpoint.
+  smooth: t => t * t * (3 - 2 * t),
   spring: (t, mass = 1.0, stiffness = 160.0, damping = 12.0) => {
     const w0 = Math.sqrt(stiffness / mass);
     const zeta = damping / (2 * Math.sqrt(stiffness * mass));
@@ -114,11 +136,31 @@ const EASINGS = {
   }
 };
 
-function getEase(name) {
-  if (!name) return EASINGS.easeOutCubic;
+// Curated fallback rotation — replaces the old single hardcoded
+// easeOutCubic default. Every node/track that omitted or misspelled an
+// easing used to collapse onto the exact same curve, which is the same
+// anchoring mechanism measured to produce 88% one-curve dominance in
+// reel_web.py's output. Hashing a seed (e.g. node id + which animation)
+// keeps rendering fully deterministic — same spec, same video, always —
+// without reintroducing that problem here.
+const FALLBACK_EASE_ROTATION = ["easeOutCubic", "easeOutQuad", "back.out", "easeOutExpo"];
+
+function _hashSeed(seed) {
+  let h = 0;
+  const s = String(seed || "");
+  for (let i = 0; i < s.length; i++) h = (h * 31 + s.charCodeAt(i)) | 0;
+  return Math.abs(h);
+}
+
+function getEase(name, seed) {
   if (typeof name === "function") return name;
-  if (name.startsWith("spring")) return EASINGS.spring;
-  return EASINGS[name] || EASINGS[name.toLowerCase()] || EASINGS.easeOutCubic;
+  if (name && name.startsWith("spring")) return EASINGS.spring;
+  if (name) {
+    const found = EASINGS[name] || EASINGS[name.toLowerCase()];
+    if (found) return found;
+  }
+  const fallback = FALLBACK_EASE_ROTATION[_hashSeed(seed) % FALLBACK_EASE_ROTATION.length];
+  return EASINGS[fallback];
 }
 
 // ── 3. Virtual Camera System ─────────────────────────────────────────────────
@@ -151,7 +193,7 @@ class Camera {
       const tr = this.tracks[i];
       const startTime = tr.time || 0.0;
       const duration = tr.duration || 0.0;
-      const easeFn = getEase(tr.easing || "easeInOutCubic");
+      const easeFn = getEase(tr.easing || "easeInOutCubic", `camera:${i}`);
 
       if (time <= startTime && i === 0) {
         if (tr.position) { curX = tr.position[0]; curY = tr.position[1]; }
@@ -200,6 +242,27 @@ class Camera {
   }
 }
 
+// Pure (no mutation) position-only re-evaluation of a node's `enter` block
+// at an arbitrary time — used by child `follow` lag above to sample a
+// node's position at a DIFFERENT time than the one it's actually being
+// rendered at, without disturbing its real evalPos/evalOpacity/etc. for
+// the current frame.
+function _resolveLocalPositionAt(node, time) {
+  const pos = [...node.position];
+  const e = node.animation && node.animation.enter;
+  if (!e) return pos;
+  const startTime = e.time || 0.0;
+  const duration = e.duration || 0.6;
+  if (time < startTime) return pos;
+  const raw = Math.min(1, (time - startTime) / duration);
+  const props = e.properties || {};
+  const perProp = props.position && props.position.easing;
+  const ease = getEase(perProp || e.easing, `${node.id}:enter:position`)(raw);
+  if (e.type === "slide_up") pos[1] += (e.distance || 60) * (1 - ease);
+  else if (e.type === "slide_down") pos[1] -= (e.distance || 60) * (1 - ease);
+  return pos;
+}
+
 // ── 4. Scene Graph Node ──────────────────────────────────────────────────────
 class Node {
   constructor(props = {}) {
@@ -238,30 +301,78 @@ class Node {
 
     if (!this.animation) return;
 
+    // Per-property easing: `properties` optionally overrides the ease for
+    // opacity/position/scale independently of the block's own flat
+    // `easing` — e.g. opacity settles gently while scale snaps with
+    // overshoot. Falls back to the block's `easing`, then to a seeded
+    // rotation (getEase's fallback) rather than one hardcoded curve, so a
+    // spec that never sets `easing` at all still gets some variety across
+    // properties instead of collapsing every node onto the same curve.
+    const easeForBlock = (block, blockName, propName) => {
+      const props = block.properties || {};
+      const perProp = props[propName] && props[propName].easing;
+      return getEase(perProp || block.easing, `${this.id}:${blockName}:${propName}`);
+    };
+
     if (this.animation.enter) {
       const e = this.animation.enter;
       const startTime = e.time || 0.0;
       const duration = e.duration || 0.6;
-      const easeFn = getEase(e.easing || "easeOutCubic");
 
       if (time < startTime) {
         this.evalOpacity = 0.0;
       } else if (time < startTime + duration) {
-        const p = easeFn((time - startTime) / duration);
+        const raw = (time - startTime) / duration;
+        const pOpacity = easeForBlock(e, "enter", "opacity")(raw);
+        const pMove = easeForBlock(e, "enter", "position")(raw);
+        const pScale = easeForBlock(e, "enter", "scale")(raw);
         if (e.type === "fade_in") {
-          this.evalOpacity = this.opacity * p;
+          this.evalOpacity = this.opacity * pOpacity;
         } else if (e.type === "pop_in" || e.type === "scale_up") {
-          this.evalOpacity = this.opacity * Math.min(1.0, p * 1.5);
-          this.evalScale = [this.scale[0] * p, this.scale[1] * p];
+          this.evalOpacity = this.opacity * Math.min(1.0, pOpacity * 1.5);
+          this.evalScale = [this.scale[0] * pScale, this.scale[1] * pScale];
         } else if (e.type === "slide_up") {
-          const dy = (e.distance || 60) * (1 - p);
+          const dy = (e.distance || 60) * (1 - pMove);
           this.evalPos[1] += dy;
-          this.evalOpacity = this.opacity * p;
+          this.evalOpacity = this.opacity * pOpacity;
         } else if (e.type === "slide_down") {
-          const dy = -(e.distance || 60) * (1 - p);
+          const dy = -(e.distance || 60) * (1 - pMove);
           this.evalPos[1] += dy;
-          this.evalOpacity = this.opacity * p;
+          this.evalOpacity = this.opacity * pOpacity;
         }
+      }
+    }
+
+    // `exit` was validated by schema.py but never evaluated here — every
+    // scene was structurally unable to animate anything OUT, guaranteeing
+    // "settles, then holds until the cut" regardless of what the spec
+    // asked for. Mirrors `enter`: an explicit absolute `time`, defaulting
+    // to Infinity (never exits) rather than 0, so a node without an
+    // authored exit is unaffected.
+    if (this.animation.exit) {
+      const x = this.animation.exit;
+      const startTime = x.time !== undefined ? x.time : Infinity;
+      const duration = x.duration || 0.6;
+
+      if (time >= startTime && time < startTime + duration) {
+        const raw = (time - startTime) / duration;
+        const pOpacity = easeForBlock(x, "exit", "opacity")(raw);
+        const pMove = easeForBlock(x, "exit", "position")(raw);
+        const pScale = easeForBlock(x, "exit", "scale")(raw);
+        if (x.type === "fade_out") {
+          this.evalOpacity = this.evalOpacity * (1 - pOpacity);
+        } else if (x.type === "pop_out" || x.type === "scale_down") {
+          this.evalOpacity = this.evalOpacity * (1 - Math.min(1.0, pOpacity * 1.5));
+          this.evalScale = [this.evalScale[0] * (1 - pScale), this.evalScale[1] * (1 - pScale)];
+        } else if (x.type === "slide_up") {
+          this.evalPos[1] -= (x.distance || 60) * pMove;
+          this.evalOpacity = this.evalOpacity * (1 - pOpacity);
+        } else if (x.type === "slide_down") {
+          this.evalPos[1] += (x.distance || 60) * pMove;
+          this.evalOpacity = this.evalOpacity * (1 - pOpacity);
+        }
+      } else if (time >= startTime + duration) {
+        this.evalOpacity = 0.0;
       }
     }
 
@@ -274,7 +385,7 @@ class Node {
           const k1 = keyframes[i];
           const k2 = keyframes[i + 1];
           if (time >= k1.time && time <= k2.time) {
-            const easeFn = getEase(k2.easing || "easeOutCubic");
+            const easeFn = getEase(k2.easing, `${this.id}:track:${prop}:${i}`);
             const p = easeFn((time - k1.time) / Math.max(0.0001, k2.time - k1.time));
             if (prop === "position.x") this.evalPos[0] = k1.value + (k2.value - k1.value) * p;
             else if (prop === "position.y") this.evalPos[1] = k1.value + (k2.value - k1.value) * p;
@@ -285,6 +396,45 @@ class Node {
           }
         }
       }
+    }
+
+    // Small seeded secondary-motion primitive — additive, deterministic
+    // (seeded hash, never Math.random(), matching this engine's own
+    // determinism requirement: same spec, same video, every render),
+    // applied after the main animation so it layers organic drift on top
+    // rather than replacing authored timing.
+    const w = this.animation.secondary_motion;
+    if (w && w.property) {
+      const seed = _hashSeed(w.seed !== undefined ? w.seed : this.id);
+      const freq = w.freq || 1.0;
+      const amount = w.amount || 0;
+      const phase = (seed % 1000) / 1000 * Math.PI * 2;
+      const offset = Math.sin(time * freq * Math.PI * 2 + phase) * amount;
+      if (w.property === "rotation") this.evalRotation += offset;
+      else if (w.property === "position.x") this.evalPos[0] += offset;
+      else if (w.property === "position.y") this.evalPos[1] += offset;
+      else if (w.property === "opacity") this.evalOpacity = Math.max(0, Math.min(1, this.evalOpacity + offset));
+      else if (w.property === "scale") this.evalScale = [this.evalScale[0] + offset, this.evalScale[1] + offset];
+    }
+
+    // Opt-in child lag/overshoot. Parenting alone gives NONE of this — a
+    // child's world transform is a rigid, instant multiply of the parent's
+    // (confirmed against how After Effects itself works: follow-through is
+    // always explicit, never automatic from hierarchy). `follow` samples
+    // the parent's own position at an earlier time via a pure, non-
+    // mutating helper (so the parent's real eval state for THIS frame is
+    // untouched) and trails the child toward it — a real drag effect,
+    // still a pure function of time. Covers slide_up/slide_down entrances
+    // on the parent only; exits and tracks-driven parent motion aren't
+    // sampled by this MVP.
+    const follow = this.animation.follow;
+    if (follow && this.parent) {
+      const lag = follow.lag || 0.08;
+      const damping = follow.damping !== undefined ? follow.damping : 0.5;
+      const parentNow = _resolveLocalPositionAt(this.parent, time);
+      const parentPast = _resolveLocalPositionAt(this.parent, Math.max(0, time - lag));
+      this.evalPos[0] += (parentPast[0] - parentNow[0]) * damping;
+      this.evalPos[1] += (parentPast[1] - parentNow[1]) * damping;
     }
   }
 

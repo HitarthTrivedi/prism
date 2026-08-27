@@ -146,14 +146,52 @@ def validate_motion_spec(data: Union[str, Dict[str, Any]]) -> Dict[str, Any]:
         node.setdefault("anchor",   [0.5, 0.5])
         node.setdefault("z_index",  0)
 
-        # Sanitize easing strings in animation blocks silently
+        # Sanitize easing strings in animation blocks silently. An invalid
+        # name is DROPPED, not rewritten to a fixed curve — forcing every
+        # bad value to the same "easeOutCubic" was a second, code-level
+        # copy of the exact anchoring bug measured in reel_web.py's prompt
+        # (every unclear case collapsing onto one identical curve). Leaving
+        # it unset lets runtime.js's own seeded rotation pick a fallback
+        # instead, which varies per node/property rather than reintroducing
+        # a single dominant curve from the Python side.
         anim = node.get("animation")
         if isinstance(anim, dict):
             for block in ("enter", "exit"):
-                if isinstance(anim.get(block), dict):
-                    e = anim[block].get("easing")
-                    if e and e not in SUPPORTED_EASINGS:
-                        anim[block]["easing"] = "easeOutCubic"
+                b = anim.get(block)
+                if not isinstance(b, dict):
+                    continue
+                e = b.get("easing")
+                if e and e not in SUPPORTED_EASINGS:
+                    del b["easing"]
+                # Per-property easing overrides — e.g. {"scale": {"easing":
+                # "back.out"}} — validated the same way, property by
+                # property, so one bad value doesn't drop the whole map.
+                props = b.get("properties")
+                if isinstance(props, dict):
+                    for prop_name, prop_cfg in list(props.items()):
+                        if not isinstance(prop_cfg, dict):
+                            continue
+                        pe = prop_cfg.get("easing")
+                        if pe and pe not in SUPPORTED_EASINGS:
+                            del prop_cfg["easing"]
+
+            secondary = anim.get("secondary_motion")
+            if isinstance(secondary, dict):
+                for numeric_key in ("freq", "amount"):
+                    if numeric_key in secondary:
+                        try:
+                            secondary[numeric_key] = float(secondary[numeric_key])
+                        except (TypeError, ValueError):
+                            del secondary[numeric_key]
+
+            follow = anim.get("follow")
+            if isinstance(follow, dict):
+                for numeric_key in ("lag", "damping"):
+                    if numeric_key in follow:
+                        try:
+                            follow[numeric_key] = float(follow[numeric_key])
+                        except (TypeError, ValueError):
+                            del follow[numeric_key]
 
         if "children" in node:
             if not isinstance(node["children"], list):

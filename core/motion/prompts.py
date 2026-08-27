@@ -115,6 +115,10 @@ FULL SCHEMA:
         },
 
         // ── SHAPE RECT (glassmorphism card) ─────────────────────────────────
+        // "properties" overrides the ease for ONE property of this enter —
+        // here scale snaps with overshoot while opacity/position keep the
+        // block's own gentler curve. "exit" is real: this card leaves
+        // before the scene ends instead of holding until the cut.
         {
           "type":     "shape_rect",
           "position": [540, 960],
@@ -123,7 +127,27 @@ FULL SCHEMA:
           "radius":   28,
           "is_glass": true,
           "fill":     "rgba(12, 18, 38, 0.90)",
-          "animation": { "enter": { "type": "pop_in", "time": 0.3, "duration": 0.7, "easing": "back.out" } }
+          "animation": {
+            "enter": {
+              "type": "pop_in", "time": 0.3, "duration": 0.7,
+              "easing": "easeOutCubic",
+              "properties": { "scale": { "easing": "back.out" } }
+            },
+            "exit": { "type": "fade_out", "time": 6.5, "duration": 0.4, "easing": "easeInCubic" }
+          }
+        },
+
+        // ── SECONDARY MOTION + FOLLOW (optional, on any node) ────────────────
+        // "secondary_motion" adds a small deterministic wiggle on top of a
+        // node's main animation — a seeded sine, never random, so the same
+        // spec always renders the same video. "follow" makes a CHILD node
+        // lag behind its parent's recent motion instead of moving in
+        // rigid lockstep — real drag, not automatic from nesting alone.
+        {
+          "type": "text", "content": "Live", "position": [900, 220], "font_size": 32,
+          "animation": {
+            "secondary_motion": { "property": "rotation", "freq": 0.6, "amount": 1.5, "seed": "live-badge" }
+          }
         },
 
         // ── SHAPE ARROW (Bézier laser with optional traveling pulse) ─────────
@@ -212,8 +236,18 @@ ANIMATION ENTER TYPES (for shape nodes):
   slide_down — translates down into position from above
 
 EASING VALUES:
-  easeOutCubic, easeInOutCubic, easeOutExpo, easeInOutExpo,
-  back.out, back.inOut, elastic.out, bounce.out, spring, linear
+  easeOutCubic, easeInCubic, easeInOutCubic, easeOutExpo, easeInOutExpo,
+  back.in, back.out, back.inOut, elastic.in, elastic.out, elastic.inOut,
+  bounce.in, bounce.out, bounce.inOut, spring, smooth, linear
+
+  Pick by what the thing is doing, not by habit — reusing one easing for
+  everything that moves is the fastest way to look like a slide deck, no
+  matter how many elements are on screen or how varied their names are.
+  As a rough guide: `.out` curves (easeOutCubic, back.out, elastic.out) for
+  things ARRIVING; `.in` curves (easeInCubic, back.in, elastic.in) for
+  things LEAVING (see "exit" above); `smooth`/linear/spring for motion
+  that's still running when the scene hands over. Use at least three
+  distinct easings across a scene's animated nodes.
 
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 DESIGN RULES:
@@ -226,7 +260,17 @@ DESIGN RULES:
 7. Grain opacity: 0.03–0.06 for clean digital, 0.08–0.14 for cinematic film look.
 8. Never use generic emojis in text content. Use clean modern copy only.
 9. Total node count per scene: 3–7. Do not overcrowd.
-10. Output ONLY the JSON inside ```json ... ```.
+10. Give at least one node a real "exit" (not just "enter") so the scene
+    doesn't just settle and hold until the cut — something should be
+    leaving, not only arriving.
+11. Vary easing by what a node is doing (see EASING VALUES above); use
+    "properties" to give one node's opacity and scale different curves
+    when that tells a better story than one curve for the whole enter.
+12. The most common way an AI-generated scene ends up looking like a
+    PowerPoint slide, however busy it is, is every element fading or
+    sliding in with the SAME easing curve and nothing else. Treat that as
+    the failure mode to design against, not an afterthought.
+13. Output ONLY the JSON inside ```json ... ```.
 """
 
 
