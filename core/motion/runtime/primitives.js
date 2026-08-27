@@ -2,8 +2,15 @@
  * Prism Motion Graphics Engine — Kinetic Typography & Vector Primitives
  * ─────────────────────────────────────────────────────────────────────
  * Full modern kinetic typography toolkit: the AI freely picks any mode per text node.
- * Also contains high-fidelity vector shapes, Bézier laser arrows with stroke-trimming,
- * and an image node with built-in glassmorphism placeholder fallback.
+ * Paint is real DOM/CSS (see Node.mount/renderDOM in runtime.js) — a node's
+ * `initDOM(box)` builds its STATIC structure once, `updateDOM(time)` writes
+ * only what actually changes per frame.
+ *
+ * ShapeCircleNode and ShapeArrowNode still carry their old Canvas2D
+ * `draw(ctx,time)` methods below, unused for now — Phase 2 of the DOM
+ * rewrite ports these (SVG stroke-dasharray for the arrow's draw-on) and
+ * the domain/{charts,diagrams,ui}.js node types; keeping the canvas
+ * versions in place is a deliberate reference for that port, not a bug.
  */
 
 // ── ShapeRectNode ─────────────────────────────────────────────────────────────
@@ -24,48 +31,54 @@ class ShapeRectNode extends Node {
     this.glowBlur     = props.glow_blur    || 0;
   }
 
-  draw(ctx, time) {
-    const w = this.width;
-    const h = this.height;
-    const x = -w * this.anchor[0];
-    const y = -h * this.anchor[1];
+  initDOM(box) {
+    const w = this.width, h = this.height;
+    box.style.transform = "";
+    box.style.left   = `${-w * this.anchor[0]}px`;
+    box.style.top    = `${-h * this.anchor[1]}px`;
+    box.style.width  = `${w}px`;
+    box.style.height = `${h}px`;
     const r = Math.min(this.radius, w / 2, h / 2);
+    box.style.borderRadius = `${r}px`;
 
-    if (this.isGlass && window.MotionEffects) {
-      window.MotionEffects.drawGlassCard(ctx, 0, 0, w, h, r, {
-        fill: this.fill, anchorX: this.anchor[0], anchorY: this.anchor[1]
-      });
+    if (this.isGlass) {
+      // Real glassmorphism — backdrop-filter genuinely blurs whatever's
+      // behind this box (the backdrop canvas / other DOM content), not a
+      // flat translucent shape standing in for it. This is the direct fix
+      // for shape_rect's "flat 2015 circle" complaint.
+      box.style.backdropFilter = "blur(20px)";
+      box.style.webkitBackdropFilter = "blur(20px)";
+      box.style.background = this.fill || "rgba(13,18,38,0.55)";
+      box.style.border = "1px solid rgba(255,255,255,0.10)";
+      box.style.boxShadow =
+        "0 20px 42px rgba(0,0,0,0.45), inset 0 1px 0 rgba(255,255,255,0.06)";
       return;
     }
 
-    ctx.beginPath();
-    r > 0 ? ctx.roundRect(x, y, w, h, r) : ctx.rect(x, y, w, h);
+    if (this.fill && this.fill !== "none") box.style.background = this.fill;
+    if (this.stroke && this.strokeWidth > 0) {
+      box.style.boxSizing = "border-box";
+      box.style.border = `${this.strokeWidth}px solid ${this.stroke}`;
+    }
 
+    // Drop-shadow AND glow together, as two comma-separated box-shadow
+    // layers — the old canvas code shared one ctx.shadow* state for both,
+    // so glow silently overwrote a configured drop-shadow. CSS box-shadow
+    // supports both simultaneously; this is a real fix, not just a port.
+    const shadows = [];
     if (this.shadowColor && this.shadowBlur > 0) {
-      ctx.shadowColor = this.shadowColor;
-      ctx.shadowBlur  = this.shadowBlur;
-      ctx.shadowOffsetY = this.shadowOffsetY;
+      shadows.push(`0 ${this.shadowOffsetY}px ${this.shadowBlur}px ${this.shadowColor}`);
     }
     if (this.glowColor && this.glowBlur > 0) {
-      ctx.shadowColor = this.glowColor;
-      ctx.shadowBlur  = this.glowBlur;
+      shadows.push(`0 0 ${this.glowBlur}px ${this.glowColor}`);
     }
-
-    if (this.fill && this.fill !== "none") {
-      ctx.fillStyle = this.fill;
-      ctx.fill();
-    }
-    ctx.shadowColor = "transparent";
-
-    if (this.stroke && this.strokeWidth > 0) {
-      ctx.lineWidth   = this.strokeWidth;
-      ctx.strokeStyle = this.stroke;
-      ctx.stroke();
-    }
+    if (shadows.length) box.style.boxShadow = shadows.join(", ");
   }
 }
 
 // ── ShapeCircleNode ───────────────────────────────────────────────────────────
+// Phase 2: not yet ported to DOM (see file header). Old canvas draw() kept
+// as the reference for that port.
 class ShapeCircleNode extends Node {
   constructor(props = {}) {
     super(props);
@@ -93,6 +106,7 @@ class ShapeCircleNode extends Node {
 }
 
 // ── ShapeArrowNode — Bézier laser arrow with stroke trim & neon bloom ─────────
+// Phase 2: not yet ported to DOM (needs SVG — see file header).
 class ShapeArrowNode extends Node {
   constructor(props = {}) {
     super(props);
@@ -107,7 +121,7 @@ class ShapeArrowNode extends Node {
     this.trimEnd      = props.trim_end     !== undefined ? props.trim_end : 1.0;
     this.drawStart    = props.draw_start   || 0.0;
     this.drawDuration = props.draw_duration || 0.65;
-    this.pulse        = props.pulse        || false;  // traveling data pulse
+    this.pulse        = props.pulse        || false;
     this.pulseColor   = props.pulse_color  || "#FFFFFF";
     this.pulseSpeed   = props.pulse_speed  || 0.9;
   }
@@ -131,7 +145,6 @@ class ShapeArrowNode extends Node {
     const cx = this.curved ? mx + nx * this.curveHeight : mx;
     const cy = this.curved ? my + ny * this.curveHeight : my;
 
-    // Helper: evaluate Bézier at t
     const bezier = t => {
       const it = 1 - t;
       return {
@@ -165,7 +178,6 @@ class ShapeArrowNode extends Node {
     }
     ctx.stroke();
 
-    // Arrow head
     if (progress > 0.4) {
       const hs = this.headSize * EASINGS["back.out"](Math.min(1, (progress - 0.4) / 0.3));
       ctx.save();
@@ -181,7 +193,6 @@ class ShapeArrowNode extends Node {
       ctx.restore();
     }
 
-    // Traveling data pulse along the path
     if (this.pulse && progress >= 1.0) {
       const pt = bezier((time * this.pulseSpeed) % 1.0);
       ctx.save();
@@ -217,299 +228,267 @@ class TextNode extends Node {
     this.shadow         = props.text_shadow    || null;  // { color, blur, offsetY }
     this.letterSpacing  = props.letter_spacing || 0;
 
-    // Mode-specific config
-    this.staggerDelay   = props.stagger_delay  || 0.075; // word_stagger / char_cascade
+    this.staggerDelay   = props.stagger_delay  || 0.075;
     this.shimmerColor   = props.shimmer_color  || "rgba(255,255,255,0.55)";
-    this.shimmerWidth   = props.shimmer_width  || 0.35;  // fraction of text width
-    this.splitGap       = props.split_gap      || 40;    // split_slide gap in px
-    this.blurAmount     = props.blur_amount    || 24;    // blur_pop initial blur
+    this.shimmerWidth   = props.shimmer_width  || 0.35;
+    this.splitGap       = props.split_gap      || 40;
+    this.blurAmount     = props.blur_amount    || 24;
+
+    // Read but never wired to an actual draw call in the old engine
+    // (dead config) — fixed here since counter_tick genuinely needs them.
+    this.prefix = props.prefix || "";
+    this.suffix = props.suffix || "";
   }
 
-  _setFont(ctx) {
-    ctx.font         = `${this.fontWeight} ${this.fontSize}px ${this.fontFamily}`;
-    ctx.textAlign    = this.align;
-    ctx.textBaseline = "middle";
-  }
-
-  _setFill(ctx, textWidth = 0) {
+  _applyBaseTextStyle(el) {
+    el.style.fontFamily = this.fontFamily;
+    el.style.fontSize = `${this.fontSize}px`;
+    el.style.fontWeight = String(this.fontWeight);
+    el.style.lineHeight = String(this.lineHeight);
+    el.style.whiteSpace = "pre";
+    if (this.letterSpacing) el.style.letterSpacing = `${this.letterSpacing}px`;
     if (this.gradient && this.gradient.stops) {
-      const gx1 = this.align === "center" ? -textWidth / 2 : 0;
-      const g = ctx.createLinearGradient(gx1, -this.fontSize / 2, gx1 + textWidth, this.fontSize / 2);
-      for (const s of this.gradient.stops) {
-        g.addColorStop(s.pos, s.color);
-      }
-      ctx.fillStyle = g;
+      const stops = this.gradient.stops
+        .slice().sort((a, b) => a.pos - b.pos)
+        .map(s => `${s.color} ${Math.round(s.pos * 100)}%`).join(", ");
+      el.style.backgroundImage = `linear-gradient(90deg, ${stops})`;
+      el.style.webkitBackgroundClip = "text";
+      el.style.backgroundClip = "text";
+      el.style.color = "transparent";
     } else {
-      ctx.fillStyle = this.fill;
+      el.style.color = this.fill;
     }
-  }
-
-  _applyTextShadow(ctx) {
     if (this.shadow) {
-      ctx.shadowColor   = this.shadow.color   || "rgba(0,0,0,0.5)";
-      ctx.shadowBlur    = this.shadow.blur    || 12;
-      ctx.shadowOffsetY = this.shadow.offsetY || 4;
+      const c = this.shadow.color !== undefined ? this.shadow.color : "rgba(0,0,0,0.5)";
+      const b = this.shadow.blur !== undefined ? this.shadow.blur : 12;
+      const oy = this.shadow.offsetY !== undefined ? this.shadow.offsetY : 4;
+      el.style.textShadow = `0 ${oy}px ${b}px ${c}`;
     }
   }
 
-  draw(ctx, time) {
-    if (!this.content) return;
-    const lines = String(this.content).split(/\r?\n/);
-    if (lines.length === 1) {
-      this._drawSingleLine(ctx, time);
-      return;
-    }
-    // Multi-line content, stacked vertically by lineHeight. Every mode
-    // below gets this for free — canvas ctx.fillText() has never respected
-    // \n on its own, so a multi-line headline (which the AI writes
-    // constantly — see core/motion/generate.py's storyboard prompt
-    // examples) silently rendered as one unbroken line, usually wider than
-    // the frame. Measured on a real generated reel: a 2-line, font-size-86
-    // headline rendered as one ~1400px line on a 1080px canvas, clipped on
-    // both edges.
-    //
-    // Simplification, not a bug: every line shares the same reveal clock —
-    // this is NOT a true per-line cascade (line 2 doesn't wait for line 1
-    // to finish). Good enough to fix the actual reported symptom
-    // (invisible/clipped text); a real staggered multi-line reveal is a
-    // separate enhancement, not required to stop text running off-frame.
-    const original = this.content;
-    const lineHeightPx = this.fontSize * this.lineHeight;
-    const totalH = lineHeightPx * (lines.length - 1);
-    try {
-      for (let i = 0; i < lines.length; i++) {
-        this.content = lines[i];
-        const y = -totalH / 2 + i * lineHeightPx;
-        ctx.save();
-        ctx.translate(0, y);
-        this._drawSingleLine(ctx, time);
-        ctx.restore();
-      }
-    } finally {
-      // Always restored, even on a thrown error — this.content is shared,
-      // mutable state re-read every frame; leaving it stuck on one line
-      // would corrupt every subsequent draw() call for this node.
-      this.content = original;
+  initDOM(box) {
+    box.style.transform = "translate(-50%,-50%)";
+    box.style.textAlign = this.align;
+
+    // Multi-line support the canvas engine had to hand-roll (ctx.fillText
+    // never respected \n) is free here — one <div> per line, stacked by
+    // lineHeight. Every line shares the same reveal clock, same as before
+    // (not a true per-line cascade — see the original comment this ports).
+    this._lines = this.content ? String(this.content).split(/\r?\n/) : [];
+    this._lineEls = [];
+    this._lineState = [];
+    for (const line of this._lines) {
+      const el = document.createElement("div");
+      this._applyBaseTextStyle(el);
+      box.appendChild(el);
+      this._lineEls.push(el);
+      this._lineState.push(this._initLineMode(el, line));
     }
   }
 
-  _drawSingleLine(ctx, time) {
-    this._setFont(ctx);
-    const fullWidth = ctx.measureText(this.content).width;
-
+  // Builds this line's STATIC per-mode structure once. Returns whatever
+  // per-line state updateDOM needs (span arrays etc.) — never rebuilt
+  // per frame; only opacity/transform/textContent on existing elements
+  // change (span identity must stay stable across seeks, or the staggered
+  // modes would thrash layout and could flicker).
+  _initLineMode(el, line) {
     switch (this.mode) {
-
-      // ── Standard: just draw it
-      case "standard":
-      default: {
-        this._setFill(ctx, fullWidth);
-        this._applyTextShadow(ctx);
-        ctx.fillText(this.content, 0, 0);
-        ctx.shadowColor = "transparent";
-        break;
-      }
-
-      // ── Typewriter: characters appear left-to-right with blinking cursor
-      case "typewriter": {
-        const elapsed = Math.max(0, time - this.revealStart);
-        const rate    = this.content.length / Math.max(0.1, this.revealDuration);
-        const visible = Math.min(this.content.length, Math.floor(elapsed * rate));
-        const str     = this.content.substring(0, visible);
-        this._setFill(ctx, fullWidth);
-        this._applyTextShadow(ctx);
-        ctx.fillText(str, 0, 0);
-        ctx.shadowColor = "transparent";
-        if (visible < this.content.length || (time * 2) % 1.0 < 0.5) {
-          const m   = ctx.measureText(str);
-          const curX = this.align === "center" ? m.width / 2 + 6 : m.width + 4;
-          ctx.fillRect(curX, -this.fontSize * 0.42, 3, this.fontSize * 0.85);
-        }
-        break;
-      }
-
-      // ── Word stagger: words pop in one-by-one with spring back.out overshoot
       case "word_stagger": {
-        const words  = this.content.split(" ");
-        const wDur   = 0.48;
-        const metrics = words.map(w => ctx.measureText(w + " ").width);
-        const totalW  = metrics.reduce((s, m) => s + m, 0);
-        let curX = this.align === "center" ? -totalW / 2 : 0;
-        ctx.save();
-        for (let i = 0; i < words.length; i++) {
+        const words = line.split(" ");
+        const spans = words.map((w, i) => {
+          const s = document.createElement("span");
+          s.style.display = "inline-block";
+          s.style.whiteSpace = "pre";
+          s.textContent = w + (i < words.length - 1 ? " " : "");
+          el.appendChild(s);
+          return s;
+        });
+        return { spans };
+      }
+      case "char_cascade": {
+        const chars = line.split("");
+        const spans = chars.map(c => {
+          const s = document.createElement("span");
+          s.style.display = "inline-block";
+          s.style.whiteSpace = "pre";
+          s.textContent = c;
+          el.appendChild(s);
+          return s;
+        });
+        return { spans };
+      }
+      case "split_slide": {
+        el.style.position = "relative";
+        el.textContent = "";
+        const mk = (side) => {
+          const s = document.createElement("span");
+          s.style.position = "absolute";
+          s.style.left = "0"; s.style.top = "0"; s.style.width = "100%";
+          s.style.whiteSpace = "pre";
+          s.style.clipPath = side === "left"
+            ? "inset(0 50% 0 0)" : "inset(0 0 0 50%)";
+          s.textContent = line;
+          el.appendChild(s);
+          return s;
+        };
+        return { left: mk("left"), right: mk("right") };
+      }
+      case "shimmer_sweep": {
+        el.style.position = "relative";
+        el.textContent = "";
+        const base = document.createElement("span");
+        base.style.whiteSpace = "pre";
+        base.textContent = line;
+        el.appendChild(base);
+
+        const shimmer = document.createElement("span");
+        shimmer.style.position = "absolute";
+        shimmer.style.left = "0"; shimmer.style.top = "0";
+        shimmer.style.whiteSpace = "pre";
+        shimmer.textContent = line;
+        shimmer.style.backgroundRepeat = "no-repeat";
+        shimmer.style.webkitBackgroundClip = "text";
+        shimmer.style.backgroundClip = "text";
+        shimmer.style.color = "transparent";
+        shimmer.style.opacity = "0";
+        el.appendChild(shimmer);
+        return { base, shimmer };
+      }
+      case "typewriter": {
+        el.textContent = "";
+        const textSpan = document.createElement("span");
+        textSpan.style.whiteSpace = "pre";
+        const cursor = document.createElement("span");
+        cursor.style.display = "inline-block";
+        cursor.style.width = "3px";
+        cursor.style.height = `${this.fontSize * 0.85}px`;
+        cursor.style.verticalAlign = "-0.1em";
+        cursor.style.marginLeft = "4px";
+        cursor.style.background = "currentColor";
+        el.appendChild(textSpan);
+        el.appendChild(cursor);
+        return { textSpan, cursor };
+      }
+      case "masked_reveal": {
+        el.textContent = line;
+        return {};
+      }
+      case "blur_pop":
+      case "counter_tick":
+        el.textContent = line;
+        return {};
+      case "standard":
+      default:
+        el.textContent = line;
+        return {};
+    }
+  }
+
+  updateDOM(time) {
+    for (let i = 0; i < this._lineEls.length; i++) {
+      this._updateLineMode(this._lineEls[i], this._lines[i], this._lineState[i], time, i);
+    }
+  }
+
+  _updateLineMode(el, line, state, time, lineIdx) {
+    switch (this.mode) {
+      case "word_stagger": {
+        const wDur = 0.48;
+        for (let i = 0; i < state.spans.length; i++) {
           const wStart = this.revealStart + i * this.staggerDelay;
           const p = Math.max(0, Math.min(1, (time - wStart) / wDur));
-          if (p > 0.001) {
-            const ep = EASINGS["back.out"](p);
-            ctx.save();
-            ctx.globalAlpha *= p;
-            ctx.translate(curX + metrics[i] / 2, (1 - ep) * 30);
-            ctx.scale(0.78 + 0.22 * ep, 0.78 + 0.22 * ep);
-            ctx.textAlign = "center";
-            this._setFill(ctx, fullWidth);
-            this._applyTextShadow(ctx);
-            ctx.fillText(words[i], 0, 0);
-            ctx.shadowColor = "transparent";
-            ctx.restore();
-          }
-          curX += metrics[i];
+          const ep = EASINGS["back.out"](p);
+          const s = state.spans[i];
+          s.style.opacity = String(p);
+          s.style.transform = `translateY(${(1 - ep) * 30}px) scale(${0.78 + 0.22 * ep})`;
         }
-        ctx.restore();
-        break;
+        return;
       }
-
-      // ── Masked reveal: text rises from behind a horizontal clip mask — editorial
-      case "masked_reveal": {
-        const p  = Math.max(0, Math.min(1,
-          EASINGS.easeOutCubic((time - this.revealStart) / Math.max(0.1, this.revealDuration))
-        ));
-        const maskH = this.fontSize * 1.3;
-        const clipY = maskH * (1 - p);
-        ctx.save();
-        ctx.beginPath();
-        const rx = this.align === "center" ? -fullWidth / 2 - 10 : -10;
-        ctx.rect(rx, -maskH / 2, fullWidth + 20, maskH);
-        ctx.clip();
-        ctx.translate(0, clipY);
-        this._setFill(ctx, fullWidth);
-        this._applyTextShadow(ctx);
-        ctx.fillText(this.content, 0, 0);
-        ctx.shadowColor = "transparent";
-        ctx.restore();
-        break;
-      }
-
-      // ── Shimmer sweep: text fades in, then a light beam sweeps across it
-      case "shimmer_sweep": {
-        // Phase 1: fade in
-        const fadeEnd = this.revealStart + this.revealDuration * 0.5;
-        const p = Math.max(0, Math.min(1, (time - this.revealStart) / (this.revealDuration * 0.5)));
-        ctx.save();
-        ctx.globalAlpha *= EASINGS.easeOutCubic(p);
-        this._setFill(ctx, fullWidth);
-        this._applyTextShadow(ctx);
-        ctx.fillText(this.content, 0, 0);
-        ctx.shadowColor = "transparent";
-
-        // Phase 2: shimmer sweep over the text
-        if (time > fadeEnd) {
-          const sweepT = Math.min(1, (time - fadeEnd) / (this.revealDuration * 0.6));
-          const sw     = fullWidth * (1 + this.shimmerWidth);
-          const sx     = (this.align === "center" ? -fullWidth / 2 : 0) - fullWidth * this.shimmerWidth + sw * sweepT;
-          const shimGrad = ctx.createLinearGradient(sx, 0, sx + fullWidth * this.shimmerWidth, 0);
-          shimGrad.addColorStop(0,    "rgba(255,255,255,0)");
-          shimGrad.addColorStop(0.4,  this.shimmerColor);
-          shimGrad.addColorStop(0.6,  this.shimmerColor);
-          shimGrad.addColorStop(1,    "rgba(255,255,255,0)");
-          ctx.globalCompositeOperation = "source-atop";
-          ctx.globalAlpha = 1.0;
-          const tw = fullWidth, gx = this.align === "center" ? -tw / 2 : 0;
-          ctx.fillStyle = shimGrad;
-          ctx.fillRect(gx, -this.fontSize * 0.6, tw, this.fontSize * 1.2);
-        }
-        ctx.restore();
-        break;
-      }
-
-      // ── Char cascade: characters fall in with staggered gravity bounce
       case "char_cascade": {
-        const chars = this.content.split("");
-        const charMetrics = chars.map(c => ctx.measureText(c).width);
-        const totalW = charMetrics.reduce((s, m) => s + m, 0);
-        let cx = this.align === "center" ? -totalW / 2 : 0;
         const cDur = 0.38;
-        ctx.save();
-        for (let i = 0; i < chars.length; i++) {
+        for (let i = 0; i < state.spans.length; i++) {
           const cStart = this.revealStart + i * (this.staggerDelay * 0.55);
           const p = Math.max(0, Math.min(1, (time - cStart) / cDur));
-          if (p > 0.001) {
-            const ep = EASINGS["bounce.out"](p);
-            ctx.save();
-            ctx.globalAlpha *= p;
-            ctx.translate(cx + charMetrics[i] / 2, -(1 - ep) * 80);
-            ctx.textAlign = "center";
-            this._setFill(ctx, fullWidth);
-            ctx.fillText(chars[i], 0, 0);
-            ctx.restore();
-          }
-          cx += charMetrics[i];
+          const ep = EASINGS["bounce.out"](p);
+          const s = state.spans[i];
+          s.style.opacity = String(p);
+          s.style.transform = `translateY(${-(1 - ep) * 80}px)`;
         }
-        ctx.restore();
-        break;
+        return;
       }
-
-      // ── Split slide: text splits into two halves that slide in from opposite sides
       case "split_slide": {
-        const p  = EASINGS.easeOutExpo(Math.max(0, Math.min(1,
+        const p = EASINGS.easeOutExpo(Math.max(0, Math.min(1,
           (time - this.revealStart) / Math.max(0.1, this.revealDuration)
         )));
-        const gx = this.align === "center" ? -fullWidth / 2 : 0;
-
-        ctx.save();
-        // Left half
-        ctx.save();
-        ctx.beginPath();
-        ctx.rect(gx - 2, -this.fontSize, fullWidth / 2 + 2, this.fontSize * 2);
-        ctx.clip();
-        ctx.translate(-(1 - p) * (this.splitGap + fullWidth / 2), 0);
-        this._setFill(ctx, fullWidth);
-        this._applyTextShadow(ctx);
-        ctx.fillText(this.content, 0, 0);
-        ctx.shadowColor = "transparent";
-        ctx.restore();
-        // Right half
-        ctx.save();
-        ctx.beginPath();
-        ctx.rect(gx + fullWidth / 2, -this.fontSize, fullWidth / 2 + 2, this.fontSize * 2);
-        ctx.clip();
-        ctx.translate((1 - p) * (this.splitGap + fullWidth / 2), 0);
-        this._setFill(ctx, fullWidth);
-        this._applyTextShadow(ctx);
-        ctx.fillText(this.content, 0, 0);
-        ctx.shadowColor = "transparent";
-        ctx.restore();
-        ctx.restore();
-        break;
+        const off = (1 - p) * (this.splitGap + 200);
+        state.left.style.transform = `translateX(${-off}px)`;
+        state.right.style.transform = `translateX(${off}px)`;
+        return;
       }
-
-      // ── Blur pop: fades in from heavy Gaussian blur to sharp with scale pop
-      case "blur_pop": {
-        const p  = EASINGS["back.out"](Math.max(0, Math.min(1,
-          (time - this.revealStart) / Math.max(0.1, this.revealDuration)
-        )));
-        // Canvas 2D doesn't have native per-draw blur, so we simulate with shadow blur + scale
-        const scl = 0.7 + 0.3 * p;
-        ctx.save();
-        ctx.globalAlpha *= p;
-        ctx.scale(scl, scl);
-        ctx.shadowColor = this.fill;
-        ctx.shadowBlur  = this.blurAmount * (1 - p);
-        this._setFill(ctx, fullWidth / scl);
-        ctx.fillText(this.content, 0, 0);
-        ctx.restore();
-        break;
+      case "shimmer_sweep": {
+        const fadeEnd = this.revealStart + this.revealDuration * 0.5;
+        const p = Math.max(0, Math.min(1, (time - this.revealStart) / (this.revealDuration * 0.5)));
+        el.style.opacity = String(EASINGS.easeOutCubic(p));
+        if (time > fadeEnd) {
+          const sweepT = Math.min(1, (time - fadeEnd) / (this.revealDuration * 0.6));
+          state.shimmer.style.opacity = "1";
+          state.shimmer.style.backgroundImage =
+            `linear-gradient(90deg, rgba(255,255,255,0) 0%, ${this.shimmerColor} 40%, ` +
+            `${this.shimmerColor} 60%, rgba(255,255,255,0) 100%)`;
+          state.shimmer.style.backgroundSize = "250% 100%";
+          state.shimmer.style.backgroundPositionX = `${100 - sweepT * 200}%`;
+        } else {
+          state.shimmer.style.opacity = "0";
+        }
+        return;
       }
-
-      // ── Counter tick: kinetic number ticks up from 0 to target
-      case "counter_tick": {
-        const target  = parseFloat(this.content) || 0;
+      case "typewriter": {
         const elapsed = Math.max(0, time - this.revealStart);
-        const p       = Math.min(1, EASINGS.easeOutCubic(elapsed / Math.max(0.1, this.revealDuration)));
-        const current = target * p;
-        const decimals = String(this.content).includes(".") ? String(this.content).split(".")[1].length : 0;
-        const prefix  = this.prefix  || "";
-        const suffix  = this.suffix  || "";
-        const display = prefix + (decimals > 0 ? current.toFixed(decimals) : Math.floor(current).toLocaleString()) + suffix;
-        this._setFill(ctx, ctx.measureText(display).width);
-        this._applyTextShadow(ctx);
-        ctx.fillText(display, 0, 0);
-        ctx.shadowColor = "transparent";
-        break;
+        const rate = Math.max(1, line.length) / Math.max(0.1, this.revealDuration);
+        const visible = Math.min(line.length, Math.floor(elapsed * rate));
+        state.textSpan.textContent = line.substring(0, visible);
+        const done = lineIdx === this._lineEls.length - 1;
+        const stillTyping = visible < line.length;
+        state.cursor.style.opacity =
+          (stillTyping || (done && (time * 2) % 1.0 < 0.5)) ? "1" : "0";
+        return;
       }
+      case "masked_reveal": {
+        const p = Math.max(0, Math.min(1,
+          EASINGS.easeOutCubic((time - this.revealStart) / Math.max(0.1, this.revealDuration))
+        ));
+        el.style.clipPath = `inset(${(1 - p) * 100}% 0 0 0)`;
+        return;
+      }
+      case "blur_pop": {
+        const p = EASINGS["back.out"](Math.max(0, Math.min(1,
+          (time - this.revealStart) / Math.max(0.1, this.revealDuration)
+        )));
+        el.style.opacity = String(Math.max(0, Math.min(1, p)));
+        el.style.filter = `blur(${Math.max(0, this.blurAmount * (1 - p))}px)`;
+        el.style.transform = `scale(${0.7 + 0.3 * p})`;
+        return;
+      }
+      case "counter_tick": {
+        const target = parseFloat(line) || 0;
+        const elapsed = Math.max(0, time - this.revealStart);
+        const p = Math.min(1, EASINGS.easeOutCubic(elapsed / Math.max(0.1, this.revealDuration)));
+        const current = target * p;
+        const decimals = line.includes(".") ? line.split(".")[1].length : 0;
+        const display = this.prefix +
+          (decimals > 0 ? current.toFixed(decimals) : Math.floor(current).toLocaleString()) +
+          this.suffix;
+        el.textContent = display;
+        return;
+      }
+      case "standard":
+      default:
+        return; // static — set once in _initLineMode, nothing changes per frame
     }
   }
 }
 
-// ── ImageNode — with glassmorphism placeholder fallback ───────────────────────
+// ── ImageNode — real <img>, browser-native loading ────────────────────────────
 class ImageNode extends Node {
   constructor(props = {}) {
     super(props);
@@ -517,55 +496,43 @@ class ImageNode extends Node {
     this.width  = props.width  || 200;
     this.height = props.height || 200;
     this.radius = props.radius || 12;
-    this._img   = null;
-    this._state = "idle"; // idle | loading | loaded | error
-
-    if (this.src) this._load();
   }
 
-  _load() {
-    this._state = "loading";
-    const img = new Image();
-    img.onload  = () => { this._img = img; this._state = "loaded"; };
-    img.onerror = () => { this._state = "error"; };
-    img.src = this.src;
-  }
-
-  draw(ctx, time) {
+  initDOM(box) {
     const w = this.width, h = this.height;
-    const x = -w * this.anchor[0], y = -h * this.anchor[1];
+    box.style.transform = "";
+    box.style.left   = `${-w * this.anchor[0]}px`;
+    box.style.top    = `${-h * this.anchor[1]}px`;
+    box.style.width  = `${w}px`;
+    box.style.height = `${h}px`;
     const r = Math.min(this.radius, w / 2, h / 2);
+    box.style.borderRadius = `${r}px`;
+    box.style.overflow = "hidden";
+    // Placeholder look while loading (or if the src never resolves) — a
+    // flat glass-style box, not Chromium's native broken-image glyph.
+    box.style.background = "rgba(15,23,42,0.75)";
+    box.style.backdropFilter = "blur(20px)";
+    box.style.webkitBackdropFilter = "blur(20px)";
 
-    if (this._state === "loaded" && this._img) {
-      ctx.save();
-      ctx.beginPath();
-      ctx.roundRect(x, y, w, h, r);
-      ctx.clip();
-      ctx.drawImage(this._img, x, y, w, h);
-      ctx.restore();
-    } else {
-      // Glassmorphism placeholder fallback
-      if (window.MotionEffects) {
-        window.MotionEffects.drawGlassCard(ctx, 0, 0, w, h, r, {
-          fill: "rgba(15,23,42,0.75)",
-          anchorX: this.anchor[0],
-          anchorY: this.anchor[1]
-        });
-      }
-      // Animated loading shimmer
-      const shimX = x + (((time * 0.6) % 1.0) * (w * 2)) - w * 0.5;
-      const sg = ctx.createLinearGradient(shimX, 0, shimX + w * 0.5, 0);
-      sg.addColorStop(0,   "rgba(255,255,255,0)");
-      sg.addColorStop(0.5, "rgba(255,255,255,0.06)");
-      sg.addColorStop(1,   "rgba(255,255,255,0)");
-      ctx.save();
-      ctx.beginPath();
-      ctx.roundRect(x, y, w, h, r);
-      ctx.clip();
-      ctx.fillStyle = sg;
-      ctx.fillRect(x, y, w, h);
-      ctx.restore();
-    }
+    const img = document.createElement("img");
+    img.style.width = "100%";
+    img.style.height = "100%";
+    // Matches the old engine's drawImage(img,x,y,w,h) exactly — stretched
+    // to the box, aspect ratio not preserved. object-fit:cover/contain
+    // would be a real behavior change, not a faithful port.
+    img.style.objectFit = "fill";
+    img.style.display = "block";
+    img.addEventListener("load", () => {
+      box.style.background = "";
+      box.style.backdropFilter = "";
+      box.style.webkitBackdropFilter = "";
+    });
+    img.addEventListener("error", () => {
+      img.style.display = "none"; // never show the native broken-image glyph
+    });
+    if (this.src) img.src = this.src;
+    box.appendChild(img);
+    this._img = img;
   }
 }
 

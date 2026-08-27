@@ -11,7 +11,6 @@ Runner priority:
 """
 from __future__ import annotations
 
-import base64
 import json
 import os
 import pathlib
@@ -114,8 +113,8 @@ def _render_via_playwright(
     """Render every frame using the Playwright Python API (headless Chromium).
 
     Each frame is:
-      1. Evaluated in the browser via `window.runtime.seek(frame)`
-      2. Captured as a JPEG screenshot
+      1. Evaluated in the browser via `window.__seek(frame)`
+      2. Captured as a JPEG page screenshot
       3. Written to FFmpeg stdin in MJPEG stream format
     """
     from playwright.sync_api import sync_playwright
@@ -130,7 +129,7 @@ def _render_via_playwright(
     spec_json = json.dumps(resolved_spec)
 
     ffmpeg_cmd = [
-        ff, "-y",
+        ff, "-y", "-loglevel", "error",
         "-f", "image2pipe",
         "-c:v", "mjpeg",
         "-framerate", str(fps),
@@ -160,54 +159,51 @@ def _render_via_playwright(
             page = browser.new_page(viewport={"width": width, "height": height})
             page.goto(index_html.as_uri(), wait_until="domcontentloaded")
 
-            # Wait for MotionRuntime to initialize
-            page.wait_for_function("typeof window.MotionRuntime !== 'undefined'",
+            # Wait for the runtime's own bootstrap (index.html's inline
+            # script) to have run, then hand it the spec through the same
+            # window.__loadSpec/__seek/__pendingImages API the Electron
+            # path already used — previously this function reconstructed
+            # its own separate MotionRuntime instance instead of using it,
+            # a second bootstrap path that could silently drift from this
+            # one.
+            page.wait_for_function("typeof window.__loadSpec === 'function'",
                                    timeout=15_000)
+            page.evaluate("spec => window.__loadSpec(spec)", resolved_spec)
 
-            # Boot the runtime with the full spec
-            page.evaluate(f"""
-                (() => {{
-                    const spec = {spec_json};
-                    const canvas = document.getElementById('motionCanvas');
-                    if (!canvas) {{
-                        window.__motionError = 'No canvas element found';
-                        return;
-                    }}
-                    window.runtime = new MotionRuntime(canvas);
-                    window.runtime.loadSpec(spec);
-                }})();
-            """)
-
-            err = page.evaluate("window.__motionError")
-            if err:
-                raise MotionRenderError(f"Runtime init error: {err}")
-
-            # Every ImageNode loads its `src` asynchronously — wait for
-            # each one to settle (loaded OR errored, a broken asset must
-            # not hang forever) before seeking frame 0. Without this, a
-            # slow-loading brand asset can still be showing its loading
-            # placeholder on frames where it should already be visible,
-            # since nothing else here waits on the network fetch.
+            # A web font that never arrives must not stop the render —
+            # index.html's Google Fonts link uses display=block, so
+            # without this wait, frame 0 (and likely several after it)
+            # can screenshot genuinely blank text. Mirrors core.reel_web's
+            # own harness.
             try:
                 page.wait_for_function(
-                    "window.runtime.pendingImageCount() === 0", timeout=15_000)
+                    "document.fonts.ready.then(() => true)", timeout=8000)
+            except Exception:
+                pass
+
+            # Every <img> loads asynchronously — wait for each one to
+            # settle (loaded OR errored, a broken asset must not hang
+            # forever) before seeking frame 0. Without this, a
+            # slow-loading brand asset can still be showing its loading
+            # placeholder on frames where it should already be visible.
+            try:
+                page.wait_for_function(
+                    "window.__pendingImages() === 0", timeout=15_000)
             except Exception:
                 pass  # best-effort — a genuinely stuck image renders as its placeholder, not a crash
 
-            # Seek frame-by-frame and capture JPEG
+            # Seek frame-by-frame and capture. A full page screenshot, not
+            # a canvas readback — the scene graph is real DOM now, there's
+            # no single element to read pixels from the way there was
+            # with a <canvas>. This also drops the base64 JS<->Python
+            # round-trip the old canvas.toDataURL() capture needed.
             for frame_idx in range(total_frames):
-                page.evaluate(f"window.runtime.seek({frame_idx})")
-
-                # Capture canvas as JPEG via JS
-                jpeg_b64: str = page.evaluate("""
-                    (() => {
-                        const canvas = document.getElementById('motionCanvas');
-                        return canvas.toDataURL('image/jpeg', 0.92).split(',')[1];
-                    })()
-                """)
-
-                jpeg_bytes = base64.b64decode(jpeg_b64)
-                ff_proc.stdin.write(jpeg_bytes)
+                page.evaluate(f"window.__seek({frame_idx})")
+                try:
+                    ff_proc.stdin.write(page.screenshot(type="jpeg", quality=95))
+                except BrokenPipeError:
+                    err = ff_proc.stderr.read().decode("utf-8", "ignore")
+                    raise MotionRenderError(f"FFmpeg stopped early: {err[:400]}")
 
                 if on_progress:
                     on_progress(frame_idx + 1, total_frames)

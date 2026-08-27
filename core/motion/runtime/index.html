@@ -9,22 +9,43 @@
   <style>
     * { box-sizing: border-box; margin: 0; padding: 0; }
     html, body {
-      width: 100%;
-      height: 100%;
       overflow: hidden;
       background: #000;
-      display: flex;
-      align-items: center;
-      justify-content: center;
+      position: relative;
     }
-    #motionCanvas {
-      display: block;
-      image-rendering: -webkit-optimize-contrast;
+    /* Layer order (bottom to top), matching the old canvas engine's Layer
+       1-4 draw order exactly: backdrop+particles, the DOM scene graph
+       (camera-transformed), then post-processing (grain/vignette) over
+       everything — see MotionRuntime.seek() in runtime.js. */
+    #backdropCanvas {
+      position: absolute; inset: 0; z-index: 0;
+      display: block; image-rendering: -webkit-optimize-contrast;
+    }
+    #stage {
+      position: absolute; inset: 0; z-index: 1;
+      transform-origin: 0 0; overflow: hidden;
+    }
+    /* Real CSS blending against everything behind (backdrop AND the DOM
+       scene graph) — not a canvas, and not per-frame; see
+       MotionRuntime._setupPostProcessing() in runtime.js for why a
+       transparent overlay canvas using ctx-level "multiply"/"overlay"
+       compositing doesn't work here the way it did on the old engine's
+       single opaque canvas. */
+    #vignetteOverlay {
+      position: absolute; inset: 0; z-index: 2;
+      mix-blend-mode: multiply; pointer-events: none; display: none;
+    }
+    #grainOverlay {
+      position: absolute; inset: 0; z-index: 3;
+      mix-blend-mode: overlay; pointer-events: none; display: none;
     }
   </style>
 </head>
 <body>
-  <canvas id="motionCanvas" width="1080" height="1920"></canvas>
+  <canvas id="backdropCanvas" width="1080" height="1920"></canvas>
+  <div id="stage"></div>
+  <div id="vignetteOverlay"></div>
+  <div id="grainOverlay"></div>
 
   <script src="effects.js"></script>
   <script src="runtime.js"></script>
@@ -33,8 +54,16 @@
   <script src="domains/charts.js"></script>
   <script src="domains/diagrams.js"></script>
   <script>
-    const canvas = document.getElementById("motionCanvas");
-    const runtime = new MotionRuntime(canvas);
+    // One canonical bootstrap, used by both the Playwright path
+    // (core/motion/render.py) and the Electron path (render_runner.js) —
+    // previously the Playwright path reconstructed its own separate
+    // MotionRuntime inline instead of using this, and could silently
+    // drift from it.
+    const backdropCanvas = document.getElementById("backdropCanvas");
+    const vignetteOverlay = document.getElementById("vignetteOverlay");
+    const grainOverlay = document.getElementById("grainOverlay");
+    const stage = document.getElementById("stage");
+    const runtime = new MotionRuntime(backdropCanvas, vignetteOverlay, grainOverlay, stage);
     window.__runtime = runtime;
     window.__ready = true;
 
@@ -55,11 +84,8 @@
       return true;
     };
 
-    // 0 once every ImageNode has either loaded or errored — see
-    // MotionRuntime.pendingImageCount()'s comment in runtime.js. A capture
-    // loop must poll this down to 0 before seeking frame 0, or a slow
-    // network image can still be showing its loading placeholder on a
-    // frame where it should already be fully visible.
+    // 0 once every <img> in the scene graph is .complete (loaded or
+    // errored — a capture loop must not hang forever on a broken asset).
     window.__pendingImages = function() {
       return runtime.pendingImageCount();
     };

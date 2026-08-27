@@ -3,6 +3,12 @@
  * ─────────────────────────────────────────────
  * Deterministic, frame-accurate animation engine with 2D Affine Matrix math,
  * virtual Camera projection, RK4 Spring Physics solver, and Scene Graph.
+ *
+ * Paint layer: real DOM/CSS (see Node.mount/renderDOM/initDOM/updateDOM and
+ * primitives.js), not Canvas2D. Everything ABOVE the paint layer — Matrix2D,
+ * EASINGS, getEase, Camera, Node.evaluateAnimation/updateTransforms, the
+ * scene-timing model — is unchanged, pure math with zero paint calls; only
+ * `draw(ctx,time)` used to be canvas-specific, and that's what moved.
  */
 
 // ── 1. 2D Affine Transformation Matrix ───────────────────────────────────────
@@ -69,6 +75,14 @@ class Matrix2D {
   applyToContext(ctx) {
     ctx.setTransform(this.a, this.b, this.c, this.d, this.tx, this.ty);
   }
+
+  // CSS's matrix(a,b,c,d,tx,ty) uses the exact same 2D affine convention as
+  // this class, so a Matrix2D maps onto it directly — used for the camera's
+  // #stage transform (a single, non-nested element, so no double-transform
+  // risk the way per-node world matrices would have — see Node.renderDOM).
+  toCSSMatrix() {
+    return `matrix(${this.a},${this.b},${this.c},${this.d},${this.tx},${this.ty})`;
+  }
 }
 
 // ── 2. Easing & Spring Dynamics ──────────────────────────────────────────────
@@ -95,10 +109,6 @@ const EASINGS = {
     return 0.5 * ((t -= 2) * t * ((s + 1) * t + s) + 2);
   },
   "elastic.out": (t, p = 0.3) => Math.pow(2, -10 * t) * Math.sin((t - p / 4) * (2 * Math.PI) / p) + 1,
-  // elastic.in/.inOut, bounce.in/.inOut and "smooth" were listed in
-  // schema.py's SUPPORTED_EASINGS but had no entry here, so getEase()
-  // silently collapsed all five to easeOutCubic — the schema promised the
-  // AI 20 curves and the renderer only ever drew 15 of them.
   "elastic.in": (t, p = 0.3) => t === 0 ? 0 : t === 1 ? 1 :
     -Math.pow(2, 10 * (t - 1)) * Math.sin((t - 1 - p / 4) * (2 * Math.PI) / p),
   "elastic.inOut": (t, p = 0.45) => {
@@ -120,8 +130,6 @@ const EASINGS = {
   "bounce.inOut": t => t < 0.5
     ? 0.5 * (1 - EASINGS["bounce.out"](1 - 2 * t))
     : 0.5 * EASINGS["bounce.out"](2 * t - 1) + 0.5,
-  // Standard smoothstep (3t²-2t³) — a gentler, more "settled" alternative
-  // to easeInOutCubic with no inflection snap at the midpoint.
   smooth: t => t * t * (3 - 2 * t),
   spring: (t, mass = 1.0, stiffness = 160.0, damping = 12.0) => {
     const w0 = Math.sqrt(stiffness / mass);
@@ -136,13 +144,6 @@ const EASINGS = {
   }
 };
 
-// Curated fallback rotation — replaces the old single hardcoded
-// easeOutCubic default. Every node/track that omitted or misspelled an
-// easing used to collapse onto the exact same curve, which is the same
-// anchoring mechanism measured to produce 88% one-curve dominance in
-// reel_web.py's output. Hashing a seed (e.g. node id + which animation)
-// keeps rendering fully deterministic — same spec, same video, always —
-// without reintroducing that problem here.
 const FALLBACK_EASE_ROTATION = ["easeOutCubic", "easeOutQuad", "back.out", "easeOutExpo"];
 
 function _hashSeed(seed) {
@@ -271,14 +272,6 @@ class Node {
     this.position = props.position ? [...props.position] : [0, 0];
     this.scale = props.scale ? [...props.scale] : [1, 1];
     this.rotation = props.rotation || 0;
-    // Defense-in-depth, not the primary fix (that's schema.py's
-    // _normalize_anchor — this only runs if something reaches the runtime
-    // without going through validate_motion_spec first). A malformed
-    // anchor here is a real landmine: spreading a STRING (e.g. "center",
-    // a keyword an LLM reasonably reaches for) produces an array of its
-    // individual characters, so anchor[0]/[1] become non-numeric and every
-    // position multiply against them is NaN — the node silently never
-    // appears anywhere, with no error.
     this.anchor = (Array.isArray(props.anchor) && props.anchor.length === 2
       && typeof props.anchor[0] === "number" && typeof props.anchor[1] === "number")
       ? [...props.anchor] : [0.5, 0.5];
@@ -295,6 +288,9 @@ class Node {
     this.evalRotation = 0;
     this.evalOpacity = 1.0;
     this.worldMatrix = Matrix2D.identity();
+
+    this._host = null;
+    this._box = null;
   }
 
   addChild(child) {
@@ -311,13 +307,6 @@ class Node {
 
     if (!this.animation) return;
 
-    // Per-property easing: `properties` optionally overrides the ease for
-    // opacity/position/scale independently of the block's own flat
-    // `easing` — e.g. opacity settles gently while scale snaps with
-    // overshoot. Falls back to the block's `easing`, then to a seeded
-    // rotation (getEase's fallback) rather than one hardcoded curve, so a
-    // spec that never sets `easing` at all still gets some variety across
-    // properties instead of collapsing every node onto the same curve.
     const easeForBlock = (block, blockName, propName) => {
       const props = block.properties || {};
       const perProp = props[propName] && props[propName].easing;
@@ -353,12 +342,6 @@ class Node {
       }
     }
 
-    // `exit` was validated by schema.py but never evaluated here — every
-    // scene was structurally unable to animate anything OUT, guaranteeing
-    // "settles, then holds until the cut" regardless of what the spec
-    // asked for. Mirrors `enter`: an explicit absolute `time`, defaulting
-    // to Infinity (never exits) rather than 0, so a node without an
-    // authored exit is unaffected.
     if (this.animation.exit) {
       const x = this.animation.exit;
       const startTime = x.time !== undefined ? x.time : Infinity;
@@ -408,11 +391,6 @@ class Node {
       }
     }
 
-    // Small seeded secondary-motion primitive — additive, deterministic
-    // (seeded hash, never Math.random(), matching this engine's own
-    // determinism requirement: same spec, same video, every render),
-    // applied after the main animation so it layers organic drift on top
-    // rather than replacing authored timing.
     const w = this.animation.secondary_motion;
     if (w && w.property) {
       const seed = _hashSeed(w.seed !== undefined ? w.seed : this.id);
@@ -427,16 +405,6 @@ class Node {
       else if (w.property === "scale") this.evalScale = [this.evalScale[0] + offset, this.evalScale[1] + offset];
     }
 
-    // Opt-in child lag/overshoot. Parenting alone gives NONE of this — a
-    // child's world transform is a rigid, instant multiply of the parent's
-    // (confirmed against how After Effects itself works: follow-through is
-    // always explicit, never automatic from hierarchy). `follow` samples
-    // the parent's own position at an earlier time via a pure, non-
-    // mutating helper (so the parent's real eval state for THIS frame is
-    // untouched) and trails the child toward it — a real drag effect,
-    // still a pure function of time. Covers slide_up/slide_down entrances
-    // on the parent only; exits and tracks-driven parent motion aren't
-    // sampled by this MVP.
     const follow = this.animation.follow;
     if (follow && this.parent) {
       const lag = follow.lag || 0.08;
@@ -464,36 +432,92 @@ class Node {
     }
   }
 
-  render(ctx, time) {
-    if (!this.visible || this.evalOpacity <= 0.001) return;
-    // Root-node scene window (see loadSpec()) — undefined for anything
-    // that isn't a direct child of a scene, so nested nodes are unaffected
-    // and gated only by whether their parent's render() runs at all.
-    if (this.sceneStart !== undefined && (time < this.sceneStart || time >= this.sceneEnd)) return;
-    ctx.save();
-    ctx.globalAlpha = Math.max(0, Math.min(1, ctx.globalAlpha * this.evalOpacity));
-    ctx.globalCompositeOperation = this.blendMode;
-    this.worldMatrix.applyToContext(ctx);
+  // ── DOM mounting — once per node, not per frame ──────────────────────────
+  // Two elements: a zero-size *host* (carries the per-frame transform/
+  // opacity, real children attach here so the browser composes nested
+  // transforms/opacity for free) and a *box* inside it (sized, anchor-offset,
+  // carries the actual paint). Collapsing these into one element would make
+  // rotation/scale pivot at the box's center instead of the node's own
+  // evalPos — wrong the moment a non-center-anchored node (a corner badge,
+  // an edge label) has children.
+  mount(parentEl) {
+    const host = document.createElement("div");
+    host.style.position = "absolute";
+    host.style.left = "0";
+    host.style.top = "0";
+    host.style.transformOrigin = "0 0";
+    host.style.zIndex = String(this.zIndex);
+    host.style.mixBlendMode = this.blendMode === "source-over" ? "normal" : this.blendMode;
+    if (!this.visible) host.style.display = "none";
 
-    this.draw(ctx, time);
+    const box = document.createElement("div");
+    box.style.position = "absolute";
+    box.style.left = "50%";
+    box.style.top = "50%";
+    box.style.transform = "translate(-50%,-50%)";
+    host.appendChild(box);
+
+    this._host = host;
+    this._box = box;
+    parentEl.appendChild(host);
+
+    this.initDOM(box);
 
     const sorted = [...this.children].sort((a, b) => a.zIndex - b.zIndex);
-    for (const child of sorted) {
-      child.render(ctx, time);
-    }
-    ctx.restore();
+    for (const child of sorted) child.mount(host);
   }
 
-  draw(ctx, time) {
-    // Abstract override
+  // Subclass hook — build this node's STATIC inner DOM/CSS once (text
+  // spans, an <img> tag, box sizing/anchor offset). Base "group" node has
+  // no paint of its own.
+  initDOM(box) {}
+
+  // ── Per-frame DOM write ──────────────────────────────────────────────────
+  // Position/opacity are handled generically here (every frame, even
+  // identity, deliberately — CSS z-index does nothing without `position`,
+  // and an element with no `transform` doesn't establish its own stacking
+  // context, so skipping this write would let z-order leak across siblings
+  // in a way the old canvas engine's linear paint order never allowed).
+  renderDOM(time) {
+    const host = this._host;
+    if (!host) return;
+    if (!this.visible) { host.style.display = "none"; return; }
+    host.style.display = "";
+    host.style.opacity = String(Math.max(0, Math.min(1, this.evalOpacity)));
+    host.style.transform =
+      `translate(${this.evalPos[0]}px,${this.evalPos[1]}px) ` +
+      `rotate(${this.evalRotation}deg) ` +
+      `scale(${this.evalScale[0]},${this.evalScale[1]})`;
+    this.updateDOM(time);
+    for (const child of this.children) child.renderDOM(time);
   }
+
+  // Subclass hook — write this node's per-frame PAINT (the box's own
+  // properties only; host's transform/opacity are handled above).
+  updateDOM(time) {}
 }
 
 // ── 5. Motion Graphics Runtime Host ──────────────────────────────────────────
 class MotionRuntime {
-  constructor(canvas) {
-    this.canvas = canvas;
-    this.ctx = canvas.getContext("2d", { alpha: false, desynchronized: true });
+  constructor(backdropCanvas, vignetteEl, grainEl, stageEl) {
+    this.backdropCanvas = backdropCanvas;
+    this.backdropCtx = backdropCanvas.getContext("2d", { alpha: false, desynchronized: true });
+    // Grain/vignette strength is static per spec (visual.grain_opacity /
+    // visual.vignette_strength never change with time), so these are real
+    // CSS mix-blend-mode overlays set once in loadSpec, not a per-frame
+    // canvas draw. They MUST be genuine CSS blending, not a second
+    // transparent <canvas> composited with ctx.globalCompositeOperation
+    // "multiply"/"overlay" — those blend against whatever's ALREADY
+    // painted on that SAME canvas; on an empty transparent one there's
+    // nothing to multiply against, so the vignette's own full-opacity
+    // white center paints through as an opaque blob instead of darkening
+    // the edges the way it did against the old engine's single opaque
+    // canvas. (Found by actually rendering and looking — first attempt at
+    // this split used a transparent postCanvas with ctx compositing and
+    // produced exactly that white-out.)
+    this.vignetteEl = vignetteEl;
+    this.grainEl = grainEl;
+    this.stageEl = stageEl;
     this.width = 1080;
     this.height = 1920;
     this.fps = 30;
@@ -502,8 +526,8 @@ class MotionRuntime {
     this.camera = new Camera(this.width, this.height);
     this.effects = window.MotionEffects ? new window.MotionEffects(this.width, this.height) : null;
     this.rootNodes = [];
+    this.sceneWindows = [];
     this.spec = null;
-    this.assets = {};
   }
 
   loadSpec(spec) {
@@ -515,56 +539,98 @@ class MotionRuntime {
     this.duration = p.duration || 10.0;
     this.background = p.background || "#090D16";
 
-    this.canvas.width = this.width;
-    this.canvas.height = this.height;
+    this.backdropCanvas.width = this.width;
+    this.backdropCanvas.height = this.height;
+
+    const px = `${this.width}px`, pyh = `${this.height}px`;
+    document.documentElement.style.width = px;
+    document.documentElement.style.height = pyh;
+    document.body.style.width = px;
+    document.body.style.height = pyh;
+    for (const el of [this.backdropCanvas, this.stageEl, this.vignetteEl, this.grainEl]) {
+      el.style.width = px;
+      el.style.height = pyh;
+    }
+
     this.camera = new Camera(this.width, this.height);
     this.effects = window.MotionEffects ? new window.MotionEffects(this.width, this.height) : null;
     if (spec.camera && spec.camera.tracks) {
       this.camera.setTracks(spec.camera.tracks);
     }
 
+    this._setupPostProcessing(spec.visual || {});
+
     // Scenes have no clock of their own — resolve_motion_spec() (Python)
     // already shifted every node's authored, scene-local times onto this
-    // one global timeline and gave each scene a real `start`. What's left
-    // for the renderer is visibility: a scene's nodes should only draw
-    // during [start, start+duration), or scene 2 renders on top of scene 1
-    // for the whole video instead of after it. sceneStart/sceneEnd are
-    // stamped onto each ROOT node only (see render()'s gate below) — a
-    // node inside a `children` array is gated by its parent's render call
-    // never running, not by carrying its own copy.
+    // one global timeline and gave each scene a real `start`. Each scene
+    // gets its own DOM container now (rather than a per-node time check),
+    // toggled visible/hidden in seek() — visibility cascades to every
+    // node mounted inside it for free, the same way the old per-root
+    // sceneStart/sceneEnd gate transitively hid a whole subtree by simply
+    // never calling render() on its root.
+    this.stageEl.innerHTML = "";
     this.rootNodes = [];
+    this.sceneWindows = [];
     const scenes = spec.scenes || [];
     for (const scene of scenes) {
       const sceneStart = scene.start || 0;
       const sceneEnd = sceneStart + (scene.duration || 0);
+      const sceneEl = document.createElement("div");
+      sceneEl.className = "scene";
+      sceneEl.style.position = "absolute";
+      sceneEl.style.inset = "0";
+      sceneEl.style.visibility = "hidden";
+      this.stageEl.appendChild(sceneEl);
+      this.sceneWindows.push({ el: sceneEl, start: sceneStart, end: sceneEnd });
+
+      const sceneRoots = [];
       for (const nodeData of scene.nodes || []) {
         const node = createNodeFromSpec(nodeData);
-        if (node) {
-          node.sceneStart = sceneStart;
-          node.sceneEnd = sceneEnd;
-          this.rootNodes.push(node);
-        }
+        if (node) { sceneRoots.push(node); this.rootNodes.push(node); }
       }
+      sceneRoots.sort((a, b) => a.zIndex - b.zIndex);
+      for (const root of sceneRoots) root.mount(sceneEl);
     }
   }
 
-  // ImageNode loads its `src` asynchronously (new Image().onload) — nothing
-  // else here waits for that. Without this, a headless capture loop that
-  // starts seeking immediately after loadSpec() can screenshot the loading
-  // placeholder even at a frame where the image should already be fully
-  // visible, because the network fetch/decode simply hasn't finished yet
-  // by wall-clock time. render.py polls this (0 = every image has either
-  // loaded or errored — not "succeeded", since a broken asset must not
-  // hang the render forever) before starting to capture frames, the same
-  // "wait for everything to be ready before frame 0" discipline
+  // Grain + vignette as real CSS mix-blend-mode overlays — genuine
+  // blending against the actual page content behind them (backdrop AND
+  // the DOM scene graph), computed once since neither varies with time.
+  // The vignette reuses the exact gradient stops applyPostProcessing()
+  // already used; the grain reuses effects.js's own noise canvas as a
+  // data: URI tile instead of redrawing it as a canvas pattern.
+  _setupPostProcessing(visual) {
+    const vigStrength = visual.vignette_strength !== undefined ? visual.vignette_strength : 0.58;
+    if (vigStrength > 0.001) {
+      this.vignetteEl.style.background =
+        `radial-gradient(circle at 50% 50%, rgba(255,255,255,1.0) 0%, ` +
+        `rgba(210,218,235,0.97) 62%, rgba(8,10,18,${vigStrength}) 100%)`;
+      this.vignetteEl.style.display = "block";
+    } else {
+      this.vignetteEl.style.display = "none";
+    }
+
+    const grainOpacity = visual.grain_opacity !== undefined ? visual.grain_opacity : 0.05;
+    if (grainOpacity > 0.001 && this.effects && this.effects._noiseCanvas) {
+      this.grainEl.style.backgroundImage = `url(${this.effects._noiseCanvas.toDataURL()})`;
+      this.grainEl.style.backgroundRepeat = "repeat";
+      this.grainEl.style.opacity = String(grainOpacity);
+      this.grainEl.style.display = "block";
+    } else {
+      this.grainEl.style.display = "none";
+    }
+  }
+
+  // Real <img> elements now (see ImageNode.initDOM in primitives.js) — this
+  // is the browser's own loading signal, not a hand-rolled state machine.
+  // "Pending" = not yet .complete; that becomes true once an image has
+  // either loaded OR errored, so a broken asset can never hang this forever
+  // — the same "wait for everything ready before frame 0" discipline
   // core.reel_web's own harness uses for web fonts.
   pendingImageCount() {
+    const imgs = this.stageEl.querySelectorAll("img");
     let pending = 0;
-    const walk = (node) => {
-      if (node instanceof ImageNode && node._state === "loading") pending++;
-      for (const child of node.children || []) walk(child);
-    };
-    for (const root of this.rootNodes) walk(root);
+    for (const img of imgs) if (!img.complete) pending++;
     return pending;
   }
 
@@ -574,47 +640,43 @@ class MotionRuntime {
 
     for (const root of this.rootNodes) {
       root.updateTransforms(time, Matrix2D.identity());
+      root.renderDOM(time);
     }
 
-    const ctx = this.ctx;
-    ctx.setTransform(1, 0, 0, 1, 0, 0);
+    for (const sw of this.sceneWindows) {
+      const on = time >= sw.start && time < sw.end;
+      sw.el.style.visibility = on ? "visible" : "hidden";
+    }
 
-    // Resolve AI visual config (from spec.visual, with background fallback)
+    // Camera applies to the DOM scene graph only — #stage's own transform,
+    // composed with every node's own (local, not world) transform via
+    // ordinary nested-element transform inheritance. transform-origin:0 0
+    // on #stage matters here: getViewMatrix()'s matrix is built relative to
+    // true (0,0) (it bakes in its own translate-to-center term), so a
+    // default 50%/50% CSS origin would double-center it the moment
+        // camera pan/zoom/rotation is non-identity.
+    this.stageEl.style.transform = this.camera.getViewMatrix().toCSSMatrix();
+
     const visual = Object.assign(
       { background: this.background },
       (this.spec && this.spec.visual) ? this.spec.visual : {}
     );
 
-    // Layer 1: Parameterized studio backdrop (spotlight, grid) — AI-driven
+    // Layer 1+2: backdrop + ambient particles, BEHIND #stage, unaffected by
+    // camera transform (matches the old engine: these use camera.x/y only
+    // as a subtle parallax offset, never the full view matrix).
+    const bctx = this.backdropCtx;
+    bctx.setTransform(1, 0, 0, 1, 0, 0);
     if (this.effects) {
-      this.effects.drawStudioBackdrop(ctx, visual, this.camera, time);
+      this.effects.drawStudioBackdrop(bctx, visual, this.camera, time);
+      this.effects.drawAmbientParticles(bctx, visual, this.camera, time);
     } else {
-      ctx.fillStyle = visual.background || this.background;
-      ctx.fillRect(0, 0, this.width, this.height);
+      bctx.fillStyle = visual.background || this.background;
+      bctx.fillRect(0, 0, this.width, this.height);
     }
-
-    // Layer 2: Atmospheric bokeh particles — AI-driven color, count, speed
-    if (this.effects) {
-      this.effects.drawAmbientParticles(ctx, visual, this.camera, time);
-    }
-
-    // Layer 3: Camera Matrix & Scene Graph Render
-    const camMat = this.camera.getViewMatrix();
-    ctx.save();
-    camMat.applyToContext(ctx);
-
-    const sortedRoots = [...this.rootNodes].sort((a, b) => a.zIndex - b.zIndex);
-    for (const root of sortedRoots) {
-      root.render(ctx, time);
-    }
-    ctx.restore();
-
-    // Layer 4: Post-Processing — film grain & vignette with AI-specified intensities
-    if (this.effects) {
-      this.effects.applyPostProcessing(ctx, visual);
-    }
+    // Layer 4 (grain/vignette) is set once in _setupPostProcessing(),
+    // not drawn per frame — see that method's comment.
   }
-
 }
 
 window.Matrix2D = Matrix2D;
