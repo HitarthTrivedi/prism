@@ -159,11 +159,29 @@ def inspect(spec: dict[str, Any]) -> list[str]:
             bounds = _node_bounds(node, canvas_w, canvas_h)
             if bounds:
                 left, top, right, bottom = bounds
-                if right <= 0 or bottom <= 0 or left >= canvas_w or top >= canvas_h:
+                fully_outside = (right <= 0 or bottom <= 0
+                                  or left >= canvas_w or top >= canvas_h)
+                if fully_outside:
                     faults.append(
                         f'node "{nid}" sits entirely outside the '
                         f"{canvas_w}x{canvas_h} frame (approx. bounds "
                         f"{left:.0f},{top:.0f} to {right:.0f},{bottom:.0f})")
+                # A center-anchored node positioned near an edge — a common
+                # real mistake: a headline meant to sit at a LEFT margin,
+                # authored with anchor [0.5, 0.5] instead of [0, 0.5], runs
+                # off the edge for anything wider than a couple of words.
+                # Caught live on a real generated scene: "DISTRIBUTED
+                # CRAWLER" at x=96 rendered as "...BUTED CRAWLER", clipped
+                # at the left edge — entirely outside the frame never fires
+                # for a PARTIAL overflow like that, so this is checked
+                # separately, not folded into the condition above.
+                elif left < 0 or top < 0 or right > canvas_w or bottom > canvas_h:
+                    faults.append(
+                        f'node "{nid}" runs off the edge of the '
+                        f"{canvas_w}x{canvas_h} frame (approx. bounds "
+                        f"{left:.0f},{top:.0f} to {right:.0f},{bottom:.0f}) — "
+                        "check its anchor against its position; a "
+                        "center anchor near a margin clips wide content")
             if duration:
                 faults.extend(_entrance_faults(node, duration))
     return faults
