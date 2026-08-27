@@ -2011,7 +2011,8 @@ def run(routing: dict, cfg: dict, attachments=None, on_event=None,
         query: str = "", chatgpt_analysis: bool = True,
         custom_stages: list[tuple[str, str, list[str]]] | None = None,
         should_stop=None, failover: bool = True,
-        reel_design_stage: str = "", pipeline_files_out: list | None = None):
+        reel_design_stage: str = "", pipeline_files_out: list | None = None,
+        motion_design_stage: str = ""):
     """Execute the pipeline. Returns (responses, links).
 
     attachments: list of records from core.files.attach() — uploaded to each
@@ -2035,6 +2036,14 @@ def run(routing: dict, cfg: dict, attachments=None, on_event=None,
                  scenes are then asked for one at a time in the same tab. A
                  routed run finds this stage on its own; only a caller passing
                  `custom_stages` has to name it.
+    motion_design_stage: the same idea as reel_design_stage, for core.motion
+                 instead of core.reel_web — that stage's reply is turn one
+                 (project, camera, storyboard rows), and core.motion.generate
+                 asks for each scene's nodes one at a time in the same tab.
+                 Motion has no routed-run auto-detection (it isn't in
+                 core.agents' catalogue), so every caller names this stage
+                 itself — there is no "a routed run finds this on its own"
+                 case the way there is for reel_design_stage.
     on_event(kind, payload) is an optional callback for live UI updates.
     should_stop() is an optional predicate polled between and during stages.
                  A routed run drives a browser for minutes at a time, so a
@@ -2254,6 +2263,14 @@ def run(routing: dict, cfg: dict, attachments=None, on_event=None,
         if design_feeder:
             script_stage = script_stage or stages[design_feeder - 1][0]
 
+    # Same idea, for core.motion. No routed-run auto-detection exists for
+    # it (see motion_design_stage's docstring) — every caller names the
+    # stage itself, unconditionally.
+    motion_feeder = None
+    if motion_design_stage:
+        motion_feeder = next((i for i, (st, _, _) in enumerate(stages)
+                              if st == motion_design_stage), None)
+
     local_reel_at = next((i for i, (_, an, _) in enumerate(stages)
                           if (A.resolve_agent("", an) or {}).get("local") == "reel"),
                          None)
@@ -2448,7 +2465,10 @@ def run(routing: dict, cfg: dict, attachments=None, on_event=None,
             # needs — and the stage immediately before it is the image maker,
             # whose text is chatter about the pictures. Forwarding that as the
             # brief is how a design ends up answering the wrong question.
-            if stage_idx == design_feeder:
+            # Motion's storyboard stage is self-contained the same way and
+            # gets the same treatment, whether or not it happens to have a
+            # preceding stage.
+            if stage_idx == design_feeder or stage_idx == motion_feeder:
                 prior = []
 
             if prior:
@@ -2696,6 +2716,8 @@ def run(routing: dict, cfg: dict, attachments=None, on_event=None,
                 expect = (routing.get(stage) or {}).get("expect", "")
                 if stage_idx == design_feeder:
                     expect = '"css"'
+                elif stage_idx == motion_feeder:
+                    expect = '"storyboard"'
                 elif stage_idx == spec_feeder:
                     # A spec streams in over several seconds and pauses mid-way;
                     # without a marker a pause reads as "finished" and we scrape
@@ -2825,6 +2847,53 @@ def run(routing: dict, cfg: dict, attachments=None, on_event=None,
                             ui.warn(f'   the design dropped or reworded: '
                                     f'"{line}"')
                         stage_responses = [_json.dumps(spec, ensure_ascii=False)]
+
+                # Same idea as design_feeder just above, for core.motion:
+                # turn one is the storyboard, every scene's nodes are then
+                # asked for one at a time in the same tab. No script/assets
+                # substitution here — core.motion.generate's prompts are
+                # self-contained, unlike reel_web's ASSET_TOKEN/BRAND_TOKEN
+                # placeholders — so there is nothing to fill in before this
+                # runs, only after the reply comes back.
+                if stage_idx == motion_feeder and texts:
+                    from . import motion as _motion_pkg
+                    from .motion import generate as _motion
+
+                    scene_wait = max(int(agent_cfg.get("wait_time", 60)), 180)
+
+                    def _ask(prompt, expect=_motion.SCENE_EXPECT):
+                        got = _reask(driver, agent_cfg, prompt, expect=expect,
+                                     wait=scene_wait)
+                        return got[-1] if got else ""
+
+                    try:
+                        spec = _motion.build_spec(
+                            texts[-1], _ask,
+                            log=lambda m: ui.info(f"   {m}"),
+                            should_stop=should_stop,
+                            on_scene=lambda i, n: emit(
+                                "motion_scene", {"index": i, "total": n}))
+                    except Exception as e:
+                        # Turn one did not parse, so there is no storyboard
+                        # to build scenes against. Kept as-is: it may still
+                        # be a whole single-reply spec from a model that
+                        # answered the old way, and the renderer will
+                        # happily parse that.
+                        ui.err(f"   {e}")
+                        kept = _keep_failed_spec(texts)
+                        if kept:
+                            ui.info(f"   what came back was saved to {kept}")
+                    else:
+                        import json as _json
+                        try:
+                            validated = _motion_pkg.validate_motion_spec(spec)
+                        except Exception as e:
+                            ui.err(f"   storyboard assembled but did not "
+                                   f"validate ({e})")
+                        else:
+                            ui.ok(f"   {len(validated['scenes'])} scene(s) "
+                                  "written")
+                            stage_responses = [_json.dumps(validated, ensure_ascii=False)]
 
                 # This stage feeds a renderer, so "it answered" isn't enough —
                 # it has to have answered in JSON. Prefer a capture that

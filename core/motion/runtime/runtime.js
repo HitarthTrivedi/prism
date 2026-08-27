@@ -456,6 +456,10 @@ class Node {
 
   render(ctx, time) {
     if (!this.visible || this.evalOpacity <= 0.001) return;
+    // Root-node scene window (see loadSpec()) — undefined for anything
+    // that isn't a direct child of a scene, so nested nodes are unaffected
+    // and gated only by whether their parent's render() runs at all.
+    if (this.sceneStart !== undefined && (time < this.sceneStart || time >= this.sceneEnd)) return;
     ctx.save();
     ctx.globalAlpha = Math.max(0, Math.min(1, ctx.globalAlpha * this.evalOpacity));
     ctx.globalCompositeOperation = this.blendMode;
@@ -509,12 +513,27 @@ class MotionRuntime {
       this.camera.setTracks(spec.camera.tracks);
     }
 
+    // Scenes have no clock of their own — resolve_motion_spec() (Python)
+    // already shifted every node's authored, scene-local times onto this
+    // one global timeline and gave each scene a real `start`. What's left
+    // for the renderer is visibility: a scene's nodes should only draw
+    // during [start, start+duration), or scene 2 renders on top of scene 1
+    // for the whole video instead of after it. sceneStart/sceneEnd are
+    // stamped onto each ROOT node only (see render()'s gate below) — a
+    // node inside a `children` array is gated by its parent's render call
+    // never running, not by carrying its own copy.
     this.rootNodes = [];
     const scenes = spec.scenes || [];
     for (const scene of scenes) {
+      const sceneStart = scene.start || 0;
+      const sceneEnd = sceneStart + (scene.duration || 0);
       for (const nodeData of scene.nodes || []) {
         const node = createNodeFromSpec(nodeData);
-        if (node) this.rootNodes.push(node);
+        if (node) {
+          node.sceneStart = sceneStart;
+          node.sceneEnd = sceneEnd;
+          this.rootNodes.push(node);
+        }
       }
     }
   }

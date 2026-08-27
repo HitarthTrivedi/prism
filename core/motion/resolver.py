@@ -9,14 +9,77 @@ from __future__ import annotations
 from typing import Any, Dict, List, Optional, Tuple
 
 
+def _offset_node_times(node: Dict[str, Any], offset: float) -> None:
+    """Shift a node's (and its children's) authored animation times by
+    `offset`, in place. Scenes are written scene-local (a node's `enter`/
+    `exit`/track keyframes count from 0 at that scene's own start,
+    matching how core.reel_web's per-scene prompts work) — this is what
+    turns that into the single global timeline runtime.js actually plays.
+    """
+    anim = node.get("animation")
+    if isinstance(anim, dict):
+        for block_name in ("enter", "exit"):
+            block = anim.get(block_name)
+            if isinstance(block, dict) and "time" in block:
+                try:
+                    block["time"] = float(block["time"]) + offset
+                except (TypeError, ValueError):
+                    pass
+        tracks = anim.get("tracks")
+        if isinstance(tracks, list):
+            for track in tracks:
+                keyframes = track.get("keyframes") if isinstance(track, dict) else None
+                if isinstance(keyframes, list):
+                    for kf in keyframes:
+                        if isinstance(kf, dict) and "time" in kf:
+                            try:
+                                kf["time"] = float(kf["time"]) + offset
+                            except (TypeError, ValueError):
+                                pass
+    children = node.get("children")
+    if isinstance(children, list):
+        for child in children:
+            if isinstance(child, dict):
+                _offset_node_times(child, offset)
+
+
 def resolve_motion_spec(spec: Dict[str, Any]) -> Dict[str, Any]:
     """Preprocesses and enriches a validated Motion Specification.
     - Resolves semantic targets in camera tracks
     - Computes bounding envelopes for auto-framing
+    - Lays scenes out sequentially on one global timeline: each scene's
+      `start` is recomputed as a running total of the scenes before it
+      (schema.py defaults every scene's `start` to 0.0, which is only ever
+      right for the first one), and every node's authored, scene-local
+      animation times are shifted to match — the renderer has no per-scene
+      clock of its own, it plays one continuous timeline and uses
+      `start`/`duration` only to decide which scene's nodes are visible
+      when.
     """
     spec = dict(spec)
     scenes = spec.get("scenes", [])
     camera = spec.get("camera", {})
+
+    # Guarded the same way camera focus_target resolution already is below
+    # (`if target and "position" not in track`) — a saved spec is meant to
+    # re-render identically forever, including a second pass through THIS
+    # function on an already-resolved spec (e.g. render() calling it fresh
+    # from a .json file that build_spec() already resolved once). Without
+    # the guard, node times shift by each scene's start a second time and
+    # drift further every re-render.
+    if not spec.get("_scene_times_resolved"):
+        cursor = 0.0
+        for scene in scenes:
+            try:
+                duration = float(scene.get("duration", 0.0) or 0.0)
+            except (TypeError, ValueError):
+                duration = 0.0
+            scene["start"] = cursor
+            for node in scene.get("nodes", []) or []:
+                if isinstance(node, dict):
+                    _offset_node_times(node, cursor)
+            cursor += duration
+        spec["_scene_times_resolved"] = True
 
     node_registry: Dict[str, Dict[str, Any]] = {}
 

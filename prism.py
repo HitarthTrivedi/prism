@@ -1499,10 +1499,11 @@ def cmd_motion(cfg: dict, request: str, attachments: list | None = None):
         ui.err(f"Motion Graphics requirement missing: {err}")
         return
 
-    from core.motion.prompts import MOTION_SYSTEM_PROMPT, parse_motion_reply
+    from core.motion import generate as motion_generate
     from core import automation
+    import json
 
-    prompt = f"{MOTION_SYSTEM_PROMPT}\n\nUSER REQUEST: {request}"
+    prompt = motion_generate.storyboard_instructions(request)
 
     # ── Multi-agent fallback routing ───────────────────────────────────────────
     # Build a prioritized provider chain from the agents the user actually
@@ -1530,22 +1531,31 @@ def cmd_motion(cfg: dict, request: str, attachments: list | None = None):
             ui.rule(f"Visual Director ({agent})", "magenta")
             ui.info(f"Designing motion graphic: {request}")
 
+            # motion_design_stage turns "storyboard" into the same
+            # scene-at-a-time conversation reel_design_stage gives
+            # core.reel_web: this one reply is turn one, and
+            # core.motion.generate.build_spec() asks for every scene's
+            # nodes on its own turn in the same tab before returning.
+            # By the time run() returns, responses["storyboard"] already
+            # holds the fully assembled, validated multi-scene spec — not
+            # just turn one's raw reply.
             responses, links = automation.run(
                 {}, cfg, attachments=attachments, chatgpt_analysis=False,
-                custom_stages=[("motion_plan", agent, [prompt])],
+                custom_stages=[("storyboard", agent, [prompt])],
+                motion_design_stage="storyboard",
                 query=f"motion graphic — {request}")
 
-            texts = [t for t in (responses.get("motion_plan") or []) if t.strip()]
+            texts = [t for t in (responses.get("storyboard") or []) if t.strip()]
             if not texts:
                 last_error = f"{agent}: returned empty response"
                 ui.warn(f"   {last_error} — trying next provider…")
                 continue
 
-            spec = parse_motion_reply(texts[-1])
+            spec = json.loads(texts[-1])
             used_agent = agent
             break
 
-        except ValueError as e:
+        except (ValueError, json.JSONDecodeError) as e:
             last_error = f"{agent}: could not parse motion spec — {e}"
             ui.warn(f"   {last_error} — trying next provider…")
             continue
@@ -1559,7 +1569,7 @@ def cmd_motion(cfg: dict, request: str, attachments: list | None = None):
         ui.err(f"Last error: {last_error}")
         return
 
-    import time, json
+    import time
     os.makedirs(C.RUNS_DIR, exist_ok=True)
     stamp = int(time.time())
     out = os.path.join(C.RUNS_DIR, f"motion_{stamp}.mp4")
