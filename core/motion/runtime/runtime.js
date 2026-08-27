@@ -271,7 +271,17 @@ class Node {
     this.position = props.position ? [...props.position] : [0, 0];
     this.scale = props.scale ? [...props.scale] : [1, 1];
     this.rotation = props.rotation || 0;
-    this.anchor = props.anchor ? [...props.anchor] : [0.5, 0.5];
+    // Defense-in-depth, not the primary fix (that's schema.py's
+    // _normalize_anchor — this only runs if something reaches the runtime
+    // without going through validate_motion_spec first). A malformed
+    // anchor here is a real landmine: spreading a STRING (e.g. "center",
+    // a keyword an LLM reasonably reaches for) produces an array of its
+    // individual characters, so anchor[0]/[1] become non-numeric and every
+    // position multiply against them is NaN — the node silently never
+    // appears anywhere, with no error.
+    this.anchor = (Array.isArray(props.anchor) && props.anchor.length === 2
+      && typeof props.anchor[0] === "number" && typeof props.anchor[1] === "number")
+      ? [...props.anchor] : [0.5, 0.5];
     this.opacity = props.opacity !== undefined ? props.opacity : 1.0;
     this.zIndex = props.z_index || 0;
     this.visible = props.visible !== undefined ? props.visible : true;

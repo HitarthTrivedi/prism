@@ -254,6 +254,46 @@ class TextNode extends Node {
 
   draw(ctx, time) {
     if (!this.content) return;
+    const lines = String(this.content).split(/\r?\n/);
+    if (lines.length === 1) {
+      this._drawSingleLine(ctx, time);
+      return;
+    }
+    // Multi-line content, stacked vertically by lineHeight. Every mode
+    // below gets this for free — canvas ctx.fillText() has never respected
+    // \n on its own, so a multi-line headline (which the AI writes
+    // constantly — see core/motion/generate.py's storyboard prompt
+    // examples) silently rendered as one unbroken line, usually wider than
+    // the frame. Measured on a real generated reel: a 2-line, font-size-86
+    // headline rendered as one ~1400px line on a 1080px canvas, clipped on
+    // both edges.
+    //
+    // Simplification, not a bug: every line shares the same reveal clock —
+    // this is NOT a true per-line cascade (line 2 doesn't wait for line 1
+    // to finish). Good enough to fix the actual reported symptom
+    // (invisible/clipped text); a real staggered multi-line reveal is a
+    // separate enhancement, not required to stop text running off-frame.
+    const original = this.content;
+    const lineHeightPx = this.fontSize * this.lineHeight;
+    const totalH = lineHeightPx * (lines.length - 1);
+    try {
+      for (let i = 0; i < lines.length; i++) {
+        this.content = lines[i];
+        const y = -totalH / 2 + i * lineHeightPx;
+        ctx.save();
+        ctx.translate(0, y);
+        this._drawSingleLine(ctx, time);
+        ctx.restore();
+      }
+    } finally {
+      // Always restored, even on a thrown error — this.content is shared,
+      // mutable state re-read every frame; leaving it stuck on one line
+      // would corrupt every subsequent draw() call for this node.
+      this.content = original;
+    }
+  }
+
+  _drawSingleLine(ctx, time) {
     this._setFont(ctx);
     const fullWidth = ctx.measureText(this.content).width;
 

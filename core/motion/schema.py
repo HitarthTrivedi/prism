@@ -27,6 +27,48 @@ SUPPORTED_EASINGS = {
     "spring", "smooth"
 }
 
+# Keyed by the keyword with every space/hyphen/underscore stripped and
+# lowercased, so "top-left", "top_left", "Top Left" and "topleft" all match
+# the same entry — an LLM asked for an anchor is about as likely to write
+# any of those forms as the others.
+_ANCHOR_KEYWORDS = {
+    "center": (0.5, 0.5), "middle": (0.5, 0.5),
+    "top": (0.5, 0.0), "topcenter": (0.5, 0.0), "topmiddle": (0.5, 0.0),
+    "bottom": (0.5, 1.0), "bottomcenter": (0.5, 1.0), "bottommiddle": (0.5, 1.0),
+    "left": (0.0, 0.5), "centerleft": (0.0, 0.5), "middleleft": (0.0, 0.5),
+    "right": (1.0, 0.5), "centerright": (1.0, 0.5), "middleright": (1.0, 0.5),
+    "topleft": (0.0, 0.0), "lefttop": (0.0, 0.0),
+    "topright": (1.0, 0.0), "righttop": (1.0, 0.0),
+    "bottomleft": (0.0, 1.0), "leftbottom": (0.0, 1.0),
+    "bottomright": (1.0, 1.0), "rightbottom": (1.0, 1.0),
+}
+
+
+def _normalize_anchor(value: Any) -> list[float]:
+    """A node's anchor, coerced to a real [x, y] pair.
+
+    Accepts what schema.py always accepted (a 2-number list/tuple) and,
+    now, common keyword strings a CSS-literate model reaches for instead
+    ("center", "top-left", ...) — mapped to the equivalent fraction rather
+    than just rejected, since that's what was actually meant. Anything
+    else (missing, malformed, an unrecognized word) falls back to
+    [0.5, 0.5] instead of passing a broken value through: see
+    _validate_node's comment for exactly how destructive that is
+    downstream (NaN positions from spreading a string in JS).
+    """
+    if isinstance(value, str):
+        key = value.strip().lower().replace(" ", "").replace("-", "").replace("_", "")
+        if key in _ANCHOR_KEYWORDS:
+            x, y = _ANCHOR_KEYWORDS[key]
+            return [x, y]
+        return [0.5, 0.5]
+    if isinstance(value, (list, tuple)) and len(value) == 2:
+        try:
+            return [float(value[0]), float(value[1])]
+        except (TypeError, ValueError):
+            pass
+    return [0.5, 0.5]
+
 
 def validate_motion_spec(data: Union[str, Dict[str, Any]]) -> Dict[str, Any]:
     """Validate raw JSON or dict against the Prism Motion Graphics Schema.
@@ -143,8 +185,18 @@ def validate_motion_spec(data: Union[str, Dict[str, Any]]) -> Dict[str, Any]:
         node.setdefault("scale",    [1.0, 1.0])
         node.setdefault("rotation", 0.0)
         node.setdefault("opacity",  1.0)
-        node.setdefault("anchor",   [0.5, 0.5])
         node.setdefault("z_index",  0)
+        # setdefault alone isn't enough for anchor — it only fills a MISSING
+        # key, and a wrong-TYPE one (present, just broken) sails through
+        # untouched. Measured on a real generated reel: every image node
+        # used anchor: "center" (a bare string, not [0.5, 0.5]) — a
+        # reasonable guess for someone used to CSS-style keyword anchors,
+        # and genuinely destructive downstream: runtime.js's Node
+        # constructor does `[...props.anchor]`, and spreading a STRING
+        # produces an array of its individual CHARACTERS ('c','e','n',...),
+        # so anchor[0]/[1] become non-numeric and every position multiply
+        # against them is NaN — the node silently never appears anywhere.
+        node["anchor"] = _normalize_anchor(node.get("anchor"))
 
         # Sanitize easing strings in animation blocks silently. An invalid
         # name is DROPPED, not rewritten to a fixed curve — forcing every

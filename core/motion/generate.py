@@ -38,7 +38,9 @@ _PALETTE_GUIDANCE = """READ THE USER'S CONTEXT and autonomously decide the right
 DO NOT use generic or safe designs. Make bold, modern, production-quality decisions."""
 
 _NODE_CATALOGUE = """NODE TYPES (put these in "nodes"):
-  text             — content, position, font_size, font_weight, fill, mode (see TEXT MODES)
+  text             — content, position, font_size, font_weight, fill, mode (see TEXT MODES).
+                      A long headline may use "\\n" for a manual line break —
+                      each line is centred and stacked automatically.
   shape_rect       — position, width, height, radius, fill, is_glass (optional)
   shape_arrow      — from, to, curved, color, stroke_width, draw_start, draw_duration
   domain_chart     — chart_type (bar|line|ring|area|sparkline|metric), data, accent_color
@@ -49,6 +51,10 @@ _NODE_CATALOGUE = """NODE TYPES (put these in "nodes"):
                       below (never write a real URL or invent a name) — a logo,
                       a product photo, a screenshot. Drawn clipped to a rounded
                       rect; SVG marks work the same way as photos.
+
+"anchor" (on any node) is ALWAYS a two-number [x, y] fraction of the node's
+own box, e.g. [0.5, 0.5] for its centre, [0, 0] for its top-left corner —
+never a keyword string like "center" or "top-left".
 
 TEXT MODES (set on any text node via "mode"):
   word_stagger   — words pop in sequentially with spring overshoot (default, versatile)
@@ -168,6 +174,14 @@ def scene_instructions(idx: int, total: int, row: dict, assets: str = "") -> str
         "slide, however busy it is, is every element using the same "
         "easing curve. Treat that as the failure to design against.\n"
         "5. Never use generic emojis in text content.\n\n"
+        "6. The brand's accent colour should recur, not repeat identically —\n"
+        "   the same one or two colours framing every single scene the same\n"
+        "   way (same white headline, same accent subtitle, same background)\n"
+        "   reads as one template stamped four times, not four scenes of one\n"
+        "   film. Let where and how the accent is used change: a highlighted\n"
+        "   word instead of a whole line, a filled shape instead of an\n"
+        "   outline, a background wash instead of just text — same brand,\n"
+        "   different weight each time.\n\n"
         + (f"ARTWORK YOU MAY USE:\n{assets}\n\n" if assets else "")
         + "Reply with ONLY this JSON object, in a ```json fenced code "
         "block, nothing before or after it:\n"
