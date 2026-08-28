@@ -95,23 +95,27 @@ def _entrance_faults(node: dict, scene_duration: float) -> list[str]:
         elif e_dur <= 0.05:
             faults.append(f'node "{nid}" enters over {e_dur:g}s — that is '
                           "instant, not an entrance; give it real duration")
-        e_type = enter.get("type")
-        if e_type in ("slide_up", "slide_down"):
+        # Per-tween checks — the closed "type" enum (slide_up/fade_in/...)
+        # this used to key off is gone; the same two facts are checked
+        # against whichever channels the enter actually declares, since a
+        # blur-focus or clip reveal can have exactly the same "technically
+        # present but too small to read" and "fades to nothing" failure
+        # modes a slide/fade could.
+        for tw in (enter.get("tweens") or []):
+            if not isinstance(tw, dict):
+                continue
+            channel = tw.get("channel")
             try:
-                distance = abs(float(enter.get("distance", 60) or 60))
+                frm = float(tw.get("from", 0.0))
+                to = float(tw.get("to", 0.0))
             except (TypeError, ValueError):
-                distance = 60
-            if distance < 5:
-                faults.append(f'node "{nid}"\'s {e_type} moves only '
-                              f"{distance:g}px — too small to read as motion")
-        if e_type == "fade_in":
-            try:
-                target_opacity = float(node.get("opacity", 1.0))
-            except (TypeError, ValueError):
-                target_opacity = 1.0
-            if target_opacity <= 0.05:
-                faults.append(f'node "{nid}" fades in to opacity '
-                              f"{target_opacity:g} — effectively invisible")
+                continue
+            if channel in ("x", "y") and abs(to - frm) < 5:
+                faults.append(f'node "{nid}"\'s enter {channel} tween moves '
+                              f"only {abs(to - frm):g}px — too small to read as motion")
+            if channel == "opacity" and to <= 0.05:
+                faults.append(f'node "{nid}" enters to opacity {to:g} — '
+                              "effectively invisible")
 
     exit_ = anim.get("exit")
     if isinstance(exit_, dict) and "time" in exit_:

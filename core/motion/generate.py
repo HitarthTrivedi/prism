@@ -21,21 +21,33 @@ from .schema import MotionValidationError
 
 SCENE_EXPECT = '"nodes"'
 
-_PALETTE_GUIDANCE = """READ THE USER'S CONTEXT and autonomously decide the right visual language:
-- Financial / data explainer  → deep navy (#06091A), emerald-green or gold accents, precise
-  sans-serif, kinetic counter tickers, smooth line/ring charts
-- SaaS / tech product demo    → obsidian (#07091A), electric cyan or violet, glassmorphism
-  UI mockup, animated cursor, status badges, word-stagger headline
-- Brand / social launch       → dark charcoal (#111215), warm coral or amber spotlight,
-  bold heavy typography (900 weight), wide radial backlight, dynamic camera zoom
-- Educational / explainer     → clean slate-navy (#0D1424), neutral accents, diagram nodes,
-  sequential step arrows, readable body copy
-- Healthcare / trust          → deep slate (#0A1020), soft teal (#14B8A6), high legibility,
-  ring chart for KPI percentages, calm spring easing
-- Consumer / lifestyle        → warm dark (#120E0A), coral-orange or amber, fast spring
-  overshoots, energetic pacing, bold italic type
+_PALETTE_GUIDANCE = """Choose a PALETTE and a TYPE PAIRING for this specific brief — not from a
+fixed industry lookup. "Financial" does not mean navy, "SaaS" does not mean
+cyan-on-obsidian — those are reflexes, and every video that reaches for the
+same reflex for the same kind of request looks like it came from a template
+library, no matter how different the copy is.
 
-DO NOT use generic or safe designs. Make bold, modern, production-quality decisions."""
+Decide instead from what the brief is actually asking to FEEL like: is it
+warm/editorial and trustworthy (cream or ivory background, a dark ink text
+colour, one warm metal or earth accent, a serif display face), cool/precise
+and technical (deep charcoal or ink background, one saturated accent,
+condensed sans display face), bright/energetic and consumer-facing (a light
+or mid-tone ground, a bold saturated accent, a heavy display weight), or
+something else the brief itself suggests — pick the mood, then commit to a
+small NAMED set for the whole piece:
+  project.palette: { bg_a, bg_b, ink, accent, accent2 } — bg_a/bg_b are the
+    two backgrounds scenes alternate between (see rule 8 below), ink is the
+    text colour that reads on whichever background is light, accent is the
+    one colour used sparingly and consistently as the piece's signature.
+  project.type: { display_font, body_font } — a real two-font pairing (a
+    display/serif or condensed face for headlines and numbers, a plain
+    sans for body copy and labels) picked for the SAME mood as the
+    palette, not the same font doing both jobs.
+
+DO NOT use generic or safe designs. Make bold, specific, production-quality
+decisions — and make a genuinely different decision than the last brief
+that felt similar, the same way rule 4 below asks for genuinely different
+easing choices scene to scene."""
 
 _NODE_CATALOGUE = """NODE TYPES (put these in "nodes"):
   text             — content, position, font_size, font_weight, fill, mode (see TEXT MODES).
@@ -67,25 +79,53 @@ TEXT MODES (set on any text node via "mode"):
   typewriter     — characters appear left-to-right with cursor (developer, code)
 
 ANIMATION, on any node via "animation" (all times are LOCAL to this scene, starting at 0):
-  "enter": {"type": "fade_in|pop_in|slide_up|slide_down", "time":, "duration":,
-            "easing":, "properties": {"scale": {"easing": "..."}, ...}}
+  "enter": {"time":, "duration":, "tweens": [
+              {"channel": "opacity", "from": 0, "to": 1, "easing": "power2.out"},
+              {"channel": "y", "from": 20, "to": 0, "easing": "power2.out", "delay": 0.05},
+              ...
+           ]}
   "exit":  same shape as "enter" — give at least one node per scene a real
            exit so the scene doesn't just settle and hold until the cut.
-  "secondary_motion": {"property": "rotation|position.x|position.y|opacity|scale",
-                        "freq":, "amount":, "seed": "<anything stable>"} — a small
-           deterministic wiggle on top of the main animation.
+  Put as many tweens in one enter/exit as the moment needs — this is how a
+  blur-focus reveal, a directional slide, a scale-pop and a plain fade are
+  all really just different CHANNEL COMBINATIONS of the same mechanism, not
+  different fixed "types" to pick from. "from"/"to" for x/y are relative
+  OFFSETS from the node's own resting position (20 means 20px away from
+  where it settles, not an absolute coordinate); scale/scaleX/scaleY/
+  rotation/skewX/skewY/opacity work the same way; blur/clipInset/
+  backgroundPositionX/strokeDashoffset are absolute values in their own
+  units (blur in px, clipInset 0-100 as percent revealed, strokeDashoffset
+  in the node's own path-length units — leave it to the runtime's own
+  full-length value, tween TO 0 to fully draw a line/arrow/mark).
+  TWEEN CHANNELS: opacity, x, y, scale, scaleX, scaleY, rotation, skewX,
+    skewY, blur, clipInset, backgroundPositionX, strokeDashoffset.
+  "secondary_motion": {"property": "<any channel above>", "freq":, "amount":,
+                        "seed": "<anything stable>"} — a small deterministic
+           wiggle on top of the main animation, running the WHOLE time this
+           node is on screen (see the background layer's rule below).
   "follow": {"lag":, "damping":} — on a CHILD node, makes it trail the parent's
-           recent motion instead of moving in rigid lockstep.
+           recent motion instead of moving in rigid lockstep. (Not yet
+           supported by the current runtime — avoid relying on it.)
 
-EASING VALUES:
-  easeOutCubic, easeInCubic, easeInOutCubic, easeOutExpo, easeInOutExpo,
-  back.in, back.out, back.inOut, elastic.in, elastic.out, elastic.inOut,
-  bounce.in, bounce.out, bounce.inOut, spring, smooth, linear
+TRANSITIONS, on a SCENE (not a node) via "transition_in" — how this scene
+cuts in from the one before it. Omit it and one is still picked for you
+(never a silent hard cut), but naming one on purpose usually reads better:
+  push        — both scenes travel together, new one pushing the old off. Neutral, use for an ordinary beat.
+  push_up     — same as push, vertical instead of horizontal.
+  squeeze     — the old scene compresses away, the new one opens out. Mechanical, precise — industrial/technical subjects.
+  zoom        — the old scene rushes past and blurs, the new one rises from behind it. Reserve it — it reads as pushing deeper into the same thought.
+  blur_swoosh — both scenes blur/skew past each other, directional. Editorial, motion-forward.
+  light_leak  — a warm light wash bridges the cut. Editorial, warm, premium — good between two beats of the same argument rather than a hard scene change.
+
+EASING VALUES (GSAP's own — the runtime hands these straight to the tween engine):
+  power1.in/out/inOut, power2.in/out/inOut, power3.in/out/inOut, power4.in/out/inOut,
+  back.in/out/inOut, elastic.in/out/inOut, bounce.in/out/inOut,
+  circ.in/out/inOut, expo.in/out/inOut, sine.in/out/inOut, none
 
   Pick by what the thing is doing, not by habit — reusing one easing for
   everything that moves is the fastest way to look like a slide deck, no
   matter how many elements are on screen. `.out` curves for things
-  ARRIVING, `.in` curves for things LEAVING, `smooth`/linear/spring for
+  ARRIVING, `.in` curves for things LEAVING, `sine.inOut`/`none` for
   motion still running when the scene hands over. Use at least two
   distinct easings in this scene."""
 
@@ -194,11 +234,16 @@ def storyboard_instructions(request: str, brand: dict | None = None,
         "nothing before or after it:\n"
         "{\n"
         '  "project": {"width": 1080, "height": 1920, "fps": 30, '
-        '"duration": 8.0, "background": "#07091A"},\n'
+        '"duration": 8.0, "background": "#07091A",\n'
+        '    "palette": {"bg_a": "...", "bg_b": "...", "ink": "...", '
+        '"accent": "...", "accent2": "..."},\n'
+        '    "type": {"display_font": "...", "body_font": "...", '
+        '"google_fonts_url": "https://fonts.googleapis.com/css2?family=...&display=block"}\n'
+        "  },\n"
         '  "camera": {"tracks": [\n'
         '    {"time": 0.0, "position": [540, 960], "zoom": 1.0},\n'
         '    {"time": 1.2, "position": [540, 900], "zoom": 1.35, '
-        '"duration": 1.1, "easing": "easeInOutCubic"}\n'
+        '"duration": 1.1, "easing": "power2.inOut"}\n'
         "  ]},\n"
         '  "storyboard": [\n'
         '    {"scene": 1, "seconds": 2.5,\n'
@@ -268,7 +313,18 @@ def scene_instructions(idx: int, total: int, row: dict, assets: str = "",
         "   film. Let where and how the accent is used change: a highlighted\n"
         "   word instead of a whole line, a filled shape instead of an\n"
         "   outline, a background wash instead of just text — same brand,\n"
-        "   different weight each time.\n\n"
+        "   different weight each time.\n"
+        "7. Use the palette/type chosen in turn one BY NAME — a full-bleed "
+        "background node filled with project.palette.bg_a or bg_b (alternate "
+        "which one scene to scene rather than repeating the same one every "
+        "time), text filled with project.palette.ink or accent, "
+        'font_family "var(--motion-display-font)" for headlines/numbers and '
+        '"var(--motion-body-font)" for body/labels — never invent a fresh '
+        "hex or font mid-scene that ignores what turn one already chose.\n"
+        "8. This scene may name a \"transition_in\" (see TRANSITIONS above) "
+        "for how it cuts in from the one before it — pick one that fits "
+        "the beat, or leave it unset and a real one is still chosen for "
+        "you rather than a hard cut.\n\n"
     )
     role_header = ""
     if skeleton == "brand_launch":

@@ -8,6 +8,73 @@ from __future__ import annotations
 
 from typing import Any, Dict, List, Optional, Tuple
 
+# Same curated set schema.py validates transition_in against. Rotation
+# (hash of the scene's own id, not Math.random/an incrementing counter) so
+# a scene missing transition_in still gets a real one deterministically —
+# every cut gets a genuine transition by default, matching the reference
+# this engine targets (the Meridian benchmark has zero hard cuts), the same
+# "don't let an unset value silently mean the flattest option" fix already
+# applied to easing fallback in schema.py/runtime.js.
+_TRANSITION_ROTATION = ["push", "blur_swoosh", "light_leak", "push_up", "squeeze", "zoom"]
+
+
+def _hash_seed(seed: str) -> int:
+    h = 0
+    for ch in str(seed):
+        h = (h * 31 + ord(ch)) & 0xFFFFFFFF
+    return h
+
+
+def _desugar_ui_mockup(node: Dict[str, Any]) -> Dict[str, Any]:
+    """A domain_ui_mockup node was never a real runtime primitive — it's
+    always been composable from shape_rect (the window chrome) + shape_rect/
+    text children (its `elements`), so it's expanded here, before the spec
+    ever reaches the runtime, rather than teaching runtime.js a type it
+    doesn't need. Keeps the real primitive count small while the schema/
+    prompt vocabulary the model sees stays rich.
+    """
+    width = float(node.get("width", 860))
+    height = float(node.get("height", 520))
+    title = node.get("title", "")
+    chrome: Dict[str, Any] = {
+        "id": f"{node.get('id', 'ui')}_chrome",
+        "type": "shape_rect",
+        "position": list(node.get("position", [0, 0])),
+        "width": width, "height": height, "radius": 18,
+        "is_glass": True,
+        "z_index": node.get("z_index", 0),
+        "anchor": list(node.get("anchor", [0.5, 0.5])),
+        "animation": node.get("animation"),
+        "children": [],
+    }
+    if title:
+        chrome["children"].append({
+            "id": f"{node.get('id', 'ui')}_title",
+            "type": "text", "content": title, "font_size": 22, "font_weight": 600,
+            "fill": "rgba(255,255,255,0.85)",
+            "position": [-width / 2 + 24, -height / 2 + 30], "anchor": [0, 0.5],
+        })
+    for i, el in enumerate(node.get("elements", []) or []):
+        el_pos = el.get("position", [0, 0])
+        if el.get("type") == "stat_card":
+            chrome["children"].append({
+                "id": f"{node.get('id', 'ui')}_el{i}_card",
+                "type": "shape_rect", "position": list(el_pos), "width": 200, "height": 90,
+                "radius": 12, "fill": "rgba(255,255,255,0.06)",
+            })
+            chrome["children"].append({
+                "id": f"{node.get('id', 'ui')}_el{i}_val",
+                "type": "text", "content": str(el.get("value", "")), "font_size": 28,
+                "font_weight": 700, "fill": el.get("color", "#FFFFFF"), "position": list(el_pos),
+            })
+        else:  # badge / generic label
+            chrome["children"].append({
+                "id": f"{node.get('id', 'ui')}_el{i}",
+                "type": "text", "content": str(el.get("label", "")), "font_size": 18,
+                "font_weight": 600, "fill": el.get("color", "#FFFFFF"), "position": list(el_pos),
+            })
+    return chrome
+
 
 def _resolve_asset_srcs(node: Dict[str, Any], uris: Dict[str, str]) -> None:
     """Swap an `image` node's `src: "asset:<name>"` for the real data: URI,
@@ -111,11 +178,49 @@ def resolve_motion_spec(spec: Dict[str, Any]) -> Dict[str, Any]:
             except (TypeError, ValueError):
                 duration = 0.0
             scene["start"] = cursor
-            for node in scene.get("nodes", []) or []:
+            # domain_ui_mockup was never a real primitive runtime.js knows
+            # how to paint — expand it into shape_rect + text children here,
+            # once, before node times get offset below (so its children's
+            # own animation, if any, is offset along with everything else).
+            nodes = scene.get("nodes", []) or []
+            for i, node in enumerate(nodes):
+                if isinstance(node, dict) and node.get("type") in ("domain_ui_mockup", "domain_ui", "ui_mockup"):
+                    nodes[i] = _desugar_ui_mockup(node)
+            for node in nodes:
                 if isinstance(node, dict):
                     _offset_node_times(node, cursor)
             cursor += duration
         spec["_scene_times_resolved"] = True
+
+    # Cross-scene transitions: each scene (after the first) that names a
+    # transition_in — or, absent one, gets a deterministic default so every
+    # cut is a real transition rather than silently defaulting to a hard
+    # one — gets a computed overlap window with the scene before it. This
+    # does NOT move where a scene's own content is timed (still `scene.
+    # start`, offset above); it only widens each scene's VISIBILITY window
+    # so both scenes coexist during the cut, mirroring core.reel_web.py's
+    # own _plan() (same overlap cap: a third of either neighbor's own
+    # duration, so a short scene is never swallowed by its own transition).
+    if not spec.get("_transitions_resolved"):
+        for i in range(1, len(scenes)):
+            this_scene, prev_scene = scenes[i], scenes[i - 1]
+            try:
+                prev_dur = float(prev_scene.get("duration", 0.0) or 0.0)
+                this_dur = float(this_scene.get("duration", 0.0) or 0.0)
+            except (TypeError, ValueError):
+                continue
+            overlap = min(0.5, prev_dur / 3, this_dur / 3)
+            if overlap <= 0.02:
+                continue  # a scene too short to safely overlap keeps a hard cut
+            t_in = this_scene.get("transition_in")
+            if not t_in:
+                t_in = _TRANSITION_ROTATION[_hash_seed(this_scene.get("id", i)) % len(_TRANSITION_ROTATION)]
+                this_scene["transition_in"] = t_in
+            cut_at = this_scene["start"]
+            this_scene["transitionInStart"] = round(cut_at - overlap, 3)
+            prev_scene["transitionOutEnd"] = round(cut_at + overlap * 0.4, 3)
+            this_scene["_transitionOverlap"] = round(overlap, 3)
+        spec["_transitions_resolved"] = True
 
     node_registry: Dict[str, Dict[str, Any]] = {}
 

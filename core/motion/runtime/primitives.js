@@ -1,19 +1,21 @@
 /**
- * Prism Motion Graphics Engine — Kinetic Typography & Vector Primitives
- * ─────────────────────────────────────────────────────────────────────
- * Full modern kinetic typography toolkit: the AI freely picks any mode per text node.
- * Paint is real DOM/CSS (see Node.mount/renderDOM in runtime.js) — a node's
- * `initDOM(box)` builds its STATIC structure once, `updateDOM(time)` writes
- * only what actually changes per frame.
+ * Prism Motion Graphics Engine — Node subclasses (GSAP rebuild)
+ * ─────────────────────────────────────────────────────────────
+ * Paint is real DOM/CSS (unchanged from the Aug-28 pivot). What changed
+ * with the GSAP rewrite: any primitive with its OWN internal content
+ * animation (TextNode's 8 modes, ShapeArrowNode's draw-on) now builds real
+ * GSAP tweens ONCE via registerContentAnimation(masterTl), instead of
+ * computing a value every frame in an updateDOM(time) override — see
+ * runtime.js's Node.registerContentAnimation for the hook shape, and
+ * proxyTween()/window.proxyTween for the shared non-GSAP-native-property
+ * helper (blur, clip-path, background-position-x, stroke-dashoffset).
  *
- * ShapeCircleNode and ShapeArrowNode still carry their old Canvas2D
- * `draw(ctx,time)` methods below, unused for now — Phase 2 of the DOM
- * rewrite ports these (SVG stroke-dasharray for the arrow's draw-on) and
- * the domain/{charts,diagrams,ui}.js node types; keeping the canvas
- * versions in place is a deliberate reference for that port, not a bug.
+ * ShapeCircleNode and ShapeArrowNode previously carried unused Canvas2D
+ * draw(ctx,time) methods, kept only as reference for this exact port —
+ * both are real DOM/SVG now, and draw() is gone.
  */
 
-// ── ShapeRectNode ─────────────────────────────────────────────────────────────
+// ── ShapeRectNode — unchanged, paint-only (no animation of its own) ───────────
 class ShapeRectNode extends Node {
   constructor(props = {}) {
     super(props);
@@ -42,10 +44,6 @@ class ShapeRectNode extends Node {
     box.style.borderRadius = `${r}px`;
 
     if (this.isGlass) {
-      // Real glassmorphism — backdrop-filter genuinely blurs whatever's
-      // behind this box (the backdrop canvas / other DOM content), not a
-      // flat translucent shape standing in for it. This is the direct fix
-      // for shape_rect's "flat 2015 circle" complaint.
       box.style.backdropFilter = "blur(20px)";
       box.style.webkitBackdropFilter = "blur(20px)";
       box.style.background = this.fill || "rgba(13,18,38,0.55)";
@@ -60,11 +58,6 @@ class ShapeRectNode extends Node {
       box.style.boxSizing = "border-box";
       box.style.border = `${this.strokeWidth}px solid ${this.stroke}`;
     }
-
-    // Drop-shadow AND glow together, as two comma-separated box-shadow
-    // layers — the old canvas code shared one ctx.shadow* state for both,
-    // so glow silently overwrote a configured drop-shadow. CSS box-shadow
-    // supports both simultaneously; this is a real fix, not just a port.
     const shadows = [];
     if (this.shadowColor && this.shadowBlur > 0) {
       shadows.push(`0 ${this.shadowOffsetY}px ${this.shadowBlur}px ${this.shadowColor}`);
@@ -76,37 +69,41 @@ class ShapeRectNode extends Node {
   }
 }
 
-// ── ShapeCircleNode ───────────────────────────────────────────────────────────
-// Phase 2: not yet ported to DOM (see file header). Old canvas draw() kept
-// as the reference for that port.
+// ── ShapeCircleNode — real DOM now (was dead Canvas2D; trivial to port) ──────
 class ShapeCircleNode extends Node {
   constructor(props = {}) {
     super(props);
     this.radius      = props.radius      || 50;
-    this.fill        = props.fill        || "#FFFFFF";
-    this.stroke      = props.stroke      || null;
-    this.strokeWidth = props.stroke_width || 0;
-    this.glowColor   = props.glow_color  || null;
-    this.glowBlur    = props.glow_blur   || 0;
+    this.fill         = props.fill         || "#FFFFFF";
+    this.stroke       = props.stroke       || null;
+    this.strokeWidth  = props.stroke_width || 0;
+    this.glowColor    = props.glow_color   || null;
+    this.glowBlur     = props.glow_blur    || 0;
   }
 
-  draw(ctx, time) {
-    ctx.beginPath();
-    ctx.arc(0, 0, this.radius, 0, Math.PI * 2);
-    if (this.glowColor && this.glowBlur > 0) {
-      ctx.shadowColor = this.glowColor;
-      ctx.shadowBlur  = this.glowBlur;
-    }
-    if (this.fill && this.fill !== "none") { ctx.fillStyle = this.fill; ctx.fill(); }
-    ctx.shadowColor = "transparent";
+  initDOM(box) {
+    const d = this.radius * 2;
+    box.style.transform = "";
+    box.style.left   = `${-d * this.anchor[0]}px`;
+    box.style.top    = `${-d * this.anchor[1]}px`;
+    box.style.width  = `${d}px`;
+    box.style.height = `${d}px`;
+    box.style.borderRadius = "50%";
+    if (this.fill && this.fill !== "none") box.style.background = this.fill;
     if (this.stroke && this.strokeWidth > 0) {
-      ctx.lineWidth = this.strokeWidth; ctx.strokeStyle = this.stroke; ctx.stroke();
+      box.style.boxSizing = "border-box";
+      box.style.border = `${this.strokeWidth}px solid ${this.stroke}`;
+    }
+    if (this.glowColor && this.glowBlur > 0) {
+      box.style.boxShadow = `0 0 ${this.glowBlur}px ${this.glowColor}`;
     }
   }
 }
 
-// ── ShapeArrowNode — Bézier laser arrow with stroke trim & neon bloom ─────────
-// Phase 2: not yet ported to DOM (needs SVG — see file header).
+// ── ShapeArrowNode — real SVG now (was dead Canvas2D) ─────────────────────────
+// The bezier control-point/point-sampling math below is the OLD engine's
+// own draw() geometry, unchanged — pure math, never canvas-specific — just
+// building an SVG path `d` string instead of ctx.lineTo calls.
 class ShapeArrowNode extends Node {
   constructor(props = {}) {
     super(props);
@@ -118,7 +115,6 @@ class ShapeArrowNode extends Node {
     this.strokeWidth  = props.stroke_width || 6;
     this.headSize     = props.head_size    || 22;
     this.glowBlur     = props.glow_blur    || 14;
-    this.trimEnd      = props.trim_end     !== undefined ? props.trim_end : 1.0;
     this.drawStart    = props.draw_start   || 0.0;
     this.drawDuration = props.draw_duration || 0.65;
     this.pulse        = props.pulse        || false;
@@ -126,96 +122,105 @@ class ShapeArrowNode extends Node {
     this.pulseSpeed   = props.pulse_speed  || 0.9;
   }
 
-  draw(ctx, time) {
-    let progress = this.trimEnd;
-    if (this.drawDuration > 0 && time >= this.drawStart) {
-      const p = Math.min(1.0, (time - this.drawStart) / this.drawDuration);
-      progress = EASINGS.easeOutCubic(p);
-    }
-    if (progress <= 0.001) return;
-
-    const [x1, y1] = this.from;
-    const [x2, y2] = this.to;
+  initDOM(box) {
+    const [x1, y1] = this.from, [x2, y2] = this.to;
     const dx = x2 - x1, dy = y2 - y1;
-    const dist = Math.hypot(dx, dy);
-    if (dist < 1) return;
-
+    const dist = Math.hypot(dx, dy) || 1;
     const mx = (x1 + x2) / 2, my = (y1 + y2) / 2;
-    const nx = -dy / dist,    ny = dx / dist;
+    const nx = -dy / dist, ny = dx / dist;
     const cx = this.curved ? mx + nx * this.curveHeight : mx;
     const cy = this.curved ? my + ny * this.curveHeight : my;
+    const tangentEnd = Math.atan2(y2 - cy, x2 - cx) * (180 / Math.PI);
 
-    const bezier = t => {
-      const it = 1 - t;
-      return {
-        x: it*it*x1 + 2*it*t*cx + t*t*x2,
-        y: it*it*y1 + 2*it*t*cy + t*t*y2
+    const minX = Math.min(x1, x2, cx) - this.headSize - this.glowBlur;
+    const minY = Math.min(y1, y2, cy) - this.headSize - this.glowBlur;
+    const maxX = Math.max(x1, x2, cx) + this.headSize + this.glowBlur;
+    const maxY = Math.max(y1, y2, cy) + this.headSize + this.glowBlur;
+    const w = maxX - minX, h = maxY - minY;
+
+    box.style.transform = "";
+    box.style.left = `${minX}px`; box.style.top = `${minY}px`;
+    box.style.width = `${w}px`; box.style.height = `${h}px`;
+
+    const svg = document.createElementNS("http://www.w3.org/2000/svg", "svg");
+    svg.setAttribute("width", w); svg.setAttribute("height", h);
+    svg.setAttribute("viewBox", `0 0 ${w} ${h}`);
+    svg.style.overflow = "visible";
+
+    const path = document.createElementNS("http://www.w3.org/2000/svg", "path");
+    const d = this.curved
+      ? `M ${x1 - minX} ${y1 - minY} Q ${cx - minX} ${cy - minY} ${x2 - minX} ${y2 - minY}`
+      : `M ${x1 - minX} ${y1 - minY} L ${x2 - minX} ${y2 - minY}`;
+    path.setAttribute("d", d);
+    path.setAttribute("fill", "none");
+    path.setAttribute("stroke", this.color);
+    path.setAttribute("stroke-width", String(this.strokeWidth));
+    path.setAttribute("stroke-linecap", "round");
+    if (this.glowBlur > 0) path.style.filter = `drop-shadow(0 0 ${this.glowBlur}px ${this.color})`;
+    svg.appendChild(path);
+
+    const head = document.createElementNS("http://www.w3.org/2000/svg", "polygon");
+    const hs = this.headSize;
+    head.setAttribute("points", `0,0 ${-hs * 1.3},${-hs * 0.6} ${-hs * 0.85},0 ${-hs * 1.3},${hs * 0.6}`);
+    head.setAttribute("fill", this.color);
+    head.setAttribute("transform", `translate(${x2 - minX},${y2 - minY}) rotate(${tangentEnd})`);
+    head.style.opacity = "0"; // fades in with the draw-on, see registerContentAnimation
+    svg.appendChild(head);
+
+    box.appendChild(svg);
+    this._path = path;
+    this._head = head;
+    this._pathLength = path.getTotalLength();
+    path.style.strokeDasharray = String(this._pathLength);
+    path.style.strokeDashoffset = String(this._pathLength);
+    this._strokeTarget = path; // lets a spec-authored strokeDashoffset tween (see TWEEN_CHANNELS) target this path directly too
+  }
+
+  registerContentAnimation(masterTl) {
+    const at = this.drawStart, dur = Math.max(0.05, this.drawDuration);
+    proxyTween(masterTl, v => { this._path.style.strokeDashoffset = String(v); },
+      this._pathLength, 0, dur, "power2.out", at);
+    masterTl.fromTo(this._head, { opacity: 0, scale: 0 }, { opacity: 1, scale: 1, duration: 0.3, ease: "back.out(2)" }, at + dur * 0.6);
+    if (this.pulse) {
+      // A traveling highlight once the line is fully drawn — a small dot
+      // orbiting the path via GSAP's MotionPathPlugin isn't in core
+      // gsap.min.js, so this samples the SAME bezier by hand (identical
+      // geometry to initDOM's own d= computation) and drives x/y directly.
+      const dot = document.createElementNS("http://www.w3.org/2000/svg", "circle");
+      dot.setAttribute("r", String(this.strokeWidth * 1.4));
+      dot.setAttribute("fill", this.pulseColor);
+      dot.style.filter = `drop-shadow(0 0 10px ${this.pulseColor})`;
+      this._path.parentNode.appendChild(dot);
+      const proxy = { t: 0 };
+      const [x1, y1] = this.from, [x2, y2] = this.to;
+      const dx = x2 - x1, dy = y2 - y1;
+      const dist = Math.hypot(dx, dy) || 1;
+      const mx = (x1 + x2) / 2, my = (y1 + y2) / 2;
+      const nx = -dy / dist, ny = dx / dist;
+      const cx = this.curved ? mx + nx * this.curveHeight : mx;
+      const cy = this.curved ? my + ny * this.curveHeight : my;
+      const place = (t) => {
+        const it = 1 - t;
+        const px = it * it * x1 + 2 * it * t * cx + t * t * x2;
+        const py = it * it * y1 + 2 * it * t * cy + t * t * y2;
+        const boxLeft = parseFloat(this._path.parentNode.parentNode.style.left || "0");
+        dot.setAttribute("cx", String(px - boxLeft));
+        dot.setAttribute("cy", String(py - parseFloat(this._path.parentNode.parentNode.style.top || "0")));
       };
-    };
-
-    ctx.save();
-    ctx.strokeStyle = this.color;
-    ctx.fillStyle   = this.color;
-    ctx.lineWidth   = this.strokeWidth;
-    ctx.lineCap     = "round";
-    ctx.lineJoin    = "round";
-    ctx.shadowColor = this.color;
-    ctx.shadowBlur  = this.glowBlur;
-
-    const STEPS  = 48;
-    const count  = Math.max(2, Math.floor(STEPS * progress));
-    let lastPt   = { x: x1, y: y1 };
-    let tangentAngle = 0;
-
-    ctx.beginPath();
-    ctx.moveTo(x1, y1);
-    for (let i = 1; i <= count; i++) {
-      const t  = (i / STEPS) * progress;
-      const pt = bezier(t);
-      ctx.lineTo(pt.x, pt.y);
-      if (i === count) tangentAngle = Math.atan2(pt.y - lastPt.y, pt.x - lastPt.x);
-      lastPt = pt;
+      masterTl.fromTo(proxy, { t: 0 }, {
+        t: 1, duration: 1 / this.pulseSpeed, ease: "none", repeat: -1,
+        onUpdate: () => place(proxy.t),
+      }, at + dur);
     }
-    ctx.stroke();
-
-    if (progress > 0.4) {
-      const hs = this.headSize * EASINGS["back.out"](Math.min(1, (progress - 0.4) / 0.3));
-      ctx.save();
-      ctx.translate(lastPt.x, lastPt.y);
-      ctx.rotate(tangentAngle);
-      ctx.beginPath();
-      ctx.moveTo(0, 0);
-      ctx.lineTo(-hs * 1.3, -hs * 0.6);
-      ctx.lineTo(-hs * 0.85, 0);
-      ctx.lineTo(-hs * 1.3,  hs * 0.6);
-      ctx.closePath();
-      ctx.fill();
-      ctx.restore();
-    }
-
-    if (this.pulse && progress >= 1.0) {
-      const pt = bezier((time * this.pulseSpeed) % 1.0);
-      ctx.save();
-      ctx.globalCompositeOperation = "screen";
-      ctx.beginPath();
-      ctx.arc(pt.x, pt.y, this.strokeWidth * 1.8, 0, Math.PI * 2);
-      ctx.fillStyle   = this.pulseColor;
-      ctx.shadowColor = this.pulseColor;
-      ctx.shadowBlur  = 22;
-      ctx.fill();
-      ctx.restore();
-    }
-
-    ctx.restore();
   }
 }
 
-// ── TextNode — Full Kinetic Typography Toolkit ────────────────────────────────
+// ── TextNode — Full Kinetic Typography Toolkit (GSAP rebuild) ────────────────
 class TextNode extends Node {
   constructor(props = {}) {
     super(props);
     this.content        = String(props.content || "");
-    this.fontFamily     = props.font_family    || "Inter, -apple-system, sans-serif";
+    this.fontFamily     = props.font_family    || "var(--motion-body-font, Inter, -apple-system, sans-serif)";
     this.fontSize       = props.font_size      || 48;
     this.fontWeight     = props.font_weight    || 700;
     this.fill           = props.fill           || "#FFFFFF";
@@ -224,8 +229,8 @@ class TextNode extends Node {
     this.mode           = props.mode           || "standard";
     this.revealStart    = props.reveal_start   || 0.0;
     this.revealDuration = props.reveal_duration || 0.75;
-    this.gradient       = props.gradient       || null;  // { from, to, stops }
-    this.shadow         = props.text_shadow    || null;  // { color, blur, offsetY }
+    this.gradient       = props.gradient       || null;
+    this.shadow         = props.text_shadow    || null;
     this.letterSpacing  = props.letter_spacing || 0;
 
     this.staggerDelay   = props.stagger_delay  || 0.075;
@@ -233,11 +238,9 @@ class TextNode extends Node {
     this.shimmerWidth   = props.shimmer_width  || 0.35;
     this.splitGap       = props.split_gap      || 40;
     this.blurAmount     = props.blur_amount    || 24;
-
-    // Read but never wired to an actual draw call in the old engine
-    // (dead config) — fixed here since counter_tick genuinely needs them.
     this.prefix = props.prefix || "";
     this.suffix = props.suffix || "";
+    this.locale = props.locale || undefined; // e.g. "en-IN" for ₹1,00,000-style grouping, matching the Meridian reference's own toLocaleString("en-IN")
   }
 
   _applyBaseTextStyle(el) {
@@ -248,8 +251,7 @@ class TextNode extends Node {
     el.style.whiteSpace = "pre";
     if (this.letterSpacing) el.style.letterSpacing = `${this.letterSpacing}px`;
     if (this.gradient && this.gradient.stops) {
-      const stops = this.gradient.stops
-        .slice().sort((a, b) => a.pos - b.pos)
+      const stops = this.gradient.stops.slice().sort((a, b) => a.pos - b.pos)
         .map(s => `${s.color} ${Math.round(s.pos * 100)}%`).join(", ");
       el.style.backgroundImage = `linear-gradient(90deg, ${stops})`;
       el.style.webkitBackgroundClip = "text";
@@ -269,11 +271,6 @@ class TextNode extends Node {
   initDOM(box) {
     box.style.transform = "translate(-50%,-50%)";
     box.style.textAlign = this.align;
-
-    // Multi-line support the canvas engine had to hand-roll (ctx.fillText
-    // never respected \n) is free here — one <div> per line, stacked by
-    // lineHeight. Every line shares the same reveal clock, same as before
-    // (not a true per-line cascade — see the original comment this ports).
     this._lines = this.content ? String(this.content).split(/\r?\n/) : [];
     this._lineEls = [];
     this._lineState = [];
@@ -286,11 +283,8 @@ class TextNode extends Node {
     }
   }
 
-  // Builds this line's STATIC per-mode structure once. Returns whatever
-  // per-line state updateDOM needs (span arrays etc.) — never rebuilt
-  // per frame; only opacity/transform/textContent on existing elements
-  // change (span identity must stay stable across seeks, or the staggered
-  // modes would thrash layout and could flicker).
+  // Builds this line's STATIC per-mode DOM once — unchanged in spirit from
+  // the previous engine; only what drives the numbers changed.
   _initLineMode(el, line) {
     switch (this.mode) {
       case "word_stagger": {
@@ -299,6 +293,7 @@ class TextNode extends Node {
           const s = document.createElement("span");
           s.style.display = "inline-block";
           s.style.whiteSpace = "pre";
+          s.style.opacity = "0";
           s.textContent = w + (i < words.length - 1 ? " " : "");
           el.appendChild(s);
           return s;
@@ -306,11 +301,11 @@ class TextNode extends Node {
         return { spans };
       }
       case "char_cascade": {
-        const chars = line.split("");
-        const spans = chars.map(c => {
+        const spans = line.split("").map(c => {
           const s = document.createElement("span");
           s.style.display = "inline-block";
           s.style.whiteSpace = "pre";
+          s.style.opacity = "0";
           s.textContent = c;
           el.appendChild(s);
           return s;
@@ -325,8 +320,7 @@ class TextNode extends Node {
           s.style.position = "absolute";
           s.style.left = "0"; s.style.top = "0"; s.style.width = "100%";
           s.style.whiteSpace = "pre";
-          s.style.clipPath = side === "left"
-            ? "inset(0 50% 0 0)" : "inset(0 0 0 50%)";
+          s.style.clipPath = side === "left" ? "inset(0 50% 0 0)" : "inset(0 0 0 50%)";
           s.textContent = line;
           el.appendChild(s);
           return s;
@@ -338,6 +332,7 @@ class TextNode extends Node {
         el.textContent = "";
         const base = document.createElement("span");
         base.style.whiteSpace = "pre";
+        base.style.opacity = "0";
         base.textContent = line;
         el.appendChild(base);
 
@@ -351,6 +346,10 @@ class TextNode extends Node {
         shimmer.style.backgroundClip = "text";
         shimmer.style.color = "transparent";
         shimmer.style.opacity = "0";
+        shimmer.style.backgroundImage =
+          `linear-gradient(90deg, rgba(255,255,255,0) 0%, ${this.shimmerColor} 40%, ` +
+          `${this.shimmerColor} 60%, rgba(255,255,255,0) 100%)`;
+        shimmer.style.backgroundSize = "250% 100%";
         el.appendChild(shimmer);
         return { base, shimmer };
       }
@@ -365,17 +364,19 @@ class TextNode extends Node {
         cursor.style.verticalAlign = "-0.1em";
         cursor.style.marginLeft = "4px";
         cursor.style.background = "currentColor";
-        el.appendChild(textSpan);
-        el.appendChild(cursor);
+        el.appendChild(textSpan); el.appendChild(cursor);
         return { textSpan, cursor };
       }
-      case "masked_reveal": {
+      case "masked_reveal":
         el.textContent = line;
+        el.style.clipPath = "inset(100% 0 0 0)";
         return {};
-      }
       case "blur_pop":
-      case "counter_tick":
         el.textContent = line;
+        el.style.opacity = "0";
+        return {};
+      case "counter_tick":
+        el.textContent = this.prefix + "0" + this.suffix;
         return {};
       case "standard":
       default:
@@ -384,111 +385,82 @@ class TextNode extends Node {
     }
   }
 
-  updateDOM(time) {
+  registerContentAnimation(masterTl) {
     for (let i = 0; i < this._lineEls.length; i++) {
-      this._updateLineMode(this._lineEls[i], this._lines[i], this._lineState[i], time, i);
+      this._registerLineMode(this._lineEls[i], this._lines[i], this._lineState[i], i, masterTl);
     }
   }
 
-  _updateLineMode(el, line, state, time, lineIdx) {
+  _registerLineMode(el, line, state, lineIdx, masterTl) {
     switch (this.mode) {
       case "word_stagger": {
         const wDur = 0.48;
-        for (let i = 0; i < state.spans.length; i++) {
-          const wStart = this.revealStart + i * this.staggerDelay;
-          const p = Math.max(0, Math.min(1, (time - wStart) / wDur));
-          const ep = EASINGS["back.out"](p);
-          const s = state.spans[i];
-          s.style.opacity = String(p);
-          s.style.transform = `translateY(${(1 - ep) * 30}px) scale(${0.78 + 0.22 * ep})`;
-        }
+        state.spans.forEach((s, i) => {
+          const at = this.revealStart + i * this.staggerDelay;
+          masterTl.fromTo(s, { opacity: 0, y: 30, scale: 0.78 },
+            { opacity: 1, y: 0, scale: 1, duration: wDur, ease: "back.out(1.7)" }, at);
+        });
         return;
       }
       case "char_cascade": {
         const cDur = 0.38;
-        for (let i = 0; i < state.spans.length; i++) {
-          const cStart = this.revealStart + i * (this.staggerDelay * 0.55);
-          const p = Math.max(0, Math.min(1, (time - cStart) / cDur));
-          const ep = EASINGS["bounce.out"](p);
-          const s = state.spans[i];
-          s.style.opacity = String(p);
-          s.style.transform = `translateY(${-(1 - ep) * 80}px)`;
-        }
+        state.spans.forEach((s, i) => {
+          const at = this.revealStart + i * (this.staggerDelay * 0.55);
+          masterTl.fromTo(s, { opacity: 0, y: -80 },
+            { opacity: 1, y: 0, duration: cDur, ease: "bounce.out" }, at);
+        });
         return;
       }
       case "split_slide": {
-        const p = EASINGS.easeOutExpo(Math.max(0, Math.min(1,
-          (time - this.revealStart) / Math.max(0.1, this.revealDuration)
-        )));
-        const off = (1 - p) * (this.splitGap + 200);
-        state.left.style.transform = `translateX(${-off}px)`;
-        state.right.style.transform = `translateX(${off}px)`;
+        const off = this.splitGap + 200;
+        masterTl.fromTo(state.left, { x: -off }, { x: 0, duration: this.revealDuration, ease: "expo.out" }, this.revealStart);
+        masterTl.fromTo(state.right, { x: off }, { x: 0, duration: this.revealDuration, ease: "expo.out" }, this.revealStart);
         return;
       }
       case "shimmer_sweep": {
-        const fadeEnd = this.revealStart + this.revealDuration * 0.5;
-        const p = Math.max(0, Math.min(1, (time - this.revealStart) / (this.revealDuration * 0.5)));
-        el.style.opacity = String(EASINGS.easeOutCubic(p));
-        if (time > fadeEnd) {
-          const sweepT = Math.min(1, (time - fadeEnd) / (this.revealDuration * 0.6));
-          state.shimmer.style.opacity = "1";
-          state.shimmer.style.backgroundImage =
-            `linear-gradient(90deg, rgba(255,255,255,0) 0%, ${this.shimmerColor} 40%, ` +
-            `${this.shimmerColor} 60%, rgba(255,255,255,0) 100%)`;
-          state.shimmer.style.backgroundSize = "250% 100%";
-          state.shimmer.style.backgroundPositionX = `${100 - sweepT * 200}%`;
-        } else {
-          state.shimmer.style.opacity = "0";
-        }
+        const fadeDur = this.revealDuration * 0.5;
+        masterTl.fromTo(state.base, { opacity: 0 }, { opacity: 1, duration: fadeDur, ease: "power2.out" }, this.revealStart);
+        const sweepAt = this.revealStart + fadeDur;
+        masterTl.set(state.shimmer, { opacity: 1 }, sweepAt);
+        proxyTween(masterTl, v => { state.shimmer.style.backgroundPositionX = `${v}%`; },
+          100, -100, this.revealDuration * 0.6, "power2.inOut", sweepAt);
         return;
       }
       case "typewriter": {
-        const elapsed = Math.max(0, time - this.revealStart);
         const rate = Math.max(1, line.length) / Math.max(0.1, this.revealDuration);
-        const visible = Math.min(line.length, Math.floor(elapsed * rate));
-        state.textSpan.textContent = line.substring(0, visible);
-        const done = lineIdx === this._lineEls.length - 1;
-        const stillTyping = visible < line.length;
-        state.cursor.style.opacity =
-          (stillTyping || (done && (time * 2) % 1.0 < 0.5)) ? "1" : "0";
+        proxyTween(masterTl, v => { state.textSpan.textContent = line.substring(0, Math.floor(v)); },
+          0, line.length, Math.max(0.1, this.revealDuration), "none", this.revealStart);
+        // Cursor blink is its own repeat:-1 tween so a seek anywhere still
+        // shows the correct phase — never a live/wall-clock blink.
+        masterTl.fromTo(state.cursor, { opacity: 1 }, { opacity: 0, duration: 0.5, ease: "steps(1)", repeat: -1, yoyo: true }, this.revealStart);
         return;
       }
-      case "masked_reveal": {
-        const p = Math.max(0, Math.min(1,
-          EASINGS.easeOutCubic((time - this.revealStart) / Math.max(0.1, this.revealDuration))
-        ));
-        el.style.clipPath = `inset(${(1 - p) * 100}% 0 0 0)`;
+      case "masked_reveal":
+        proxyTween(masterTl, v => { el.style.clipPath = `inset(${Math.max(0, 100 - v)}% 0 0 0)`; },
+          0, 100, this.revealDuration, "power2.out", this.revealStart);
         return;
-      }
-      case "blur_pop": {
-        const p = EASINGS["back.out"](Math.max(0, Math.min(1,
-          (time - this.revealStart) / Math.max(0.1, this.revealDuration)
-        )));
-        el.style.opacity = String(Math.max(0, Math.min(1, p)));
-        el.style.filter = `blur(${Math.max(0, this.blurAmount * (1 - p))}px)`;
-        el.style.transform = `scale(${0.7 + 0.3 * p})`;
+      case "blur_pop":
+        masterTl.fromTo(el, { opacity: 0, scale: 0.7 }, { opacity: 1, scale: 1, duration: this.revealDuration, ease: "back.out(1.7)" }, this.revealStart);
+        proxyTween(masterTl, v => { el.style.filter = `blur(${Math.max(0, v)}px)`; },
+          this.blurAmount, 0, this.revealDuration, "back.out(1.7)", this.revealStart);
         return;
-      }
       case "counter_tick": {
         const target = parseFloat(line) || 0;
-        const elapsed = Math.max(0, time - this.revealStart);
-        const p = Math.min(1, EASINGS.easeOutCubic(elapsed / Math.max(0.1, this.revealDuration)));
-        const current = target * p;
         const decimals = line.includes(".") ? line.split(".")[1].length : 0;
-        const display = this.prefix +
-          (decimals > 0 ? current.toFixed(decimals) : Math.floor(current).toLocaleString()) +
-          this.suffix;
-        el.textContent = display;
+        proxyTween(masterTl, v => {
+          const num = decimals > 0 ? v.toFixed(decimals) : Math.floor(v).toLocaleString(this.locale);
+          el.textContent = this.prefix + num + this.suffix;
+        }, 0, target, this.revealDuration, "power2.out", this.revealStart);
         return;
       }
       case "standard":
       default:
-        return; // static — set once in _initLineMode, nothing changes per frame
+        return; // static — set once in _initLineMode
     }
   }
 }
 
-// ── ImageNode — real <img>, browser-native loading ────────────────────────────
+// ── ImageNode — unchanged, paint/load-state only ──────────────────────────────
 class ImageNode extends Node {
   constructor(props = {}) {
     super(props);
@@ -508,8 +480,6 @@ class ImageNode extends Node {
     const r = Math.min(this.radius, w / 2, h / 2);
     box.style.borderRadius = `${r}px`;
     box.style.overflow = "hidden";
-    // Placeholder look while loading (or if the src never resolves) — a
-    // flat glass-style box, not Chromium's native broken-image glyph.
     box.style.background = "rgba(15,23,42,0.75)";
     box.style.backdropFilter = "blur(20px)";
     box.style.webkitBackdropFilter = "blur(20px)";
@@ -517,9 +487,6 @@ class ImageNode extends Node {
     const img = document.createElement("img");
     img.style.width = "100%";
     img.style.height = "100%";
-    // Matches the old engine's drawImage(img,x,y,w,h) exactly — stretched
-    // to the box, aspect ratio not preserved. object-fit:cover/contain
-    // would be a real behavior change, not a faithful port.
     img.style.objectFit = "fill";
     img.style.display = "block";
     img.addEventListener("load", () => {
@@ -527,9 +494,7 @@ class ImageNode extends Node {
       box.style.backdropFilter = "";
       box.style.webkitBackdropFilter = "";
     });
-    img.addEventListener("error", () => {
-      img.style.display = "none"; // never show the native broken-image glyph
-    });
+    img.addEventListener("error", () => { img.style.display = "none"; });
     if (this.src) img.src = this.src;
     box.appendChild(img);
     this._img = img;
@@ -548,8 +513,6 @@ function createNodeFromSpec(nodeData) {
   else if (type === "image")                                 node = new ImageNode(nodeData);
   else if ((type === "domain_chart" || type === "chart") && window.DomainChartNode)
     node = new window.DomainChartNode(nodeData);
-  else if ((type === "domain_ui" || type === "domain_ui_mockup" || type === "ui_mockup") && window.DomainUIMockupNode)
-    node = new window.DomainUIMockupNode(nodeData);
   else if ((type === "domain_diagram" || type === "diagram" || type === "workflow") && window.DomainDiagramNode)
     node = new window.DomainDiagramNode(nodeData);
   else

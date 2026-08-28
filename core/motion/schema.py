@@ -7,6 +7,7 @@ Decouples AI high-level intent from low-level frame rendering.
 from __future__ import annotations
 
 import json
+import re
 from dataclasses import dataclass, field
 from typing import Any, Dict, List, Optional, Tuple, Union
 
@@ -16,15 +17,62 @@ class MotionValidationError(Exception):
     pass
 
 
+# GSAP's own core ease vocabulary (gsap.min.js, no plugins) — replaces the
+# old hand-rolled easeInCubic/etc. names now that runtime.js hands these
+# strings straight to gsap.to()'s own `ease` option instead of interpreting
+# them itself. A base name optionally followed by GSAP's own parenthesized
+# config, e.g. "back.out(1.7)" or "elastic.out(1,0.3)" — see _valid_easing.
 SUPPORTED_EASINGS = {
-    "linear",
-    "easeInQuad", "easeOutQuad", "easeInOutQuad",
-    "easeInCubic", "easeOutCubic", "easeInOutCubic",
-    "easeInExpo", "easeOutExpo", "easeInOutExpo",
+    "none",
+    "power1.in", "power1.out", "power1.inOut",
+    "power2.in", "power2.out", "power2.inOut",
+    "power3.in", "power3.out", "power3.inOut",
+    "power4.in", "power4.out", "power4.inOut",
     "back.in", "back.out", "back.inOut",
     "elastic.in", "elastic.out", "elastic.inOut",
     "bounce.in", "bounce.out", "bounce.inOut",
-    "spring", "smooth"
+    "circ.in", "circ.out", "circ.inOut",
+    "expo.in", "expo.out", "expo.inOut",
+    "sine.in", "sine.out", "sine.inOut",
+}
+
+_EASE_RE = re.compile(r"^([a-zA-Z0-9]+(?:\.[a-zA-Z]+)?)(\([0-9.,\s-]*\))?$")
+
+
+def _valid_easing(value: Any) -> bool:
+    """True for a known GSAP ease base name, with or without GSAP's own
+    parenthesized config (back.out(1.7), elastic.out(1,0.3)) — the paren
+    group is only shape-checked (digits/commas/dot/minus), GSAP itself
+    validates the actual parameter values at tween time.
+    """
+    if not isinstance(value, str):
+        return False
+    m = _EASE_RE.match(value.strip())
+    return bool(m) and m.group(1) in SUPPORTED_EASINGS
+
+
+# The animatable surface every primitive shares — replaces the old closed
+# enter/exit "type" enum (fade_in/pop_in/slide_up/slide_down) with channels
+# a tween can target on ANY node, not just the four archetypes runtime.js
+# used to hand-branch on. Each maps to a real CSS-expressible property in
+# runtime.js's tween builder (opacity, transform components, filter:blur,
+# clip-path inset, background-position-x for shimmer sweeps, and
+# stroke-dashoffset for SVG draw-ins shared by charts/arrows/the brand mark).
+TWEEN_CHANNELS = {
+    "opacity", "x", "y", "scale", "scaleX", "scaleY", "rotation",
+    "skewX", "skewY", "blur", "clipInset", "backgroundPositionX",
+    "strokeDashoffset",
+}
+
+# Named, curated cross-scene transitions — ported from core.reel_web's own
+# `.cut-*` library (push/push_up/squeeze/zoom, themselves adapted from
+# HyperFrames under Apache 2.0, see prism_gui/NOTICE) plus two new ones
+# translated from the Meridian HyperFrames reference (blur_swoosh,
+# light_leak). A curated set, not free-text, for the same reason the
+# easing fallback rotation is curated rather than open: a bounded, varied
+# menu beats an unconstrained surface for consistency across scenes.
+TRANSITION_NAMES = {
+    "push", "push_up", "squeeze", "zoom", "blur_swoosh", "light_leak",
 }
 
 # Keyed by the keyword with every space/hyphen/underscore stripped and
@@ -85,6 +133,61 @@ def _normalize_anchor(value: Any) -> list[float]:
     return [0.5, 0.5]
 
 
+def _validate_tween(tween: Any) -> Optional[dict]:
+    """One {channel, from, to, easing, delay} entry inside an enter/exit
+    block's "tweens" list. Returns None (drop silently) if the channel is
+    missing/unrecognized or from/to aren't numbers — one bad tween must
+    not invalidate its siblings, same tolerant-but-structural philosophy
+    as the rest of this file.
+    """
+    if not isinstance(tween, dict):
+        return None
+    channel = tween.get("channel")
+    if channel not in TWEEN_CHANNELS:
+        return None
+    try:
+        frm = float(tween["from"])
+        to = float(tween["to"])
+    except (KeyError, TypeError, ValueError):
+        return None
+    out: dict[str, Any] = {"channel": channel, "from": frm, "to": to}
+    easing = tween.get("easing")
+    if easing and _valid_easing(easing):
+        out["easing"] = easing
+    if tween.get("delay") is not None:
+        try:
+            out["delay"] = max(0.0, float(tween["delay"]))
+        except (TypeError, ValueError):
+            pass
+    return out
+
+
+def _validate_animation_block(block: Any) -> Optional[dict]:
+    """One enter/exit block: {time, duration, tweens: [...]}. A block with
+    no valid tweens left after filtering is dropped entirely — an enter/
+    exit that ends up animating nothing is not a real block, same as
+    before when a malformed "type" fell through.
+    """
+    if not isinstance(block, dict):
+        return None
+    tweens_in = block.get("tweens")
+    if not isinstance(tweens_in, list):
+        return None
+    tweens = [t for t in (_validate_tween(t) for t in tweens_in) if t]
+    if not tweens:
+        return None
+    out: dict[str, Any] = {"tweens": tweens}
+    try:
+        out["time"] = float(block.get("time", 0.0))
+    except (TypeError, ValueError):
+        out["time"] = 0.0
+    try:
+        out["duration"] = max(0.05, float(block.get("duration", 0.6)))
+    except (TypeError, ValueError):
+        out["duration"] = 0.6
+    return out
+
+
 def validate_motion_spec(data: Union[str, Dict[str, Any]]) -> Dict[str, Any]:
     """Validate raw JSON or dict against the Prism Motion Graphics Schema.
     Returns a cleaned, normalized specification dict or raises MotionValidationError.
@@ -124,6 +227,30 @@ def validate_motion_spec(data: Union[str, Dict[str, Any]]) -> Dict[str, Any]:
     project.setdefault("duration", 10.0)
     project.setdefault("background", "#090D16")
 
+    # A small NAMED palette (not just background+one accent) and a real
+    # display/body font pairing — threaded through every scene so a whole
+    # generation shares one identity instead of each scene picking its own
+    # colors/font fresh. Both are open string values (any hex, any Google
+    # Font name) — the model's actual choice is steered by doctrine in
+    # generate.py's prompt, not constrained here; this layer only enforces
+    # the SHAPE (right keys, string values) so downstream CSS generation
+    # never chokes on a non-string.
+    palette = project.get("palette")
+    if not isinstance(palette, dict):
+        palette = {}
+    for key in ("bg_a", "bg_b", "ink", "accent", "accent2"):
+        if key in palette and not isinstance(palette[key], str):
+            del palette[key]
+    project["palette"] = palette
+
+    type_cfg = project.get("type")
+    if not isinstance(type_cfg, dict):
+        type_cfg = {}
+    for key in ("display_font", "body_font", "google_fonts_url"):
+        if key in type_cfg and not isinstance(type_cfg[key], str):
+            del type_cfg[key]
+    project["type"] = type_cfg
+
     width    = int(project["width"])
     height   = int(project["height"])
     fps      = int(project["fps"])
@@ -157,8 +284,8 @@ def validate_motion_spec(data: Union[str, Dict[str, Any]]) -> Dict[str, Any]:
                 except (ValueError, TypeError):
                     track["zoom"] = 1.0  # safe default
             if "easing" in track:
-                if track["easing"] not in SUPPORTED_EASINGS:
-                    track["easing"] = "easeInOutCubic"  # silent fallback
+                if not _valid_easing(track["easing"]):
+                    track["easing"] = "power2.inOut"  # silent fallback, GSAP-native
             if "position" in track:
                 pos = track["position"]
                 if not (isinstance(pos, (list, tuple)) and len(pos) == 2):
@@ -222,34 +349,20 @@ def validate_motion_spec(data: Union[str, Dict[str, Any]]) -> Dict[str, Any]:
         # against them is NaN — the node silently never appears anywhere.
         node["anchor"] = _normalize_anchor(node.get("anchor"))
 
-        # Sanitize easing strings in animation blocks silently. An invalid
-        # name is DROPPED, not rewritten to a fixed curve — forcing every
-        # bad value to the same "easeOutCubic" was a second, code-level
-        # copy of the exact anchoring bug measured in reel_web.py's prompt
-        # (every unclear case collapsing onto one identical curve). Leaving
-        # it unset lets runtime.js's own seeded rotation pick a fallback
-        # instead, which varies per node/property rather than reintroducing
-        # a single dominant curve from the Python side.
+        # animation.enter / animation.exit are now a composable list of
+        # {channel, from, to, easing, delay} tweens rather than a closed
+        # "type" enum (fade_in/pop_in/slide_up/slide_down) — see
+        # TWEEN_CHANNELS above. A block that fails validation entirely
+        # (missing/malformed) is dropped, not coerced to a default type,
+        # since there's no longer a "type" to fall back to.
         anim = node.get("animation")
         if isinstance(anim, dict):
-            for block in ("enter", "exit"):
-                b = anim.get(block)
-                if not isinstance(b, dict):
-                    continue
-                e = b.get("easing")
-                if e and e not in SUPPORTED_EASINGS:
-                    del b["easing"]
-                # Per-property easing overrides — e.g. {"scale": {"easing":
-                # "back.out"}} — validated the same way, property by
-                # property, so one bad value doesn't drop the whole map.
-                props = b.get("properties")
-                if isinstance(props, dict):
-                    for prop_name, prop_cfg in list(props.items()):
-                        if not isinstance(prop_cfg, dict):
-                            continue
-                        pe = prop_cfg.get("easing")
-                        if pe and pe not in SUPPORTED_EASINGS:
-                            del prop_cfg["easing"]
+            for block_name in ("enter", "exit"):
+                validated = _validate_animation_block(anim.get(block_name))
+                if validated:
+                    anim[block_name] = validated
+                elif block_name in anim:
+                    del anim[block_name]
 
             secondary = anim.get("secondary_motion")
             if isinstance(secondary, dict):
@@ -281,6 +394,15 @@ def validate_motion_spec(data: Union[str, Dict[str, Any]]) -> Dict[str, Any]:
         scene.setdefault("id", f"scene_{s_idx}")
         scene.setdefault("start", 0.0)
         scene.setdefault("duration", duration)
+        # Which named transition (see TRANSITION_NAMES) plays as this scene
+        # cuts in from the PREVIOUS one — absent/invalid means resolver.py
+        # picks one via the same seeded-rotation approach the easing
+        # fallback already uses, rather than defaulting every unset scene
+        # to the identical transition. Meaningless (and dropped) on scene 0,
+        # which has nothing before it to cut in from.
+        t_in = scene.get("transition_in")
+        if s_idx == 0 or t_in not in TRANSITION_NAMES:
+            scene.pop("transition_in", None)
         nodes = scene.get("nodes", [])
         if not isinstance(nodes, list):
             raise MotionValidationError(f"scenes[{s_idx}].nodes must be a list.")
