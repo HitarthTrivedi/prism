@@ -2068,7 +2068,6 @@ def run(routing: dict, cfg: dict, attachments=None, on_event=None,
     from . import lang as L
 
     attachments = attachments or []
-    attach_ctx = F.context_block(attachments)
 
     # "Reply in Gujarati", if the user asked for it. Resolved once per run
     # rather than per prompt: it is the same sentence every time, and reading
@@ -2099,7 +2098,9 @@ def run(routing: dict, cfg: dict, attachments=None, on_event=None,
         q = (f"Your ONLY task is: analyse the attached file(s) ({names}) thoroughly — "
              "their content, structure, key facts, numbers, data and style — and "
              "produce a short, precise brief of everything the next AI needs to "
-             f"use these files{goal}. Do NOT perform the task itself.")
+             f"use these files{goal}. Do NOT perform the task itself. Do not "
+             "reproduce the file's rows or text back; where a profile of a "
+             "spreadsheet is given below, trust its counts over your own.")
         stages.insert(0, ("analysis", "ChatGPT", [q]))
         ui.info("📎  attachments present — ChatGPT will analyse the files first")
 
@@ -2417,8 +2418,9 @@ def run(routing: dict, cfg: dict, attachments=None, on_event=None,
             # travel in a text handoff at all.
             send_files = (attachments if include_attachment else []) + \
                          (pipeline_files if producer else [])
+            went_up = 0
             if send_files:
-                _upload_files(driver, agent_cfg, send_files, agent_name)
+                went_up = _upload_files(driver, agent_cfg, send_files, agent_name)
 
             # Relay hand-off: forward ONLY the most recent stage's output.
             # Every agent is instructed (below) to fold the key findings of
@@ -2429,7 +2431,10 @@ def run(routing: dict, cfg: dict, attachments=None, on_event=None,
             # the previous stage's handoff. Whatever else gets crowded out of
             # a long prompt, this must not be it.
             context = _intent_block(query)
-            context += attach_ctx if include_attachment else ""
+            if include_attachment:
+                # Built per stage, not once: whether the files went UP to
+                # this tool decides whether their text is pasted in as well.
+                context += F.context_block(attachments, uploaded=bool(went_up))
             if producer and pipeline_files:
                 # Not always pictures any more — _harvest_files also lands
                 # generated documents, decks, code and archives here, so the
