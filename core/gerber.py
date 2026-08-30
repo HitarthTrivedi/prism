@@ -2036,7 +2036,10 @@ def mm_to_mil(v: float) -> float:
 def _fmt(v, mil=True) -> str:
     if v is None:
         return "not measured"
-    return f"{v:.3f} mm ({mm_to_mil(v):.1f} mil)" if mil else f"{v:.3f} mm"
+    # Two decimal places, by the customer's instruction: their own check
+    # lists are written that way, and a third digit reads as false precision
+    # when a person diffs these against a CAM reading.
+    return f"{v:.2f} mm ({mm_to_mil(v):.1f} mil)" if mil else f"{v:.2f} mm"
 
 
 def _rule_note(job: dict, key: str) -> str:
@@ -2098,8 +2101,8 @@ def answers_text(job: dict) -> str:
     b = job["board"]
     size = a["pcb_size"] or "not measured"
     if b.get("width_mm"):
-        size += (f"   [{b['width_mm'] / MM_PER_INCH:.3f} x "
-                 f"{b['height_mm'] / MM_PER_INCH:.3f} in]")
+        size += (f"   [{b['width_mm'] / MM_PER_INCH:.2f} x "
+                 f"{b['height_mm'] / MM_PER_INCH:.2f} in]")
     layers = a.get("layers")
     layer_txt = str(layers) if layers else "not measured"
     if a.get("plane_layers"):
@@ -2108,7 +2111,7 @@ def answers_text(job: dict) -> str:
     if a.get("array_size"):
         array_txt = a["array_size"]
         aw, ah = a["array_size_mm"]
-        array_txt += f"   [{aw / MM_PER_INCH:.3f} x {ah / MM_PER_INCH:.3f} in]"
+        array_txt += f"   [{aw / MM_PER_INCH:.2f} x {ah / MM_PER_INCH:.2f} in]"
         count_txt = f"{a['pcbs_per_array']}   ({a['array_grid']} — across x up)"
     else:
         array_txt = "not an array — a single board"
@@ -2145,7 +2148,7 @@ def summary_text(job: dict) -> str:
     out: list[str] = []
     b = job["board"]
     if b.get("width_mm"):
-        out.append(f"SIZE      {b['width_mm']:.3f} x {b['height_mm']:.3f} mm"
+        out.append(f"SIZE      {b['width_mm']:.2f} x {b['height_mm']:.2f} mm"
                    + (f", area {b['area_mm2']:.0f} mm²" if b.get("area_mm2") else ""))
         out.append(f"          via {b['method']} in {b['source']}"
                    + (f" — {b['shape']}" if b.get("shape") else ""))
@@ -2159,7 +2162,7 @@ def summary_text(job: dict) -> str:
         if row["widths"]:
             out.append("   track widths actually drawn:")
             for w in row["widths"]:
-                out.append(f"      {w['width_mm']:.3f} mm "
+                out.append(f"      {w['width_mm']:.2f} mm "
                            f"({mm_to_mil(w['width_mm']):5.1f} mil)   "
                            f"{w['segments']:6d} segments, "
                            f"{w['length_mm'] / 1000:7.2f} m of trace")
@@ -2188,7 +2191,7 @@ def summary_text(job: dict) -> str:
                            "not the whole board.")
             if sp["tightest"] and sp["tightest"][0].get("at"):
                 x, y = sp["tightest"][0]["at"]
-                out.append(f"   tightest gap is at X{x:.3f} Y{y:.3f} mm")
+                out.append(f"   tightest gap is at X{x:.2f} Y{y:.2f} mm")
             if sp["snapped"]:
                 out.append(f"   ({sp['snapped']} pair(s) closer than "
                            f"{job['snap_mm']} mm treated as touching, not as a gap)")
@@ -2202,7 +2205,7 @@ def summary_text(job: dict) -> str:
         out.append(f"DRILLS    from {d['source']} ({how})")
         for t in d["tools"]:
             flag = "" if t["hits"] else "   ← declared but never used"
-            out.append(f"      T{t['tool']:<4} {t['dia_mm']:6.3f} mm "
+            out.append(f"      T{t['tool']:<4} {t['dia_mm']:6.2f} mm "
                        f"({mm_to_mil(t['dia_mm']):6.1f} mil)   "
                        f"{t['hits']:5d} holes{flag}")
         out.append(f"      {'TOTAL':<5} {'':6} {'':8}   {d['total']:5d} holes")
@@ -2245,43 +2248,43 @@ def write_report_csv(job: dict, path: str) -> None:
                     "copper files",
                     "layers carrying tracks — what a fabricator's check sheet "
                     "may mean by 'layers'"])
-        w.writerow(["pcb_width", f"{b['width_mm']:.4f}" if b["width_mm"] else "",
+        w.writerow(["pcb_width", f"{b['width_mm']:.2f}" if b["width_mm"] else "",
                     "mm", b.get("source", ""), b.get("method", "")])
-        w.writerow(["pcb_height", f"{b['height_mm']:.4f}" if b["height_mm"] else "",
+        w.writerow(["pcb_height", f"{b['height_mm']:.2f}" if b["height_mm"] else "",
                     "mm", b.get("source", ""), b.get("shape", "")])
         arr = job.get("array") or {}
-        w.writerow(["array_width", f"{arr['array_w']:.4f}" if arr.get("is_array") else "",
+        w.writerow(["array_width", f"{arr['array_w']:.2f}" if arr.get("is_array") else "",
                     "mm", arr.get("source", ""),
                     "the panel the boards sit on" if arr.get("is_array")
                     else "not an array — a single board"])
-        w.writerow(["array_height", f"{arr['array_h']:.4f}" if arr.get("is_array") else "",
+        w.writerow(["array_height", f"{arr['array_h']:.2f}" if arr.get("is_array") else "",
                     "mm", arr.get("source", ""), ""])
         w.writerow(["pcbs_per_array", a.get("pcbs_per_array", 1), "boards",
                     arr.get("source", ""),
                     f"{arr['cols']} across x {arr['rows']} up" if arr.get("is_array") else ""])
         w.writerow(["min_track_width",
-                    f"{a['min_track_width_mm']:.4f}" if a["min_track_width_mm"] else "",
+                    f"{a['min_track_width_mm']:.2f}" if a["min_track_width_mm"] else "",
                     "mm", "copper layers",
                     "smallest circular aperture used to draw a CONDUCTOR "
                     "(lettering etched in copper excluded)"])
         w.writerow(["min_track_spacing",
-                    f"{a['min_track_spacing_mm']:.4f}" if a["min_track_spacing_mm"] else "",
+                    f"{a['min_track_spacing_mm']:.2f}" if a["min_track_spacing_mm"] else "",
                     "mm", "copper layers",
                     f"conductors only; gaps below {job['snap_mm']} mm treated "
                     f"as touching; {a.get('spacing_pairs_at_min', 0)} place(s) "
                     "on the board are this tight"])
-        w.writerow(["min_drill", f"{a['min_drill_mm']:.4f}" if a["min_drill_mm"] else "",
+        w.writerow(["min_drill", f"{a['min_drill_mm']:.2f}" if a["min_drill_mm"] else "",
                     "mm", job["drills"]["source"] if job["drills"] else "",
                     "smallest tool with at least one hit"])
         w.writerow(["drill_count", a["drill_count"] if a["drill_count"] is not None else "",
                     "holes", job["drills"]["source"] if job["drills"] else "", ""])
         w.writerow(["min_pad_pitch",
-                    f"{a['min_pitch_mm']:.4f}" if a.get("min_pitch_mm") else "",
+                    f"{a['min_pitch_mm']:.2f}" if a.get("min_pitch_mm") else "",
                     "mm", a.get("min_pitch_layer") or "",
                     "centre to centre between two separate pads; "
                     f"{a.get('min_pitch_pairs', 0)} pair(s) at this pitch"])
         w.writerow(["min_smt_pad",
-                    f"{a['min_smt_pad_mm']:.4f}" if a.get("min_smt_pad_mm") else "",
+                    f"{a['min_smt_pad_mm']:.2f}" if a.get("min_smt_pad_mm") else "",
                     "mm", a.get("min_smt_pad_layer") or "",
                     (f"narrow side of a {a['min_smt_pad']} pad with no hole under it; "
                      f"{a.get('smt_pad_count', 0)} SMT pad(s) on the outer layers")
@@ -2294,14 +2297,14 @@ def write_report_csv(job: dict, path: str) -> None:
                            ("min_drill_mm", "rule_allows_drill"),
                            ("annular_ring_mm", "rule_min_annular_ring")):
             if rules.get(key):
-                w.writerow([label, f"{rules[key]:.4f}", "mm", rules["source"],
+                w.writerow([label, f"{rules[key]:.2f}", "mm", rules["source"],
                             "what the DESIGN was allowed to use — not what it "
                             "actually uses; the measured figure above is what "
                             "limits manufacture"])
         w.writerow([])
         w.writerow(["drill_tool", "diameter_mm", "diameter_mil", "hits", ""])
         for t in (job["drills"]["tools"] if job["drills"] else []):
-            w.writerow([f"T{t['tool']}", f"{t['dia_mm']:.4f}",
+            w.writerow([f"T{t['tool']}", f"{t['dia_mm']:.2f}",
                         f"{mm_to_mil(t['dia_mm']):.1f}", t["hits"], ""])
         w.writerow([])
         # Layer identification. It was printed on screen and left out of the
@@ -2323,9 +2326,9 @@ def write_report_csv(job: dict, path: str) -> None:
                     "trace_length_m"])
         for row in job["copper"]:
             for wd in row["widths"]:
-                w.writerow([row["name"], f"{wd['width_mm']:.4f}",
+                w.writerow([row["name"], f"{wd['width_mm']:.2f}",
                             f"{mm_to_mil(wd['width_mm']):.1f}", wd["segments"],
-                            f"{wd['length_mm'] / 1000:.3f}"])
+                            f"{wd['length_mm'] / 1000:.2f}"])
 
 
 _JOB_SUFFIX = re.compile(
@@ -2433,8 +2436,8 @@ def write_summary_csv(jobs: list[tuple[str, dict]], path: str) -> None:
                 name,
                 a.get("layers", ""),
                 a.get("routed_layers", ""),
-                f"{x / MM_PER_INCH:.4f}" if x else "",
-                f"{y / MM_PER_INCH:.4f}" if y else "",
+                f"{x / MM_PER_INCH:.2f}" if x else "",
+                f"{y / MM_PER_INCH:.2f}" if y else "",
                 f"{x:.2f} x {y:.2f}" if x else "",
                 m(a.get("min_track_width_mm")),
                 m(a.get("min_track_spacing_mm")),

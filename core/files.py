@@ -18,6 +18,17 @@ import mimetypes
 
 # How much extracted text to inline per file (keeps prompts sane).
 MAX_TEXT_CHARS = 12000
+# When the same file has ALSO been uploaded to the tool, inline only this
+# much: past it the tool reads the attachment, and the prompt carries a
+# description instead. A 370 KB attendance sheet pasted into the prompt as
+# 12,000 characters of truncated rows — beside the very same file as an
+# upload — is what stalled the analysis stage on a real run.
+INLINE_WHEN_UPLOADED = 2500
+# Spreadsheet-like files (csv/tsv/xlsx) above this many rows are never
+# inlined raw; they get a profile — columns, row count, per-column summary,
+# a few sample rows — which is what "analyse this file" needs anyway.
+PROFILE_ABOVE_ROWS = 40
+_TABULAR_EXTS = {".csv", ".tsv", ".xlsx"}
 
 # Extensions we treat as directly-readable UTF-8 text even when mimetypes is unsure.
 _TEXT_EXTS = {
@@ -141,6 +152,9 @@ def attach(path: str) -> dict:
     truncated = bool(text and len(text) > MAX_TEXT_CHARS)
     if truncated:
         text = text[:MAX_TEXT_CHARS]
+    profile = ""
+    if os.path.splitext(path)[1].lower() in _TABULAR_EXTS:
+        profile = tabular_profile(path)
     return {
         "path": path,
         "name": os.path.basename(path),
@@ -149,7 +163,123 @@ def attach(path: str) -> dict:
         "kind": kind,
         "text": text,
         "truncated": truncated,
+        # For a spreadsheet-like file: what it holds, in a few hundred
+        # characters, instead of a wall of rows. Empty for everything else.
+        "profile": profile,
     }
+
+
+# ── spreadsheets: a profile, not a wall of rows ──────────────────────────────
+
+def _read_table(path: str, limit: int = 200_000) -> tuple[list[str], list[list[str]]]:
+    """Header and rows of a csv/tsv/xlsx, capped so a huge file stays cheap."""
+    ext = os.path.splitext(path)[1].lower()
+    if ext == ".xlsx":
+        try:
+            import openpyxl
+        except Exception:
+            return [], []
+        wb = openpyxl.load_workbook(path, read_only=True, data_only=True)
+        ws = wb.worksheets[0]
+        rows: list[list[str]] = []
+        for row in ws.iter_rows(values_only=True):
+            rows.append(["" if v is None else str(v) for v in row])
+            if len(rows) > limit:
+                break
+        wb.close()
+    else:
+        import csv
+        delimiter = "\t" if ext == ".tsv" else ","
+        with open(path, "r", encoding="utf-8-sig", errors="ignore", newline="") as f:
+            rows = []
+            for row in csv.reader(f, delimiter=delimiter):
+                rows.append(row)
+                if len(rows) > limit:
+                    break
+    rows = [r for r in rows if any(c.strip() for c in r)]
+    if not rows:
+        return [], []
+    return [c.strip() for c in rows[0]], rows[1:]
+
+
+def _as_number(text: str):
+    t = text.strip().replace(",", "")
+    if not t:
+        return None
+    try:
+        return float(t)
+    except ValueError:
+        return None
+
+
+def tabular_profile(path: str, sample_rows: int = 6, max_chars: int = 3500) -> str:
+    """What a spreadsheet holds, in a few hundred characters.
+
+    Row count, the columns, and for each column the kind of thing in it:
+    a range for numbers and dates, the distinct values with counts for a
+    short list (Status: Present 6,912 · Absent 401 · Leave 187), the count
+    of distinct values with examples for everything else — then a handful
+    of rows verbatim so the reader can see the shape. This is the brief an
+    "analyse this file" stage would spend its whole turn producing from the
+    raw rows, and it is exact where a model's own count would be a guess.
+
+    Never raises; an unreadable file profiles as an empty string.
+    """
+    try:
+        header, rows = _read_table(path)
+    except Exception:
+        return ""
+    if not header:
+        return ""
+    lines = [f"{len(rows):,} rows x {len(header)} columns. Columns: "
+             + ", ".join(header)]
+    for i, name in enumerate(header):
+        values = [r[i].strip() for r in rows if i < len(r)]
+        filled = [v for v in values if v]
+        if not filled:
+            lines.append(f"  {name}: empty")
+            continue
+        blanks = len(values) - len(filled)
+        blank_note = f"; {blanks:,} blank" if blanks else ""
+        numbers = [n for n in (_as_number(v) for v in filled) if n is not None]
+        distinct = {}
+        for v in filled:
+            distinct[v] = distinct.get(v, 0) + 1
+        if len(numbers) == len(filled) and len(distinct) > 12:
+            lo, hi = min(numbers), max(numbers)
+            mean = sum(numbers) / len(numbers)
+            fmt = (lambda x: f"{x:,.0f}") if all(n == int(n) for n in numbers) \
+                else (lambda x: f"{x:,.2f}")
+            lines.append(f"  {name}: numbers {fmt(lo)} to {fmt(hi)}, "
+                         f"average {fmt(mean)}{blank_note}")
+        elif len(distinct) <= 12:
+            top = sorted(distinct.items(), key=lambda kv: -kv[1])
+            lines.append(f"  {name}: " + " · ".join(f"{v} {n:,}" for v, n in top)
+                         + blank_note)
+        else:
+            import re as _re
+            if all(_re.fullmatch(r"\d{1,2}:\d{2}", v) for v in list(distinct)[:200]):
+                # Clock times / durations: order by minutes, not as text,
+                # or "from 10:00 to 9:59" comes out backwards.
+                ordered = sorted(distinct, key=lambda v: int(v.split(":")[0]) * 60
+                                 + int(v.split(":")[1]))
+                looks_sorted = True
+            else:
+                ordered = sorted(distinct)
+                looks_sorted = all(len(v) == len(ordered[0]) for v in ordered[:50])
+            if looks_sorted and (ordered[0][:2].isdigit() or ":" in ordered[0]):
+                lines.append(f"  {name}: {len(distinct):,} distinct, from "
+                             f"{ordered[0]} to {ordered[-1]}{blank_note}")
+            else:
+                examples = ", ".join(list(distinct)[:3])
+                lines.append(f"  {name}: {len(distinct):,} distinct, e.g. "
+                             f"{examples}{blank_note}")
+    lines.append(f"First {min(sample_rows, len(rows))} rows, as written:")
+    lines.append("  " + " | ".join(header))
+    for r in rows[:sample_rows]:
+        lines.append("  " + " | ".join(r))
+    out = "\n".join(lines)
+    return out[:max_chars]
 
 
 def describe(att: dict) -> str:
@@ -157,16 +287,39 @@ def describe(att: dict) -> str:
     return f"{att['name']}  [dim]({_human_size(att['size'])} · {tag})[/dim]"
 
 
-def context_block(attachments: list[dict]) -> str:
-    """Text injected into agent prompts so tools see file contents inline."""
+def _row_count(att: dict) -> int:
+    head = (att.get("profile") or "").split(" rows", 1)[0].replace(",", "")
+    return int(head) if head.isdigit() else 0
+
+
+def context_block(attachments: list[dict], uploaded: bool = False) -> str:
+    """Text injected into agent prompts so tools see file contents inline.
+
+    `uploaded` — the same files have just gone up to this tool as real
+    attachments. Then a big text file is NOT pasted in as well: the prompt
+    says it is attached and, for a spreadsheet, gives the profile. Pasting
+    it too is how a 370 KB sheet became 12,000 characters of truncated rows
+    beside its own upload, and the tool spent the turn reading them.
+    """
     if not attachments:
         return ""
     parts = ["📎 The user attached the following file(s). Use them as primary source material:\n"]
     for att in attachments:
         header = f"── {att['name']} ({_human_size(att['size'])}, {att['kind']})"
-        if att["text"]:
+        profile = att.get("profile") or ""
+        text = att.get("text") or ""
+        big_table = bool(profile) and _row_count(att) > PROFILE_ABOVE_ROWS
+        if big_table:
+            where = ("uploaded to this chat as a file — read the rows there"
+                     if uploaded else
+                     "too large to paste; only this profile is given")
+            parts.append(f"{header}  [spreadsheet: {where}]\n{profile}\n")
+        elif text and uploaded and len(text) > INLINE_WHEN_UPLOADED:
+            parts.append(f"{header}\n(uploaded to this chat as a file — read it "
+                         "from the attachment; not pasted here)\n")
+        elif text:
             trunc = "  [content truncated]" if att.get("truncated") else ""
-            parts.append(f"{header}{trunc}\n{att['text']}\n")
+            parts.append(f"{header}{trunc}\n{text}\n")
         else:
             parts.append(f"{header}\n(binary file — uploaded directly to the tool; contents not inlined)\n")
     parts.append("── end of attachments ──\n")

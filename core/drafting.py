@@ -35,6 +35,8 @@ arithmetic and owns the file.**
 """
 from __future__ import annotations
 
+import re
+
 import os
 from dataclasses import dataclass, field
 
@@ -152,8 +154,65 @@ def draft(cfg: dict, prompt: str, *, purpose: str = "draft",
 
     texts = responses.get(purpose) or []
     body = "\n\n".join(t for t in texts if t and t.strip()).strip()
-    return Draft(text=body, agent=name, url=links.get(purpose, ""),
+    return Draft(text=clean_reply(body), agent=name, url=links.get(purpose, ""),
                  attachments=attachments)
+
+
+# ── what the page scrape drags along ─────────────────────────────────────────
+# Read off a browser tab, a tool's answer arrives with the tool's own chrome
+# on it: Claude's "Thought for 6s" pill (twice, when the page re-rendered), a
+# "Claude responded:" caption, a salutation duplicated across two DOM nodes,
+# a fenced block. One of those went out to a real customer under the owner's
+# name. Nothing that is not the letter may leave this function.
+
+_THOUGHT = re.compile(
+    r"\b(?:Thought|Thinking|Reasoned|Reasoning|Searched|Analysed|Analyzed)"
+    r"(?:\s+(?:for|about))?\s+\d+\s*(?:s|sec|secs|seconds?|m|min|mins|minutes?)\b\.?",
+    re.IGNORECASE)
+_JUNK_LINE = re.compile(
+    r"^\s*(?:Thinking\s*(?:\.{3}|…)?|Thought process|Show (?:thinking|reasoning)|"
+    r"Copy(?: code)?|Retry|Regenerate|Edit)\s*$", re.IGNORECASE)
+_CAPTION = re.compile(
+    r"^\s*(?:[A-Z][\w .-]{0,24}?)\s+(?:responded|replied|said|wrote|answered)\s*:\s*",
+    re.IGNORECASE)
+_SUBJECT_LINE = re.compile(r"^\s*\**\s*subject\s*\**\s*:", re.IGNORECASE)
+
+
+def clean_reply(text: str) -> str:
+    """The letter, and nothing else. Never raises; empty in, empty out."""
+    if not text or not text.strip():
+        return ""
+    t = text.replace("\r\n", "\n").replace("\r", "\n")
+    # Fences, wherever the tool put them.
+    t = re.sub(r"^```[a-zA-Z]*[ \t]*\n?", "", t, flags=re.MULTILINE)
+    t = t.replace("```", "")
+    # "Claude responded:" and its cousins, at the very top only — a letter
+    # that mentions "the customer said:" further down is quoting, not junk.
+    t = _CAPTION.sub("", t.lstrip(), count=1)
+    # The thinking pill, inline or on its own line, however many times.
+    t = _THOUGHT.sub("", t)
+    lines = [ln.rstrip() for ln in t.split("\n")]
+    lines = [ln for ln in lines if not _JUNK_LINE.match(ln)]
+    # A subject line the prompt told it not to write.
+    while lines and not lines[0].strip():
+        lines.pop(0)
+    if lines and _SUBJECT_LINE.match(lines[0]):
+        lines.pop(0)
+    while lines and not lines[0].strip():
+        lines.pop(0)
+    # A salutation rendered twice ("Dear Sir/Madam" ... "Dear Sir/Madam"):
+    # keep the LAST copy, which is the one the body follows.
+    if lines:
+        first = lines[0].strip()
+        if first:
+            for k in range(1, min(len(lines), 6)):
+                if lines[k].strip() == first:
+                    lines = lines[k:]
+                    break
+    out = "\n".join(lines)
+    out = re.sub(r"[ \t]+\n", "\n", out)
+    out = re.sub(r"\n{3,}", "\n\n", out)
+    return out.strip()
 
 
 # ── the prompts ──────────────────────────────────────────────────────────────
@@ -182,7 +241,7 @@ customer's own email below:
 def negotiation_prompt(*, quotation_text: str, customer_reply: str,
                        policy_text: str, customer_name: str = "",
                        product: str = "", signature: str = "",
-                       language: str = "") -> str:
+                       language: str = "", offer_sample: bool = True) -> str:
     """Win back a customer who has said no, or who wants a better rate.
 
     The pricing policy is the whole point. Without it the tool writes a
@@ -227,6 +286,15 @@ def negotiation_prompt(*, quotation_text: str, customer_reply: str,
         "contingent on. Close by asking one specific question that makes it "
         "easy for them to reply.",
     ]
+    if offer_sample:
+        lines += [
+            "",
+            "Offer to send them a sample piece so they can check the quality "
+            "for themselves before deciding — a standing offer this owner "
+            "makes, not a price concession — and ask where to send it. Say "
+            "that our quotation is repeated below this email for their "
+            "reference; do not restate its lines yourself.",
+        ]
     if signature:
         lines.append(f"Sign off as: {signature}")
     if language:

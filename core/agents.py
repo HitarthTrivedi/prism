@@ -454,7 +454,7 @@ AGENT_REGISTRY = {
         "Freemium", "5–10s", 30,
     ),
     "Kimi 2.6": _agent(
-        "https://kimi.moonshot.cn",
+        "https://www.kimi.ai",
         "massive context window for analysing 100+ page documents; multilingual",
         "Free/Low", "15–40s", 500,
         textarea_selector="div[contenteditable='true'], textarea",
