@@ -44,11 +44,16 @@ def _node_bounds(node: dict, canvas_w: int, canvas_h: int) -> tuple[float, float
     if node_type == "text":
         content = str(node.get("content", ""))
         font_size = float(node.get("font_size", 48) or 48)
-        # Rough average glyph width — this is a coarse proxy, not a real
-        # text layout; it only needs to catch positions nowhere near the
-        # canvas, not exact wrap points.
-        w = max(font_size, len(content) * font_size * 0.55)
-        h = font_size * 1.3
+        # A multi-line headline ("\n" — every real spec uses it, see
+        # generate.py's catalogue) is genuinely taller and narrower per
+        # line than the whole string treated as one line — measuring it as
+        # one line UNDERSTATES its real height (a 4-line headline's true
+        # extent is ~4x taller than this used to compute), which is
+        # exactly backwards for a check meant to catch real collisions.
+        lines = content.split("\n") or [content]
+        line_height = float(node.get("line_height", 1.25) or 1.25)
+        w = max(font_size, max((len(ln) for ln in lines), default=0) * font_size * 0.55)
+        h = max(font_size * 1.3, len(lines) * font_size * line_height)
     elif node_type == "shape_arrow":
         frm = node.get("from") or [x, y]
         to = node.get("to") or [x, y]
@@ -69,6 +74,51 @@ def _node_bounds(node: dict, canvas_w: int, canvas_h: int) -> tuple[float, float
     left = x - w * ax
     top = y - h * ay
     return (left, top, left + w, top + h)
+
+
+def _overlap_faults(scene: dict, canvas_w: int, canvas_h: int) -> list[str]:
+    """Do any two text/image nodes' AUTHORED (settled) bounds collide by
+    more than a third of the smaller one's area?
+
+    Scoped to text-vs-image and image-vs-image on purpose — shape_rect is
+    routinely and correctly used as an intentional backdrop/badge/panel
+    directly BEHIND other content (a highlight pill behind a label, a
+    glass card behind a photo), so including it would flag legitimate
+    layering as a fault. Text piled on top of a photo, or two photos
+    sharing the same region, has no such legitimate reading — that combo
+    only happens when nothing accounted for what else was already there.
+    A factual, checkable geometry question (do these boxes intersect),
+    not a taste judgment — same category as the existing off-frame check,
+    not the reverted diversity-dominance one.
+    """
+    nodes = [n for n in (scene.get("nodes") or [])
+             if isinstance(n, dict) and n.get("type") in ("text", "image")]
+    boxes = []
+    for n in nodes:
+        b = _node_bounds(n, canvas_w, canvas_h)
+        if b:
+            boxes.append((n.get("id", "?"), n.get("type"), b))
+
+    faults: list[str] = []
+    for i in range(len(boxes)):
+        for j in range(i + 1, len(boxes)):
+            id_a, type_a, (l1, t1, r1, b1) = boxes[i]
+            id_b, type_b, (l2, t2, r2, b2) = boxes[j]
+            ix = max(0.0, min(r1, r2) - max(l1, l2))
+            iy = max(0.0, min(b1, b2) - max(t1, t2))
+            if ix <= 0 or iy <= 0:
+                continue
+            inter = ix * iy
+            area_a = max(1.0, (r1 - l1) * (b1 - t1))
+            area_b = max(1.0, (r2 - l2) * (b2 - t2))
+            smaller = min(area_a, area_b)
+            if inter / smaller > 0.33:
+                faults.append(
+                    f'node "{id_a}" ({type_a}) and node "{id_b}" ({type_b}) '
+                    f"overlap by {int(inter / smaller * 100)}% of the smaller "
+                    "one's area — move or resize one of them so they don't "
+                    "share the same region")
+    return faults
 
 
 def _entrance_faults(node: dict, scene_duration: float) -> list[str]:
@@ -203,6 +253,7 @@ def inspect(spec: dict[str, Any]) -> list[str]:
         except (TypeError, ValueError):
             duration = 0.0
         faults.extend(_layer_faults(scene))
+        faults.extend(_overlap_faults(scene, canvas_w, canvas_h))
         for node in scene.get("nodes", []) or []:
             if not isinstance(node, dict):
                 continue

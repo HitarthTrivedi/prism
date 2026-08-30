@@ -120,17 +120,51 @@ def save_run(record: dict, runs_dir: str = "") -> str:
     return path
 
 
+def _clean_name(text: str, limit: int = 60) -> str:
+    """Strip a string down to something safe as a Windows file or folder
+    name: no reserved characters, no unprintables, collapsed whitespace,
+    trimmed trailing dots/spaces (Windows rejects both)."""
+    illegal = '<>:"/\\|?*'   # reserved on Windows; harmless to strip elsewhere
+    clean = "".join(c for c in (text or "").strip()
+                    if c not in illegal and c.isprintable())
+    return " ".join(clean.split())[:limit].strip(" .")
+
+
 def _artifact_stem(prompt: str, kind: str) -> str:
-    """A filename that says what made it, not just when — same sanitising
-    rule gerber_dialog.py already uses for its CSV names, so a customer
-    scanning the folder sees "quote 500 pcs for Acme" rather than a hash."""
-    import time
-    stem = "".join(c if c.isalnum() or c in "-_" else "_"
-                   for c in (prompt or "").strip())[:60].strip("_")
-    return f"{stem or kind}_{int(time.time())}"
+    """A filename a person can actually read in Finder/Explorer without
+    opening it: what they asked for, what kind of thing this is, and when —
+    not a sanitized-to-underscores prompt fragment glued to a raw unix
+    timestamp."""
+    import datetime
+    clean = _clean_name(prompt)
+    when = datetime.datetime.now().strftime("%Y-%m-%d %I-%M %p")
+    label = (kind or "artifact").replace("_", " ").capitalize()
+    return " - ".join(p for p in (clean, label, when) if p)
 
 
-def save_artifact(src_path: str, prompt: str, kind: str = "artifact") -> str:
+def artifact_task_dir(task: str) -> str:
+    """The per-task subfolder under ARTIFACTS_DIR that `save_artifact()` also
+    writes into when passed this same `task` string — grouping everything one
+    New Task (or one BOQ/Gerber/quote job) produced into one folder a customer
+    can open, instead of every image/doc/video for every run landing loose in
+    one ever-growing list.
+
+    Exposed on its own (not only through save_artifact) for a caller whose
+    deliverable is a whole directory tree — Gerber's cleaned-copy output,
+    which is a folder of layers plus a report and preview images, not a
+    single file `shutil.copy2` can land in one call.
+
+    Empty `task` returns ARTIFACTS_DIR itself: today's flat top-level
+    behavior, so a caller nobody has updated yet keeps working unchanged.
+    """
+    folder = (os.path.join(ARTIFACTS_DIR, _clean_name(task, limit=80) or "Task")
+             if task else ARTIFACTS_DIR)
+    os.makedirs(folder, exist_ok=True)
+    return folder
+
+
+def save_artifact(src_path: str, prompt: str, kind: str = "artifact",
+                  link: str = "", task: str = "") -> str:
     """Copy a file an agent generated into the one folder a customer will
     actually look in again — see ARTIFACTS_DIR above for why this exists.
 
@@ -138,16 +172,32 @@ def save_artifact(src_path: str, prompt: str, kind: str = "artifact") -> str:
     the render worker) keeps working with the path it knows, and losing this
     copy afterwards (a full disk, a permissions slip) never breaks the
     caller's own view of what it produced.
+
+    `link`, when given, is the live tab URL of the AI conversation that made
+    this — real for a ChatGPT/Claude stage, empty for a local render (Reel,
+    Motion) that was never a chat at all. Written as a tiny sidecar next to
+    the artifact rather than baked into the filename, since a URL is
+    something to open, not something to read at a glance in Finder/Explorer.
+
+    `task`, when given, is the run/job this artifact belongs to (the same
+    string already used to title it in History and in its own filename) —
+    see `artifact_task_dir()`. Everything from one task then lands in one
+    subfolder instead of loose at the top level.
     """
-    os.makedirs(ARTIFACTS_DIR, exist_ok=True)
+    dest_dir = artifact_task_dir(task)
     _, ext = os.path.splitext(src_path)
     stem = _artifact_stem(prompt, kind)
-    dest = os.path.join(ARTIFACTS_DIR, f"{stem}{ext}")
+    dest = os.path.join(dest_dir, f"{stem}{ext}")
     n = 1
     while os.path.exists(dest):
         n += 1
-        dest = os.path.join(ARTIFACTS_DIR, f"{stem}_{n}{ext}")
+        dest = os.path.join(dest_dir, f"{stem}_{n}{ext}")
     import shutil
     shutil.copy2(src_path, dest)
+    if link:
+        try:
+            with open(dest + ".link.txt", "w", encoding="utf-8") as f:
+                f.write(link.strip() + "\n")
+        except OSError:
+            pass   # the artifact itself is already safely saved either way
     return dest
-    return path

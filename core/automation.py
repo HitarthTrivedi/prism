@@ -11,6 +11,7 @@ even on machines where they aren't installed yet.
 """
 from __future__ import annotations
 import os
+import re
 import time
 import shutil
 import tempfile
@@ -880,10 +881,15 @@ def _harvest_files(driver, agent_cfg, stage: str) -> list[dict]:
     return out
 
 
-def _save_artifacts(items: list[dict], query: str, stage: str) -> None:
+def _save_artifacts(items: list[dict], query: str, stage: str,
+                    link: str = "") -> None:
     """Copy what a stage just generated out of the temp directory `items`
     were harvested into, and into the one folder a customer can still find
     once Prism is closed — see config.ARTIFACTS_DIR.
+
+    `link` is the live tab this stage's tool answered in — passed straight
+    through to config.save_artifact() so the saved file keeps a way back to
+    the actual AI conversation that produced it, not just its output.
 
     Best-effort and silent per item: a full disk or a permissions slip here
     must not cost the run its actual result, which the harvested temp file
@@ -896,7 +902,11 @@ def _save_artifacts(items: list[dict], query: str, stage: str) -> None:
         if not path:
             continue
         try:
-            saved = config.save_artifact(path, query, kind=stage)
+            # `query` names the whole run, not just this stage — passing it
+            # as `task` too means every stage's output (images, docs, video)
+            # from one New Task lands in the same Artifacts subfolder.
+            saved = config.save_artifact(path, query, kind=stage, link=link,
+                                         task=query)
         except Exception:                               # noqa: BLE001
             continue
         ui.info(f"   💾  saved to {saved}")
@@ -1068,6 +1078,43 @@ def _wait_for_images(driver, agent_cfg, want: int, cap: int = 240,
             if steady >= 20:
                 break
         elif grace is not None and time.time() - start >= grace:
+            break   # nothing ever appeared — not this turn's kind of reply
+    return last
+
+
+def _wait_for_files(driver, cap: int = 60, grace: int = 12) -> int:
+    """_wait_for_images's twin for document/deck/code deliverables.
+
+    A Code-Interpreter-style "Download" link often finishes rendering AFTER
+    the reply text settles — the model says "here's your file" a few seconds
+    before the button that serves it exists. Most development/presentation/
+    format turns never produce a separate download link at all (the code or
+    outline written into the chat IS the whole reply), so `grace` gives up
+    fast when nothing shows, rather than taxing every plain-text turn on
+    these stages the way an unconditional wait would.
+    """
+    exts_sel = ", ".join(f"a[href$='{ext}']" for ext in _HARVESTABLE_EXTS)
+    js = f"""
+        return document.querySelectorAll(
+            "a[href^='blob:'], a[download], {exts_sel}"
+        ).length;
+    """
+    start, last, steady = time.time(), 0, 0
+    while time.time() - start < cap:
+        time.sleep(3)
+        try:
+            n = int(driver.execute_script(js) or 0)
+        except Exception:
+            continue
+        if n > last:
+            last, steady = n, 0
+            ui.info(f"   📎  {n} file link(s) so far…")
+        elif last:
+            steady += 3
+            # A link that's been sitting there for 10s is all there is.
+            if steady >= 10:
+                break
+        elif time.time() - start >= grace:
             break   # nothing ever appeared — not this turn's kind of reply
     return last
 
@@ -1762,7 +1809,8 @@ _EDITABLE_STAGES = ("visual", "presentation")
 
 
 def _make_editable(driver, agent_cfg: dict, stage: str, query: str,
-                   responses: list, machine_shaped: bool = False) -> list:
+                   responses: list,
+                   machine_shaped: bool = False) -> tuple[list, str]:
     """Hand the image just generated to Canva, in the same conversation.
 
     Two prompts, not one. The first asked for the best picture the tool can
@@ -1773,41 +1821,47 @@ def _make_editable(driver, agent_cfg: dict, stage: str, query: str,
     rendered the scene — so the customer had to choose between a good picture
     and an editable one. Generate first, convert second, and they get both.
 
-    Returns the responses to keep. The Canva reply is appended rather than
-    substituted: the first answer holds the image, and dropping it to keep a
-    link would lose the artwork the customer actually asked for.
+    Returns `(responses, canva_url)`. The Canva reply is appended to
+    `responses` rather than substituted: the first answer holds the image,
+    and dropping it to keep a link would lose the artwork the customer
+    actually asked for. `canva_url` is the design's own URL, pulled out of
+    that reply — the caller saves it as the artifact's link so "editable"
+    means something a customer can actually click open, instead of pointing
+    back at the ChatGPT tab where the link is just one more line of text.
     """
     if stage not in _EDITABLE_STAGES:
-        return responses
+        return responses, ""
     if machine_shaped:
         # This stage's answer is parsed by Prism, not read by a person. It was
         # just told to reply with ONLY a JSON object; adding a chat turn after
         # that both wastes a round trip and leaves prose sitting where the
         # parser expects to find the spec.
-        return responses
+        return responses, ""
     if not A.wants_canva(query):
-        return responses
+        return responses, ""
     if not responses:
         # Nothing was made, so there is nothing to convert. Asking anyway
         # would have Canva invent a design from the prompt alone, which is
         # exactly the template-instead-of-artwork failure this avoids.
         ui.warn("   nothing to make editable — skipping the Canva step")
-        return responses
+        return responses, ""
 
     ui.info("   🎨  asking Canva to make it editable…")
     reply = _reask(driver, agent_cfg, A._CANVA_FOLLOWUP, expect="CANVA LINK:")
     text = "\n\n".join(t for t in reply if t and t.strip()).strip()
     if not text:
         ui.warn("   Canva didn't answer — keeping the image on its own")
-        return responses
+        return responses, ""
     if "canva link: none" in text.lower():
         # Said plainly rather than swallowed: the customer asked for something
         # editable and is not getting it, and the reason is one they can fix.
         ui.warn("   the Canva app isn't connected to this ChatGPT account — "
                 "connect it there and the design becomes editable next time")
-        return responses
+        return responses, ""
+    match = re.search(r"canva link:\s*(\S+)", text, re.IGNORECASE)
+    canva_url = match.group(1).rstrip(").,") if match else ""
     ui.ok("   ✅  editable Canva design created")
-    return responses + [text]
+    return responses + [text], canva_url
 
 
 def _reask(driver, agent_cfg: dict, prompt: str, expect: str = "",
@@ -2494,7 +2548,8 @@ def run(routing: dict, cfg: dict, attachments=None, on_event=None,
                 # the customer-facing artifact describe the original request.
                 try:
                     from . import config as _config
-                    saved = _config.save_artifact(out, query, kind="reel")
+                    saved = _config.save_artifact(out, query, kind="reel",
+                                                 task=query)
                     ui.info(f"   💾  saved to {saved}")
                 except Exception:                       # noqa: BLE001
                     pass       # rendering succeeded; copying is best-effort
@@ -2709,10 +2764,10 @@ def run(routing: dict, cfg: dict, attachments=None, on_event=None,
                     # the stage immediately before, which is now the image
                     # maker's chatter rather than the words of the reel.
                     from . import reel_web as _web
+                    from . import assets as _assets
                     made = {f["path"] for f in pipeline_files}
                     table = {}
                     try:
-                        from . import assets as _assets
                         table = _assets.collect(
                             (attachments or []) + pipeline_files,
                             generated=made)
@@ -3129,14 +3184,17 @@ def run(routing: dict, cfg: dict, attachments=None, on_event=None,
                                    "have nothing to draw")
             # The artwork exists and is good. NOW make it editable — a second
             # prompt in the same chat rather than a different first prompt.
-            stage_responses = _make_editable(
+            stage_responses, canva_url = _make_editable(
                 driver, agent_cfg, stage, query, stage_responses,
                 machine_shaped=machine_shaped)
 
             if stage_responses:
                 ui.info(f"   📥  captured {sum(len(t) for t in stage_responses)} chars")
 
-            all_links[stage] = driver.current_url
+            # The Canva design, when there is one, is the deliverable a
+            # customer actually opens and edits — worth more as the saved
+            # link than the ChatGPT tab it was requested from.
+            all_links[stage] = canva_url or driver.current_url
             all_responses[stage] = stage_responses
 
             # Image-making stages: pull the generated images off the page so
@@ -3161,18 +3219,28 @@ def run(routing: dict, cfg: dict, attachments=None, on_event=None,
                     pipeline_files[:] = (pipeline_files + made)[-6:]
                     ui.info(f"   🖼️   harvested {len(made)} generated image(s) "
                             "for the next stages")
-                    _save_artifacts(made, query, stage)
+                    _save_artifacts(made, query, stage, link=all_links.get(stage, ""))
             # Same idea for the producer stages whose deliverable is a
             # document, deck or code file rather than a picture — without
             # this, only their scraped TEXT reply ever reached a later stage,
             # and a genuinely generated PDF/DOCX/PPTX/code file/zip never did.
-            elif stage in ("development", "presentation", "format"):
+            # "content" is here too: most turns on that stage are plain copy,
+            # but the ones that ask for an actual document deserve the same
+            # treatment "format" and "presentation" already get, and
+            # _wait_for_files gives up in `grace` seconds when nothing shows
+            # rather than taxing every plain-text reply. "write" is Gerber's
+            # custom-pipeline label for the same reason "format" is /boq's.
+            elif stage in ("development", "presentation", "format",
+                           "content", "write"):
+                ui.info("   ⏳  waiting for the file to finish rendering "
+                        "(up to 60s)…")
+                _wait_for_files(driver)
                 made_files = _harvest_files(driver, agent_cfg, stage)
                 if made_files:
                     pipeline_files[:] = (pipeline_files + made_files)[-6:]
                     ui.info(f"   📎  harvested {len(made_files)} generated "
                             "file(s) for the next stages")
-                    _save_artifacts(made_files, query, stage)
+                    _save_artifacts(made_files, query, stage, link=all_links.get(stage, ""))
 
             if stage_responses:
                 ui.ok(f"captured {len(stage_responses)} response(s)")

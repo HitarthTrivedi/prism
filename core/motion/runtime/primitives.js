@@ -487,7 +487,15 @@ class ImageNode extends Node {
     const img = document.createElement("img");
     img.style.width = "100%";
     img.style.height = "100%";
-    img.style.objectFit = "fill";
+    // "fill" (stretch to the box, ignoring aspect ratio) faithfully matched
+    // the old engine's drawImage(img,x,y,w,h) — but a live test surfaced
+    // the real cost: a brand asset (a wordmark/logo, naturally wide) forced
+    // into a box whose aspect ratio doesn't match gets smeared into
+    // illegible mush. "contain" never distorts — worst case is letterbox
+    // padding inside the box, which reads as an intentional frame, not a
+    // rendering defect. A real, confirmed-by-evidence behavior change, not
+    // a port choice.
+    img.style.objectFit = "contain";
     img.style.display = "block";
     img.addEventListener("load", () => {
       box.style.background = "";

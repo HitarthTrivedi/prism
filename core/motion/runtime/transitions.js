@@ -35,22 +35,26 @@
     return leakContainer;
   }
 
+  // Every tween in this engine is explicit fromTo — a timeline that is
+  // ONLY EVER seeked, never played forward from 0 in real time, can't
+  // reliably rely on a plain .to()'s implicit starting value (GSAP
+  // resolves that lazily, tied to normal playback reaching the tween,
+  // not to an arbitrary .seek() landing inside its window). push() and
+  // squeeze() used to be the one gsap.set()+.to() pair in the whole
+  // codebase — everything else (node tweens, zoom, blurSwoosh) was
+  // already fromTo, which is exactly why only these two broke.
   function push(masterTl, outEl, inEl, cutAt, overlap, w, h, vertical) {
     const prop = vertical ? "y" : "x";
     const dim = vertical ? h : w;
-    gsap.set(outEl, { [prop]: 0 });
-    gsap.set(inEl, { [prop]: dim });
-    masterTl.to(outEl, { [prop]: -dim, duration: overlap, ease: "power2.inOut" }, cutAt - overlap);
-    masterTl.to(inEl, { [prop]: 0, duration: overlap, ease: "power2.inOut" }, cutAt - overlap);
+    masterTl.fromTo(outEl, { [prop]: 0 }, { [prop]: -dim, duration: overlap, ease: "power2.inOut" }, cutAt - overlap);
+    masterTl.fromTo(inEl, { [prop]: dim }, { [prop]: 0, duration: overlap, ease: "power2.inOut" }, cutAt - overlap);
   }
 
   function squeeze(masterTl, outEl, inEl, cutAt, overlap) {
     outEl.style.transformOrigin = "left center";
     inEl.style.transformOrigin = "right center";
-    gsap.set(outEl, { scaleX: 1 });
-    gsap.set(inEl, { scaleX: 0 });
-    masterTl.to(outEl, { scaleX: 0, duration: overlap, ease: "power2.inOut" }, cutAt - overlap);
-    masterTl.to(inEl, { scaleX: 1, duration: overlap, ease: "power2.inOut" }, cutAt - overlap);
+    masterTl.fromTo(outEl, { scaleX: 1 }, { scaleX: 0, duration: overlap, ease: "power2.inOut" }, cutAt - overlap);
+    masterTl.fromTo(inEl, { scaleX: 0 }, { scaleX: 1, duration: overlap, ease: "power2.inOut" }, cutAt - overlap);
   }
 
   function zoom(masterTl, outEl, inEl, cutAt, overlap) {

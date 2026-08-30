@@ -78,8 +78,25 @@ def _playwright_available() -> bool:
         return False
 
 
+# Temporary kill-switch, 2026-08-30: the render pipeline has a known bug
+# (image nodes resolving to asset paths that don't exist at render time —
+# a broken-image icon and a blank frame, baked into the actual output, not
+# a log-only glitch) that makes Motion unsafe to show a client today. This
+# is the single chokepoint BOTH ways Motion gets reached funnel through —
+# main_window._open_motion_dialog() (core_bridge.motion_available()) and
+# the AI-router's own pipeline execution (automation._run_motion()) both
+# call this function and already degrade gracefully on a (False, message)
+# result, exactly like Reel does when FFmpeg is missing. Flip this back to
+# False once the asset-path bug is fixed and re-verified with a real
+# attached-image render — do not just delete this without confirming that.
+_DISABLED_PENDING_ASSET_FIX = True
+
+
 def is_available() -> tuple[bool, str]:
     """Check if FFmpeg and a headless browser runner are available."""
+    if _DISABLED_PENDING_ASSET_FIX:
+        return False, ("Motion Graphics isn't available in this release yet "
+                       "— it's still being finished.")
     try:
         from core import ffmpeg
         ff = ffmpeg.locate()
