@@ -777,6 +777,7 @@ _HARVESTABLE_EXTS = (
     ".py", ".js", ".ts", ".tsx", ".jsx", ".json", ".html", ".css",
     ".java", ".c", ".cpp", ".h", ".go", ".rb", ".php", ".sh", ".sql",
     ".ipynb", ".md", ".txt", ".rtf",
+    ".mp3", ".wav", ".m4a", ".ogg", ".flac", ".aac",
 )
 
 
@@ -803,32 +804,49 @@ def _harvest_files(driver, agent_cfg, stage: str) -> list[dict]:
     Unlike an image, there is no "screenshot the element" fallback when the
     fetch fails — a rendered pixel grid can stand in for a picture; nothing
     can stand in for a PDF. A candidate that can't be fetched is skipped.
+
+    For the "audio" stage specifically, an <a href> download link is often
+    not how the result appears at all — ElevenLabs/Suno-style players
+    typically hand back an <audio> element instead, with no anchor anywhere.
+    Unverified against either tool's real DOM (no live account to test
+    against), but harmless to try: `currentSrc` is read via JS because that
+    reflects what the player actually loaded, not just a static `src`
+    attribute a dynamic player may never set.
     """
     import base64
     from selenium.webdriver.common.by import By
     from . import files as F
 
     sel = agent_cfg.get("response_selector", "")
-    links = []
+    candidates: list[tuple[str, str | None]] = []
     try:
-        if sel:
-            links = driver.find_elements(By.CSS_SELECTOR, f"{sel} a[href]")
+        links = driver.find_elements(By.CSS_SELECTOR, f"{sel} a[href]") if sel else []
         if not links:
             links = driver.find_elements(By.CSS_SELECTOR, "a[href]")
+        for a in links:
+            try:
+                candidates.append((a.get_attribute("href") or "",
+                                   a.get_attribute("download")))
+            except Exception:
+                continue
     except Exception:
         return []
+
+    if stage == "audio":
+        try:
+            srcs = driver.execute_script(
+                "return [...document.querySelectorAll('audio')]"
+                ".map(a => a.currentSrc || a.src).filter(Boolean);") or []
+            candidates.extend((src, None) for src in srcs)
+        except Exception:
+            pass
 
     out, seen = [], set()
     try:
         driver.set_script_timeout(20)
     except Exception:
         pass
-    for a in links:
-        try:
-            href = a.get_attribute("href") or ""
-            download_attr = a.get_attribute("download")
-        except Exception:
-            continue
+    for href, download_attr in candidates:
         if not href or href in seen:
             continue
         clean = href.split("?")[0].split("#")[0]
@@ -1082,7 +1100,8 @@ def _wait_for_images(driver, agent_cfg, want: int, cap: int = 240,
     return last
 
 
-def _wait_for_files(driver, cap: int = 60, grace: int = 12) -> int:
+def _wait_for_files(driver, cap: int = 60, grace: int = 12,
+                    stage: str = "") -> int:
     """_wait_for_images's twin for document/deck/code deliverables.
 
     A Code-Interpreter-style "Download" link often finishes rendering AFTER
@@ -1092,11 +1111,16 @@ def _wait_for_files(driver, cap: int = 60, grace: int = 12) -> int:
     outline written into the chat IS the whole reply), so `grace` gives up
     fast when nothing shows, rather than taxing every plain-text turn on
     these stages the way an unconditional wait would.
+
+    `stage="audio"` also counts <audio> elements — see _harvest_files' own
+    audio-specific note on why a synth/music player is unlikely to expose a
+    plain download anchor the way a document tool does.
     """
     exts_sel = ", ".join(f"a[href$='{ext}']" for ext in _HARVESTABLE_EXTS)
+    audio_sel = ", audio" if stage == "audio" else ""
     js = f"""
         return document.querySelectorAll(
-            "a[href^='blob:'], a[download], {exts_sel}"
+            "a[href^='blob:'], a[download], {exts_sel}{audio_sel}"
         ).length;
     """
     start, last, steady = time.time(), 0, 0
@@ -3232,11 +3256,14 @@ def run(routing: dict, cfg: dict, attachments=None, on_event=None,
             # _wait_for_files gives up in `grace` seconds when nothing shows
             # rather than taxing every plain-text reply. "write" is Gerber's
             # custom-pipeline label for the same reason "format" is /boq's.
+            # "audio" (ElevenLabs/Suno) never had ANY harvesting before this —
+            # best-effort, unverified against a live account; see the notes
+            # on _harvest_files and _wait_for_files.
             elif stage in ("development", "presentation", "format",
-                           "content", "write"):
+                           "content", "write", "audio"):
                 ui.info("   ⏳  waiting for the file to finish rendering "
                         "(up to 60s)…")
-                _wait_for_files(driver)
+                _wait_for_files(driver, stage=stage)
                 made_files = _harvest_files(driver, agent_cfg, stage)
                 if made_files:
                     pipeline_files[:] = (pipeline_files + made_files)[-6:]
