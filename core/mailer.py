@@ -316,12 +316,13 @@ def clean_password(password: str) -> str:
     return p
 
 
-def explain_error(error: str, address: str = "") -> str:
+def explain_error(error: str, address: str = "", port: int | str = "") -> str:
     """Turn an smtplib failure into the sentence that actually unblocks the
     user. The raw text ('(535, b\\'5.7.8 Username and Password not accepted\\')')
     says nothing about app passwords, which is what it almost always means."""
     e = (error or "").lower()
     domain = address.rsplit("@", 1)[-1].lower() if "@" in address else ""
+    other_port = 465 if str(port) == "587" else 587
     if "535" in e or "auth" in e or "username and password" in e:
         if domain in ("gmail.com", "googlemail.com"):
             return ("Google rejected the sign-in. Gmail needs a 16-character "
@@ -341,11 +342,19 @@ def explain_error(error: str, address: str = "") -> str:
     if "certificate" in e or "ssl" in e:
         return ("TLS handshake failed — check the port: 465 is SSL, 587 is "
                 "STARTTLS. Using the wrong one for your host fails like this.")
-    if "getaddrinfo" in e or "name or service" in e or "resolve" in e:
+    if ("getaddrinfo" in e or "name or service" in e or "resolve" in e
+           or "name resolution" in e):
         return "Couldn't resolve the SMTP host — check it for typos."
     if "timed out" in e or "timeout" in e:
-        return ("The mail server didn't answer. Some networks block SMTP "
-                "ports — try another connection, or port 587 instead of 465.")
+        # Which port to suggest depends on which one just failed — telling
+        # someone already on 587 to "try 587" fixes nothing and reads as a
+        # canned non-answer.
+        return (f"The mail server didn't answer on port {port or '?'}. This "
+               f"usually means a network is blocking outbound mail — some "
+               f"ISPs and office firewalls block it entirely. Try port "
+               f"{other_port} instead in Setup, or send from a different "
+               f"network (e.g. a phone hotspot) to check whether it's the "
+               f"network rather than the account.")
     return error
 
 
@@ -364,7 +373,7 @@ def verify(cfg: dict) -> str:
     try:
         server = _connect(ec, timeout=30)
     except Exception as e:
-        return explain_error(str(e), ec.get("address", ""))
+        return explain_error(str(e), ec.get("address", ""), ec.get("port", ""))
     try:
         server.quit()
     except Exception:
