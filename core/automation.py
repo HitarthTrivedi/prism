@@ -1049,7 +1049,7 @@ def _smart_wait(driver, agent_cfg, cap: int, poll: int = 5,
 
 
 def _wait_for_images(driver, agent_cfg, want: int, cap: int = 240,
-                     grace: int | None = None) -> int:
+                     grace: int | None = None, should_stop=None) -> int:
     """Wait for generated images to actually appear, then stop growing.
 
     _smart_wait watches TEXT, and during image generation the text is finished
@@ -1080,7 +1080,12 @@ def _wait_for_images(driver, agent_cfg, want: int, cap: int = 240,
     """
     start, last, steady = time.time(), 0, 0
     while time.time() - start < cap:
-        time.sleep(4)
+        # Four seconds a poll, and stop/skip checked every poll: this loop
+        # never polled should_stop at all, and a stage stuck "rendering" an
+        # image that was never coming held the run for the whole cap with no
+        # way out. That is the loop "Skip this step" exists to break.
+        if _sleep_interruptibly(4, should_stop):
+            break
         try:
             n = int(driver.execute_script(js, sel) or 0)
         except Exception:
@@ -2158,7 +2163,7 @@ def run(routing: dict, cfg: dict, attachments=None, on_event=None,
         custom_stages: list[tuple[str, str, list[str]]] | None = None,
         should_stop=None, failover: bool = True,
         reel_design_stage: str = "", pipeline_files_out: list | None = None,
-        motion_design_stage: str = ""):
+        motion_design_stage: str = "", skip_signal=None):
     """Execute the pipeline. Returns (responses, links).
 
     attachments: list of records from core.files.attach() — uploaded to each
@@ -2192,6 +2197,14 @@ def run(routing: dict, cfg: dict, attachments=None, on_event=None,
                  case the way there is for reel_design_stage.
     on_event(kind, payload) is an optional callback for live UI updates.
     should_stop() is an optional predicate polled between and during stages.
+
+    skip_signal is an optional threading.Event the GUI sets when the user
+    presses "Skip this step": the CURRENT stage stops waiting, whatever the
+    tool had produced is kept, and the run moves on to the next stage. The
+    engine clears the event when it acts on it, so one press skips one step
+    — a leftover press can never eat the stage after it. This is the way
+    out of a tool stuck generating (an image that never finishes, a site
+    whose selectors have moved) without throwing away the whole run.
                  A routed run drives a browser for minutes at a time, so a
                  caller with a Stop button needs a way to be let go of that
                  isn't killing the process. When it returns True the run
@@ -2519,6 +2532,14 @@ def run(routing: dict, cfg: dict, attachments=None, on_event=None,
     def stopped() -> bool:
         return bool(should_stop and should_stop())
 
+    def skip_requested() -> bool:
+        return bool(skip_signal is not None and skip_signal.is_set())
+
+    def stage_halt() -> bool:
+        # What the per-stage waits poll: a full Stop, or a skip of the stage
+        # that is waiting right now.
+        return stopped() or skip_requested()
+
     # Stages that produced nothing, and why. Read by the failover pass after
     # the loop; see _retry_failed_stages().
     failures: dict[str, dict] = {}
@@ -2536,6 +2557,10 @@ def run(routing: dict, cfg: dict, attachments=None, on_event=None,
             ui.warn("Stopped at your request — keeping everything finished so far.")
             emit("cancelled", {"stage": stage, "done": len(all_responses)})
             break
+        if skip_requested():
+            # A skip pressed in the dying moments of the previous stage must
+            # not eat this one.
+            skip_signal.clear()
 
         agent_cfg = A.resolve_agent(stage, agent_name)
         if not agent_cfg:
@@ -2901,7 +2926,7 @@ def run(routing: dict, cfg: dict, attachments=None, on_event=None,
                             # multi-prompt stage, which is where "Stop takes
                             # minutes" was coming from.
                             _smart_wait(driver, agent_cfg, 120,
-                                       should_stop=should_stop)
+                                       should_stop=stage_halt)
                     except Exception as e:
                         ui.err(f"   prompt error: {e}")
 
@@ -2922,7 +2947,35 @@ def run(routing: dict, cfg: dict, attachments=None, on_event=None,
                 ui.info(f"   ⏳  waiting up to {wait}s for {agent_name} to finish…")
                 emit("waiting", {"stage": stage, "seconds": wait})
                 took, settled = _smart_wait(driver, agent_cfg, wait,
-                                            expect=expect, should_stop=should_stop)
+                                            expect=expect, should_stop=stage_halt)
+                if skip_requested() and not stopped():
+                    # "Skip this step": keep whatever the tool had produced —
+                    # exactly as a Stop would — and carry on with the NEXT
+                    # stage instead of ending the run. This is the way past a
+                    # tool stuck generating without losing everything else.
+                    skip_signal.clear()
+                    ui.warn("   ⤼  skipped at your request — keeping what "
+                            "landed and moving to the next step")
+                    try:
+                        captured = _capture(driver, agent_cfg)
+                        partial = [max(captured, key=len)] if captured else []
+                    except Exception:
+                        partial = []
+                    all_links[stage] = driver.current_url
+                    if partial:
+                        all_responses[stage] = partial
+                        emit("stage_done", {"stage": stage,
+                                            "count": len(partial),
+                                            "texts": partial,
+                                            "url": driver.current_url,
+                                            "timed_out": True})
+                    emit("stage_skipped", {
+                        "stage": stage, "agent": agent_name,
+                        "reason": "You skipped this step. Whatever the tool "
+                                  "had produced was kept; the run moved on "
+                                  "to the next step."})
+                    first_tab = False
+                    continue
                 if stopped():
                     # Scrape before leaving: the tool has been generating for
                     # however long the user waited before pressing Stop, and
@@ -2975,7 +3028,8 @@ def run(routing: dict, cfg: dict, attachments=None, on_event=None,
                     ui.info(f"   ⏳  waiting for the pictures to finish "
                             f"rendering (up to {cap}s)…")
                     got = _wait_for_images(driver, agent_cfg, want,
-                                           cap=cap, grace=grace)
+                                           cap=cap, grace=grace,
+                                           should_stop=stage_halt)
                     if got:
                         timed_out = False
                     elif stage == "artwork":
@@ -3030,7 +3084,7 @@ def run(routing: dict, cfg: dict, attachments=None, on_event=None,
                             assets_table=design_assets,
                             check=_web.inspect,
                             log=lambda m: ui.info(f"   {m}"),
-                            should_stop=should_stop,
+                            should_stop=stage_halt,
                             on_scene=lambda i, n: emit(
                                 "reel_scene", {"index": i, "total": n}))
                     except Exception as e:
@@ -3097,7 +3151,7 @@ def run(routing: dict, cfg: dict, attachments=None, on_event=None,
                             assets_table=motion_assets_table,
                             check=_motion_inspect.inspect,
                             log=lambda m: ui.info(f"   {m}"),
-                            should_stop=should_stop,
+                            should_stop=stage_halt,
                             on_scene=lambda i, n: emit(
                                 "motion_scene", {"index": i, "total": n}))
                     except Exception as e:
