@@ -38,6 +38,16 @@ from . import reel_web
 
 EDITS_KEY = "edits"
 
+
+def is_studio_spec(spec) -> bool:
+    """Was this reel filmed from a web page? Only those can be edited —
+    the Quick renderer draws from templates and its spec carries no HTML."""
+    if not isinstance(spec, dict):
+        return False
+    scenes = spec.get("scenes")
+    return (isinstance(scenes, list) and bool(scenes)
+            and any(isinstance(sc, dict) and sc.get("html") for sc in scenes))
+
 # Bounds for what a browser may hand back. A drag of four thousand pixels on
 # a 1080x1920 frame is off any edge; anything past these is a bug or mischief.
 _MAX_SHIFT = 4000.0
