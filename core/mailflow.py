@@ -22,7 +22,7 @@ import re
 from dataclasses import dataclass, field
 from datetime import date
 
-from . import inbox, register, sop, triage, ui, worklist
+from . import history, inbox, register, sop, triage, ui, worklist
 from .inbox import Message, State
 
 # Sub-folders under the company folder. Flat, obvious names — the owner will
@@ -346,6 +346,46 @@ class Result:
         return " · ".join(parts)
 
 
+# classify()'s ORDER category is deliberately wide — CATEGORIES[ORDER] reads
+# "a purchase order, an order confirmation, or a customer saying they are
+# placing the order" — because a genuinely new correspondent's very first
+# mail saying "please supply 500 units" really is an order with nothing
+# else to call it. That same wide net catches a bare "Done deal" or
+# "please proceed" on a thread that already has an open, quoted inquiry —
+# where the far better reading is an ACCEPTED reply (reply_intent() already
+# knows "please proceed" and "go ahead" mean exactly that, see
+# _LOCAL_INTENT above), not a purchase order Prism cannot read a single
+# field out of. This only narrows the ORDER path for messages already tied
+# to an existing inquiry — a brand-new correspondent's first mail is
+# unaffected, and still needs nothing more than the wide category to be
+# treated as an order.
+_PO_LIKE = re.compile(
+    r"\bpurchase\s*order\b|\bp\.?\s*o\.?\s*(no\.?|number|#)\s*[:\-]?\s*\w",
+    re.I)
+
+
+def _reads_as_an_order(message: Message) -> bool:
+    """An attachment, or text that actually names a PO — not just any
+    confirmation-shaped sentence."""
+    if message.attachments:
+        return True
+    return bool(_PO_LIKE.search(getattr(message, "body", "") or ""))
+
+
+def _log_history(folder: str, event: str, message: Message) -> None:
+    """One line into history.txt for a mail that arrived — see core/history.py.
+    Never lets a logging failure stop the check; the register row and the
+    saved attachments are the record that matters if this fails."""
+    who = message.from_name or message.from_addr
+    if message.from_name and message.from_addr:
+        who = f"{message.from_name} <{message.from_addr}>"
+    try:
+        history.append(folder, event, who=who, subject=message.subject,
+                       body=message.body, when=message.date)
+    except Exception:                                   # noqa: BLE001
+        pass
+
+
 def check(cfg: dict, paths: Paths, *, state: State | None = None,
           knowledge: triage.Knowledge | None = None,
           model: str = "", local_only: bool = False,
@@ -414,14 +454,18 @@ def check(cfg: dict, paths: Paths, *, state: State | None = None,
             folder = existing.get("Folder") or paths.folder_for(
                 existing.get("Inquiry no", "unknown"))
             files = inbox.save_attachments(message, folder)
-            item = Item("order" if verdict.category == triage.ORDER else "reply",
+            is_order = (verdict.category == triage.ORDER
+                       and _reads_as_an_order(message))
+            item = Item("order" if is_order else "reply",
                         message, existing, folder, files)
-            if verdict.category == triage.ORDER:
+            if is_order:
                 item.note = "a purchase order may be attached"
                 out.orders.append(item)
+                _log_history(folder, "Purchase order received", message)
             else:
                 item.intent = reply_intent(message, api_key, model)
                 out.replies.append(item)
+                _log_history(folder, "Reply received", message)
             dirty = True
             continue
 
@@ -448,8 +492,10 @@ def check(cfg: dict, paths: Paths, *, state: State | None = None,
         if verdict.category == triage.ORDER:
             item.note = "ordered without a quotation from us"
             out.orders.append(item)
+            _log_history(folder, "Order received (no prior quotation)", message)
         else:
             out.new_inquiries.append(item)
+            _log_history(folder, "Enquiry received", message)
 
     if dirty:
         try:

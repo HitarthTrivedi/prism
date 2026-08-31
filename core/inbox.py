@@ -50,10 +50,18 @@ _IMAP_HOSTS = {
     "rediffmail.com": ("imap.rediffmail.com", 993),
 }
 
-# How far back the very first fetch reaches. A mailbox with eight years in it
-# would otherwise be downloaded in full on day one — minutes of waiting, and
-# an inquiry register suddenly full of business that closed in 2019.
-FIRST_FETCH_DAYS = 30
+# How far back the very first fetch reaches — on a mailbox Prism has never
+# read, or one whose UIDVALIDITY reset (the server renumbered it). A mailbox
+# with eight years in it would otherwise be downloaded in full on day one —
+# hours of waiting, and an inquiry register suddenly full of business that
+# closed in 2019. A year is deliberately not "all of it": long enough that
+# "where are my older mails" (a customer complaint, once) is answered, short
+# enough that a decade-old mailbox does not swamp the register with dead
+# business on day one. Nothing before this window is fetched, ever, once
+# the bookmark has moved past it — there is no second pass that reaches back
+# further, so this number is the actual answer to "how far back can Prism
+# see", not just a first-day throttle.
+FIRST_FETCH_DAYS = 365
 
 # Ceiling on one fetch. Not a limit on the mailbox — the next run picks up from
 # where this one stopped — just a guarantee that no single check can hang for

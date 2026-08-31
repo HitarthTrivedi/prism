@@ -37,6 +37,14 @@ rewritten, because it might be the only copy of something.
 
 Every write is atomic, same discipline as register.py: a crash mid-write
 must never truncate the only record of what still needs a reply.
+
+The logs (`arrived`, `sent`) are still capped, for the working file to stay
+small enough to rewrite on every check. What the cap evicts used to simply
+be deleted — silently, and in contradiction to the promise above. It is not
+deleted any more: it is appended, one JSON object per line, to
+`arrived.archive.jsonl` / `sent.archive.jsonl` next to the working file,
+before the working file is trimmed. Nothing a customer sent is gone; it has
+just moved to the file a person, not a tab, reads.
 """
 from __future__ import annotations
 
@@ -62,6 +70,7 @@ LOG_KINDS = ("arrived", "sent")
 ARRIVED_KEEP = 5000
 SENT_KEEP = 5000
 RESOLVED_KEEP = 500
+ARCHIVE_SUFFIX = ".archive.jsonl"
 
 
 # ── where things are ──────────────────────────────────────────────────────────
@@ -74,6 +83,21 @@ def path_for(folder: str, kind: str) -> str:
     if kind not in KINDS:
         raise ValueError(f"unknown worklist kind {kind!r}")
     return os.path.join(dir_in(folder), f"{kind}.json")
+
+
+def archive_path_for(folder: str, kind: str) -> str:
+    """Where a cap's evictions go instead of the bin. Append-only, one JSON
+    object per line — never read by Prism itself, so a very old mailbox's
+    history costs nothing at runtime; it exists so a person can open it."""
+    return os.path.join(dir_in(folder), f"{kind}{ARCHIVE_SUFFIX}")
+
+
+def has_archive(folder: str, kind: str) -> bool:
+    """True once a cap has ever evicted a row of this kind — the UI's cue
+    that "everything" now means "everything, some of it in the archive
+    file" rather than a silent lie."""
+    path = archive_path_for(folder, kind)
+    return os.path.exists(path) and os.path.getsize(path) > 0
 
 
 def path_in(folder: str) -> str:
@@ -202,21 +226,47 @@ def append(folder: str, kind: str, entries: list[dict]) -> dict:
         if kind not in LOG_KINDS:
             entry.setdefault("resolved", False)
         rows.append(entry)
-    rows = _trimmed(kind, rows)
+    rows = _trimmed(folder, kind, rows)
     _write_kind(folder, kind, rows)
     data = load(folder)
     data[kind] = rows
     return data
 
 
-def _trimmed(kind: str, rows: list[dict]) -> list[dict]:
+def _archive(folder: str, kind: str, rows: list[dict]) -> None:
+    """Append rows a cap is about to evict, oldest first, so the archive
+    file reads in the same order the working file did. One write, so a
+    crash mid-append costs at most the row being written, never an
+    earlier one — the same discipline as _write_kind(), just additive
+    instead of atomic-replace, because this file is never rewritten."""
+    if not rows:
+        return
+    os.makedirs(dir_in(folder), exist_ok=True)
+    with open(archive_path_for(folder, kind), "a", encoding="utf-8") as f:
+        for row in rows:
+            f.write(json.dumps(row, ensure_ascii=False))
+            f.write("\n")
+        f.flush()
+        os.fsync(f.fileno())
+
+
+def _trimmed(folder: str, kind: str, rows: list[dict]) -> list[dict]:
+    """Whatever a cap would evict is archived first — see _archive() — so
+    the working file stays small without anything being deleted."""
     if kind == "arrived":
-        return rows[-ARRIVED_KEEP:] if len(rows) > ARRIVED_KEEP else rows
+        if len(rows) <= ARRIVED_KEEP:
+            return rows
+        _archive(folder, kind, rows[:-ARRIVED_KEEP])
+        return rows[-ARRIVED_KEEP:]
     if kind == "sent":
-        return rows[-SENT_KEEP:] if len(rows) > SENT_KEEP else rows
+        if len(rows) <= SENT_KEEP:
+            return rows
+        _archive(folder, kind, rows[:-SENT_KEEP])
+        return rows[-SENT_KEEP:]
     pending_rows = [r for r in rows if not r.get("resolved")]
     resolved = [r for r in rows if r.get("resolved")]
     if len(resolved) > RESOLVED_KEEP:
+        _archive(folder, kind, resolved[:-RESOLVED_KEEP])
         resolved = resolved[-RESOLVED_KEEP:]
     # Stable order: interleave back by original position rather than
     # pending-then-resolved, so the screen reads oldest-to-newest as typed.
