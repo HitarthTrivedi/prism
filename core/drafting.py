@@ -173,8 +173,10 @@ _JUNK_LINE = re.compile(
     r"^\s*(?:Thinking\s*(?:\.{3}|…)?|Thought process|Show (?:thinking|reasoning)|"
     r"Copy(?: code)?|Retry|Regenerate|Edit)\s*$", re.IGNORECASE)
 _CAPTION = re.compile(
-    r"^\s*(?:[A-Z][\w .-]{0,24}?)\s+(?:responded|replied|said|wrote|answered)\s*:\s*",
-    re.IGNORECASE)
+    # One token (plus an optional version) before the verb — "Claude
+    # responded:", never "The customer said:", which is content.
+    r"^\s*[A-Z][\w.-]{1,15}(?:\s+\d[\w.]*)?\s+"
+    r"(?:responded|replied|said|wrote|answered)\s*:\s*")
 _SUBJECT_LINE = re.compile(r"^\s*\**\s*subject\s*\**\s*:", re.IGNORECASE)
 
 

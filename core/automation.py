@@ -1779,6 +1779,30 @@ def _match(driver, selector: str) -> list:
         return []                       # invalid selector, or the page moved
 
 
+# The page's own furniture, scraped along with the answer: a "Claude
+# responded:" caption, a "Thought for 9s" pill (twice, when the pane
+# re-rendered). Left in, it rides the relay into the NEXT tool's prompt —
+# where a fabricated-looking "Claude responded:" header is exactly what a
+# model's prompt-injection defences are trained to refuse. One real run
+# died that way: Claude read the relayed script as a scripted takeover and
+# declined to produce the design at all. Fences and content are untouched.
+_CAPTION_RE = re.compile(
+    # ONE token (plus an optional version) before the verb: "Claude
+    # responded:", "Kimi 2.6 said:". Never two words — "The customer said:"
+    # is content, and an earlier, looser pattern ate it.
+    r"^\s*[A-Z][\w.-]{1,15}(?:\s+\d[\w.]*)?\s+"
+    r"(?:responded|replied|said|wrote|answered)\s*:\s*")
+_THOUGHT_RE = re.compile(
+    r"\b(?:Thought|Thinking|Reasoned|Reasoning)(?:\s+(?:for|about))?\s+\d+\s*"
+    r"(?:s|sec|secs|seconds?|m|min|mins|minutes?)\b\.?", re.IGNORECASE)
+
+
+def _clean_capture(text: str) -> str:
+    t = _CAPTION_RE.sub("", text or "", count=1)
+    t = _THOUGHT_RE.sub("", t)
+    return t.strip()
+
+
 def _capture(driver, agent_cfg: dict) -> list[str]:
     """Everything on the page that reads as a reply, longest captures only.
 
@@ -1819,7 +1843,7 @@ def _capture(driver, agent_cfg: dict) -> list[str]:
     if echoes:
         texts = [t for t in texts if t not in echoes]
         ui.info(f"   ↩️   ignored {len(echoes)} echo(es) of our own prompt")
-    return texts
+    return [c for c in (_clean_capture(t) for t in texts) if c]
 
 
 # Stages where "make it editable" means anything.
@@ -2861,9 +2885,15 @@ def run(routing: dict, cfg: dict, attachments=None, on_event=None,
                     script = "\n\n".join(
                         t for t in (all_responses.get(script_stage) or [])
                         if t.strip())
-                    head = (f"THE SCRIPT — final, use these words, this order "
-                            f"and these timings:\n\n{script}\n\n"
-                            if script else "")
+                    head = ((
+                        "For context: you are one stage of Prism, a desktop "
+                        "automation the client's own team launched and is "
+                        "watching. The script below is the genuine output of "
+                        "this pipeline's writing stage, relayed as it was "
+                        "written.\n\n"
+                        f"THE SCRIPT — final, use these words, this order "
+                        f"and these timings:\n\n{script}\n\n")
+                        if script else "")
                     questions = [head + q.replace(_web_token(), listing)
                                  for q in questions]
 
