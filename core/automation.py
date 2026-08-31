@@ -780,6 +780,53 @@ _HARVESTABLE_EXTS = (
     ".mp3", ".wav", ".m4a", ".ogg", ".flac", ".aac",
 )
 
+# A blob: download button (ChatGPT/Claude canvas export) hands back an
+# extension-less href and usually no `download` filename, so the deliverable
+# used to land as "..._file1" with NO suffix — the OS typed it as a generic
+# "File", Prism couldn't preview it, and it read as "the PDF wasn't taken" even
+# though the bytes were right there. The real type is recoverable two ways: the
+# data: URL FileReader returns names the MIME type, and failing that the bytes
+# start with a recognisable magic number. This map covers the office/doc types
+# `mimetypes.guess_extension` gets wrong or refuses cross-platform.
+_MIME_EXT = {
+    "application/pdf": ".pdf",
+    "text/plain": ".txt",
+    "text/markdown": ".md",
+    "text/csv": ".csv",
+    "text/html": ".html",
+    "application/json": ".json",
+    "application/zip": ".zip",
+    "application/msword": ".doc",
+    "application/vnd.openxmlformats-officedocument.wordprocessingml.document": ".docx",
+    "application/vnd.ms-excel": ".xls",
+    "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet": ".xlsx",
+    "application/vnd.ms-powerpoint": ".ppt",
+    "application/vnd.openxmlformats-officedocument.presentationml.presentation": ".pptx",
+}
+
+
+def _guess_ext(mime: str, raw: bytes) -> str:
+    """Best-effort file extension when the download link gave none: trust the
+    MIME type the data: URL declared, fall back to a magic-number sniff, else
+    empty (caller keeps whatever it had)."""
+    mime = (mime or "").split(";")[0].strip().lower()
+    if mime and mime != "application/octet-stream":
+        hit = _MIME_EXT.get(mime)
+        if hit:
+            return hit
+        import mimetypes
+        guess = mimetypes.guess_extension(mime)
+        if guess:
+            return ".jpg" if guess == ".jpe" else guess
+    # Content sniff — a blob download often reports octet-stream regardless.
+    if raw[:5] == b"%PDF-":
+        return ".pdf"
+    if raw[:2] == b"PK":
+        return ".zip"          # also docx/pptx/xlsx, but .zip at least opens
+    if raw[:4] == b"%!PS":
+        return ".ps"
+    return ""
+
 
 def _harvest_files(driver, agent_cfg, stage: str) -> list[dict]:
     """Non-image sibling of _harvest_images. A code, presentation or format
@@ -875,6 +922,11 @@ def _harvest_files(driver, agent_cfg, stage: str) -> list[dict]:
             if data and data.startswith("data:"):
                 header, b64 = data.split(",", 1)
                 raw = base64.b64decode(b64)
+                if not ext and raw:
+                    # header looks like "data:application/pdf;base64" — the part
+                    # after "data:" is the MIME type the browser attached.
+                    mime = header[5:] if header.startswith("data:") else ""
+                    ext = _guess_ext(mime, raw)
         except Exception:
             raw = None
         if not raw:
@@ -896,7 +948,116 @@ def _harvest_files(driver, agent_cfg, stage: str) -> list[dict]:
         out.append(att)
         if len(out) >= 4:
             break
+
+    # Nothing fetchable — try the click-to-download path. Claude's file skill
+    # and ChatGPT's canvas serve a generated file through a Download BUTTON
+    # that runs JS to save it, with no <a href> whose bytes we can fetch; the
+    # reply says "Download the … PDF" and the artifact folder stayed empty.
+    if not out:
+        out = _harvest_via_download(driver, agent_cfg, stage)
     return out
+
+
+def _click_download_control(driver, scope: str) -> bool:
+    """Click whatever serves a generated file: an explicit download anchor, a
+    download-labelled icon button, or visible 'Download' text — searched inside
+    the reply first, then the whole page. Returns whether something was
+    clicked. Never raises."""
+    from selenium.webdriver.common.by import By
+    css_list = [f"{scope}a[download]",
+                f"{scope}[aria-label*='download' i]",
+                f"{scope}[data-testid*='download' i]",
+                "a[download]", "[aria-label*='download' i]"]
+    for css in css_list:
+        try:
+            els = driver.find_elements(By.CSS_SELECTOR, css.strip())
+        except Exception:
+            continue
+        for el in els:
+            try:
+                if el.is_displayed() and el.is_enabled():
+                    driver.execute_script(
+                        "arguments[0].scrollIntoView({block:'center'});", el)
+                    el.click()
+                    return True
+            except Exception:
+                continue
+    # Last resort: a visible link/button whose text is literally "Download …".
+    return _click_by_text(driver, ["download"], timeout=4)
+
+
+def _harvest_via_download(driver, agent_cfg, stage: str) -> list[dict]:
+    """Capture a file that is only reachable by CLICKING a download control —
+    the sibling of _harvest_files' fetch path, for tools that hand the file
+    over through JS rather than a fetchable link. Point Chrome's download at a
+    scratch folder we own (so our file is distinguishable from the user's own
+    ~/Downloads traffic), click the control, and harvest whatever lands.
+
+    Best-effort and never raises: if the download can't be redirected, or
+    nothing lands, or a plain link navigates instead of downloading, it gives
+    back an empty list and restores the chat tab, leaving the run unharmed."""
+    from . import files as F
+
+    folder = os.path.join(tempfile.gettempdir(),
+                          f"prism_dl_{stage}_{os.getpid()}")
+    try:
+        os.makedirs(folder, exist_ok=True)
+        driver.execute_cdp_cmd("Page.setDownloadBehavior",
+                               {"behavior": "allow", "downloadPath": folder})
+    except Exception:
+        return []
+
+    origin = ""
+    try:
+        origin = driver.current_url
+    except Exception:
+        pass
+    before = set(os.listdir(folder))
+    scope = (agent_cfg.get("response_selector", "") + " ").lstrip()
+    if not _click_download_control(driver, scope):
+        return []
+
+    # Wait for a COMPLETE file — Chrome writes *.crdownload while in flight, and
+    # a big PDF from a code tool can take a while to serialise and stream.
+    start, tried_menu, target = time.time(), False, None
+    while time.time() - start < 45:
+        time.sleep(1)
+        now = set(os.listdir(folder)) - before
+        fresh = [f for f in now
+                 if not f.endswith((".crdownload", ".tmp", ".part"))]
+        inflight = any(f.endswith((".crdownload", ".tmp", ".part")) for f in now)
+        if fresh:
+            cand = os.path.join(folder, sorted(fresh)[0])
+            s1 = os.path.getsize(cand) if os.path.exists(cand) else -1
+            time.sleep(1)
+            s2 = os.path.getsize(cand) if os.path.exists(cand) else -2
+            if s1 == s2 and s1 > 0:          # size settled → done writing
+                target = cand
+                break
+        elif not inflight and not tried_menu and time.time() - start > 6:
+            # Nothing landed and nothing is downloading — the first click may
+            # have opened a "Download as…" menu instead. Try a menu item once.
+            tried_menu = True
+            _click_by_text(driver, ["pdf", "download"], timeout=2)
+
+    # A plain link (no Content-Disposition) navigates instead of downloading —
+    # put the chat tab back so the saved stage URL and any later step are intact.
+    try:
+        if origin and driver.current_url != origin:
+            driver.get(origin)
+    except Exception:
+        pass
+
+    if not target:
+        return []
+    try:
+        att = F.attach(target)
+    except Exception:
+        return []
+    if att.get("kind") == "image":
+        return []          # _harvest_images already owns real pictures
+    att["_generated"] = True
+    return [att]
 
 
 def _save_artifacts(items: list[dict], query: str, stage: str,
@@ -2158,7 +2319,7 @@ def run(routing: dict, cfg: dict, attachments=None, on_event=None,
         custom_stages: list[tuple[str, str, list[str]]] | None = None,
         should_stop=None, failover: bool = True,
         reel_design_stage: str = "", pipeline_files_out: list | None = None,
-        motion_design_stage: str = ""):
+        motion_design_stage: str = "", resume_urls: dict | None = None):
     """Execute the pipeline. Returns (responses, links).
 
     attachments: list of records from core.files.attach() — uploaded to each
@@ -2594,7 +2755,11 @@ def run(routing: dict, cfg: dict, attachments=None, on_event=None,
             if not first_tab:
                 _open_tab(driver, agent_name)
             first_tab = False
-            driver.get(agent_cfg["url"])
+            # A follow-up RESUMES the exact conversation this stage answered in
+            # (its saved tab URL) instead of the tool's blank home page — so it
+            # continues the SAME chat, with all its context, rather than opening
+            # a fresh one. resume_urls is empty on an ordinary run.
+            driver.get((resume_urls or {}).get(stage) or agent_cfg["url"])
             time.sleep(agent_cfg.get("page_wait", 4))
 
             # Only NON-EMPTY prior outputs count — a failed scrape must not
@@ -2762,21 +2927,12 @@ def run(routing: dict, cfg: dict, attachments=None, on_event=None,
             if answer_language and not machine_shaped:
                 handoff += "\n\n" + answer_language
 
-            # Keep the answer in the CHAT, not in a side artifact. Claude and
-            # ChatGPT increasingly move a long answer into a document/canvas
-            # pane Prism's scraper cannot see — so the chat holds only a
-            # preamble ("I'll build you a document…"), the stage looks finished
-            # on that stub, and the real work never reaches the next stage.
-            # (Live-seen 27-08: a Claude DOCX artifact was captured as its
-            # one-line preamble.) Machine-shaped stages already demand the whole
-            # answer inline, so this only guards prose stages. Belt to the
-            # capture-side fix that follows.
-            if not machine_shaped:
-                handoff += ("\n\nIMPORTANT — write your COMPLETE answer "
-                            "directly in this chat message. Do NOT put it in a "
-                            "separate document, canvas, or artifact: only the "
-                            "chat text is read, so anything placed outside it "
-                            "is lost.")
+            # (Removed the "answer in the chat, never in a document/artifact"
+            # instruction: the engine now HARVESTS artifact/canvas files
+            # (_harvest_files) and saves them to the task's Artifacts folder, so
+            # a document IS captured and downloadable. Forcing chat-only was
+            # actively stopping document stages — the BOQ especially — from
+            # producing the very PDF the customer wants.)
 
             if agent_cfg.get("search_tool") == "apollo":
                 # Deliberately does NOT get `context`. That blob opens with
