@@ -734,6 +734,12 @@ def render(spec: dict, out_path: str, on_progress=None,
     fps = int(spec.get("fps", DEFAULT_FPS))
     plan, total = _plan(spec, fps)
     html = build_html(spec, fps)
+    # The owner's own hand fixes, made in the browser editor. Applied by the
+    # SAME script the editor runs, so the film cannot differ from what they
+    # saw when they pressed Save & render.
+    if spec.get("edits"):
+        from . import reel_edit
+        html = reel_edit.apply_edits(html, reel_edit.clean_edits(spec["edits"]))
     exe = ffmpeg_path()
 
     os.makedirs(os.path.dirname(os.path.abspath(out_path)) or ".", exist_ok=True)
