@@ -386,3 +386,50 @@ def render_sheet(report: dict, out_dir: str) -> dict:
     except Exception:                               # noqa: BLE001
         png_path = ""   # the HTML stands on its own
     return {"html": html_path, "png": png_path}
+
+
+def auto_brief(report: dict) -> str:
+    """The prompt /step-auto hands the image agent.
+
+    The security model lives IN the prompt: only these measured figures and
+    Prism's own plain render travel to the tool — the customer's STEP file
+    stays on this machine, and the brief says so out loud, so the agent
+    neither asks for the model nor invents a number to fill a gap.
+    """
+    o = report["overall_mm"]
+    lines = [
+        "Draw ONE professional sheet-metal fabrication drawing sheet as a "
+        "single portrait image, in the plain style of a manufacturer's "
+        "hand-made dimension sheet: black line-work on white, one labelled "
+        "view per part, dimension lines with arrowheads for length, width "
+        "and height, hole callouts written as diameter x count, and a small "
+        "title block at the bottom.",
+        "",
+        "Every figure below was MEASURED OFFLINE by Prism from the "
+        "customer's CAD model. The model itself is confidential and is not "
+        "shared — the attached image is Prism's own plain render of the "
+        "parts, for view reference only.",
+        "",
+        f"Job: {report['file']} · {report['mode']} moulding · "
+        f"assembly overall {o[0]:.2f} x {o[1]:.2f} x {o[2]:.2f} mm · "
+        f"{len(report['parts'])} part(s)",
+        "",
+    ]
+    for i, part in enumerate(report["parts"], 1):
+        L, W, H = part["size_mm"]
+        lines.append(f"{i}) {part['name']} — {L:.2f} x {W:.2f} x {H:.2f} mm "
+                     f"· sheet t≈{part['thickness_mm']:.2f} mm · 1 nos")
+        if part["holes"]:
+            lines.append("   holes: " + " · ".join(
+                f"Ø{h['dia_mm']:g} x {h['count']}" for h in part["holes"]))
+    lines += [
+        "",
+        "Title block: job name, material "
+        + ("CRC sheet" if report["mode"] == "metal" else "moulded plastic")
+        + ", scale NTS, today's date, and the line "
+          "'Measured offline by Prism'.",
+        "Rules: use EXACTLY the numbers above — do not round, convert or "
+        "invent any dimension, and do not add parts or holes that are not "
+        "listed. Label every part with its name.",
+    ]
+    return "\n".join(lines)

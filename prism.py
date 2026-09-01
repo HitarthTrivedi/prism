@@ -14,6 +14,7 @@ hands the output forward.
 """
 import os
 import re
+import shutil
 import time
 import sys
 
@@ -239,6 +240,10 @@ HELP = """
                 and weight — from the real geometry, offline. Writes an Excel
                 dimension sheet and a drawing page with an isometric view of
                 each part. No AI ever sees the STEP file. /s works too.
+  [teal]/step-auto [metal|plastic] <file.step>[/teal]  the same offline
+                measurement, then your image agent draws the professional
+                dimensioned sheet FROM THE MEASURED NUMBERS — the STEP file
+                still never leaves this machine.
   [teal]/gerber <folder|zip|rar> [what to write][/teal]  read a PCB job and
                 measure what a fab asks for — board size, min track width, min
                 track spacing, min drill, hole count — from the real geometry.
@@ -1137,20 +1142,16 @@ def _show_gerber(job, label: str = ""):
 
 
 
-def cmd_step(cfg, arg: str, attachments: list):
-    """/step [metal|plastic] <file.step> — measure a 3D CAD model.
-
-    The estimator's first hour on a moulding inquiry, done offline: every
-    part's formed size, thickness, holes, volume and weight, read from the
-    real geometry by core.stepfile. The customer's STEP file never leaves
-    this machine and no AI ever sees it — same rule as /gerber.
-    """
+def _step_measured(arg: str, attachments: list):
+    """The offline half both /step and /step-auto share: find the model,
+    measure it, save the Excel sheet and Prism's own plain drawing render.
+    Returns (report, out_dir, drawn) or None after explaining itself."""
     from core import stepfile as SF
 
     ok, why = SF.available()
     if not ok:
         ui.err(why)
-        return
+        return None
 
     mode = "metal"
     tokens = arg.strip().split()
@@ -1174,7 +1175,7 @@ def cmd_step(cfg, arg: str, attachments: list):
                 "  /step ~/Downloads/Assem1.STEP\n"
                 "  /step plastic ~/Downloads/housing.stp\n"
                 "  (or /attach the file, then /step)")
-        return
+        return None
 
     ui.info(f"📐  measuring {os.path.basename(target)} ({mode} moulding) — "
             "the design never leaves this machine; no AI sees the STEP file.")
@@ -1182,7 +1183,7 @@ def cmd_step(cfg, arg: str, attachments: list):
         report = SF.analyse(target, mode=mode)
     except SF.StepError as e:
         ui.err(str(e))
-        return
+        return None
 
     ui.panel(SF.report_text(report), title="What the model measures",
              style="teal")
@@ -1200,6 +1201,96 @@ def cmd_step(cfg, arg: str, attachments: list):
     ui.info("   drawing the parts…")
     drawn = SF.render_sheet(report, out_dir)
     ui.ok(f"drawing sheet   → {drawn['png'] or drawn['html']}")
+    return report, out_dir, drawn
+
+
+def cmd_step(cfg, arg: str, attachments: list):
+    """/step [metal|plastic] <file.step> — measure a 3D CAD model.
+
+    The estimator's first hour on a moulding inquiry, done offline: every
+    part's formed size, thickness, holes, volume and weight, read from the
+    real geometry by core.stepfile. The customer's STEP file never leaves
+    this machine and no AI ever sees it — same rule as /gerber.
+    """
+    _step_measured(arg, attachments)
+
+
+def cmd_step_auto(cfg, arg: str, attachments: list):
+    """/step-auto [metal|plastic] <file.step> — measure offline, then have
+    the visual agent draw the professional dimension sheet.
+
+    The split IS the security model: core.stepfile measures the customer's
+    model on this machine, and the only things that ever reach an AI are
+    the measured figures and Prism's own plain render of the parts. The
+    STEP file itself is never uploaded — same rule as /gerber, and the
+    prompt says so, so the agent cannot ask for it either.
+    """
+    from core import stepfile as SF
+
+    measured = _step_measured(arg, attachments)
+    if measured is None:
+        return
+    report, out_dir, drawn = measured
+
+    agents = C.active_agents(cfg)
+    artist = agents.get("visual") or agents.get("media")
+    if not artist:
+        ui.err("No image tool is set up — the measured sheet above is done, "
+               "but drawing the AI version needs a visual agent. Run /agents.")
+        return
+
+    try:
+        from core import automation
+        from core import files as F
+    except Exception as e:
+        ui.err(f"Automation deps not available ({e}). "
+               "The measured sheet above is still yours.")
+        return
+
+    # Only Prism's OWN render travels — never the customer's model. When the
+    # PNG could not be rendered (no Playwright), the numbers in the prompt
+    # carry the whole brief on their own.
+    files = []
+    if drawn.get("png"):
+        files.append(F.attach(drawn["png"]))
+    ui.info(f"🎨  asking {artist} to draw the dimensioned sheet — from the "
+            "measured numbers only; the STEP file stays here.")
+
+    made: list = []
+    responses, links = automation.run(
+        {}, cfg, attachments=files, chatgpt_analysis=False,
+        custom_stages=[("visual", artist, [SF.auto_brief(report)])],
+        query=f"draw a dimensioned fabrication sheet for {report['file']}",
+        pipeline_files_out=made)
+
+    kept = []
+    for rec in made:
+        src = rec.get("path", "") if isinstance(rec, dict) else str(rec)
+        if src and os.path.exists(src):
+            dest = os.path.join(out_dir,
+                                f"ai-sheet-{len(kept) + 1}"
+                                f"{os.path.splitext(src)[1] or '.png'}")
+            try:
+                shutil.copyfile(src, dest)
+                kept.append(dest)
+            except OSError:
+                pass
+    for p in kept:
+        ui.ok(f"AI drawing sheet → {p}")
+    if not kept:
+        texts = [t for t in (responses.get("visual") or []) if t.strip()]
+        if texts:
+            ui.warn("No image came back — what the agent said instead is in "
+                    "the saved run.")
+        else:
+            ui.warn("The agent returned nothing. Prism's own measured sheet "
+                    "above still stands.")
+    if links.get("visual"):
+        ui.info(f"Its tab: {links['visual']}")
+    saved = C.save_run({"query": f"/step-auto {arg}".strip(),
+                        "responses": responses, "links": links,
+                        "step": {"out_dir": out_dir, "ai_sheets": kept}})
+    ui.ok(f"Run saved → {saved}")
 
 
 def cmd_gerber(cfg, arg: str, attachments: list):
@@ -1796,6 +1887,9 @@ def _dispatch(cfg: dict, line: str, attachments: list) -> tuple[dict, bool]:
         cmd_email(cfg, line[len("/email"):].strip(), attachments)
     elif line.startswith("/boq"):
         cmd_boq(cfg, line[len("/boq"):].strip(), attachments)
+    elif line.startswith("/step-auto") or line.startswith("/stepauto"):
+        cmd_step_auto(cfg, line.split(" ", 1)[1] if " " in line else "",
+                      attachments)
     elif line.startswith("/step") or line == "/s" or line.startswith("/s "):
         cmd_step(cfg, line.split(" ", 1)[1] if " " in line else "", attachments)
     elif line.startswith("/gerber"):
