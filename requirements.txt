@@ -46,3 +46,8 @@ shapely
 
 # Prism Studio films an HTML page frame by frame — this is the browser engine.
 playwright>=1.44
+
+# /step reads the customer's 3D CAD model (sheet metal or plastic
+# moulding) with a real B-rep kernel, offline — same rule as the
+# Gerber add-on: the design never leaves the machine.
+cadquery
