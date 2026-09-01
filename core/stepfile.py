@@ -431,5 +431,10 @@ def auto_brief(report: dict) -> str:
         "Rules: use EXACTLY the numbers above — do not round, convert or "
         "invent any dimension, and do not add parts or holes that are not "
         "listed. Label every part with its name.",
+        "Never label any view 'flat pattern' or 'developed' — no unfolded "
+        "flat has been computed, and a fabricator would cut from it. Views "
+        "are of the FORMED part only. Do not state any tolerance, grade or "
+        "finish that is not written above; general notes may only say the "
+        "dimensions are in millimetres and hole positions are indicative.",
     ]
     return "\n".join(lines)
