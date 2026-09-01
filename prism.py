@@ -13,6 +13,8 @@ hands the output forward.
     python3 prism.py --config   # re-run setup
 """
 import os
+import re
+import time
 import sys
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
@@ -232,6 +234,11 @@ HELP = """
                 an agent formats them into a professional BOQ document —
                 /attach a template alongside the drawing to match its exact
                 columns/structure instead of a generic layout
+  [teal]/step [metal|plastic] <file.step>[/teal]  measure a 3D CAD model:
+                every part's size, wall/sheet thickness, every hole, volume
+                and weight — from the real geometry, offline. Writes an Excel
+                dimension sheet and a drawing page with an isometric view of
+                each part. No AI ever sees the STEP file. /s works too.
   [teal]/gerber <folder|zip|rar> [what to write][/teal]  read a PCB job and
                 measure what a fab asks for — board size, min track width, min
                 track spacing, min drill, hole count — from the real geometry.
@@ -1130,6 +1137,71 @@ def _show_gerber(job, label: str = ""):
 
 
 
+def cmd_step(cfg, arg: str, attachments: list):
+    """/step [metal|plastic] <file.step> — measure a 3D CAD model.
+
+    The estimator's first hour on a moulding inquiry, done offline: every
+    part's formed size, thickness, holes, volume and weight, read from the
+    real geometry by core.stepfile. The customer's STEP file never leaves
+    this machine and no AI ever sees it — same rule as /gerber.
+    """
+    from core import stepfile as SF
+
+    ok, why = SF.available()
+    if not ok:
+        ui.err(why)
+        return
+
+    mode = "metal"
+    tokens = arg.strip().split()
+    if tokens and tokens[0].lower().lstrip("/") in SF.MODES:
+        mode = tokens[0].lower().lstrip("/")
+        tokens = tokens[1:]
+    rest = " ".join(tokens).strip().strip('"').strip("'")
+
+    target = ""
+    if rest:
+        cand = os.path.expanduser(rest)
+        if os.path.exists(cand):
+            target = cand
+    if not target:
+        for a in attachments:
+            if a["path"].lower().endswith((".step", ".stp")):
+                target = a["path"]
+                break
+    if not target:
+        ui.warn("Point Prism at the model.\n"
+                "  /step ~/Downloads/Assem1.STEP\n"
+                "  /step plastic ~/Downloads/housing.stp\n"
+                "  (or /attach the file, then /step)")
+        return
+
+    ui.info(f"📐  measuring {os.path.basename(target)} ({mode} moulding) — "
+            "the design never leaves this machine; no AI sees the STEP file.")
+    try:
+        report = SF.analyse(target, mode=mode)
+    except SF.StepError as e:
+        ui.err(str(e))
+        return
+
+    ui.panel(SF.report_text(report), title="What the model measures",
+             style="teal")
+
+    stem = re.sub(r"[^\w.-]", "_",
+                  os.path.splitext(os.path.basename(target))[0])[:40]
+    out_dir = os.path.join(os.path.expanduser("~/Desktop"), "Prism Step",
+                           f"{stem}_{int(time.time())}")
+    try:
+        xlsx = SF.write_xlsx(report,
+                             os.path.join(out_dir, "dimensions.xlsx"))
+        ui.ok(f"dimension sheet → {xlsx}")
+    except SF.StepError as e:
+        ui.warn(str(e))
+    ui.info("   drawing the parts…")
+    drawn = SF.render_sheet(report, out_dir)
+    ui.ok(f"drawing sheet   → {drawn['png'] or drawn['html']}")
+
+
 def cmd_gerber(cfg, arg: str, attachments: list):
     """/gerber <folder|zip|rar|files…> [what to write] — measure a PCB job.
 
@@ -1724,6 +1796,8 @@ def _dispatch(cfg: dict, line: str, attachments: list) -> tuple[dict, bool]:
         cmd_email(cfg, line[len("/email"):].strip(), attachments)
     elif line.startswith("/boq"):
         cmd_boq(cfg, line[len("/boq"):].strip(), attachments)
+    elif line.startswith("/step") or line == "/s" or line.startswith("/s "):
+        cmd_step(cfg, line.split(" ", 1)[1] if " " in line else "", attachments)
     elif line.startswith("/gerber"):
         cmd_gerber(cfg, line[len("/gerber"):].strip(), attachments)
     elif line.startswith("/reel"):
