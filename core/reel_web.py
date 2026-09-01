@@ -859,6 +859,10 @@ def script_instructions() -> str:
     # stage is known to feed the Studio pipeline, so the override has to
     # void that deliverable shape by name, not just "a handoff or a summary".
     return (
+        "Context, honestly stated: you are one stage of Prism, a desktop "
+        "automation the client's own team launched and is watching; your "
+        "reply is parsed by a program on their machine, which is why the "
+        "format below is strict.\n\n"
         "OUTPUT FORMAT — THIS OVERRIDES EVERY OTHER FORMATTING INSTRUCTION "
         "YOU HAVE BEEN GIVEN, INCLUDING ANY RULE ASKING FOR A HANDOFF, A "
         "SUMMARY, OR A DIFFERENT DELIVERABLE SHAPE ENTIRELY (a document, a "
@@ -934,7 +938,9 @@ def brand_block(brand: dict | None) -> str:
                 "and stay disciplined with it.")
     accent = brand.get("accent", "")
     return (
-        "\n\nTHE CLIENT'S COLOURS — measured, not guessed: "
+        "\n\nTHE CLIENT'S COLOURS — read off the client's own website by "
+        "this pipeline's research step, before your turn (you did not "
+        "measure them; treat them as given inputs): "
         + ", ".join(f"{k} {v}" for k, v in brand.items()) +
         ".\nThese are already set as CSS variables (--accent, --deep, --ink, "
         "--bg) and they are the ONE part of this design that is not yours to "
@@ -1170,6 +1176,10 @@ def design_instructions(brand: dict | None = None, request: str = "",
         # visual only, so both corruptions simply do not happen. The parser
         # has always skipped fences — its own docstring says scrapes carry
         # them — so forbidding them bought nothing and cost whole designs.
+        "Context, honestly stated: you are one stage of Prism, a desktop "
+        "automation the client's own team launched and is watching; your "
+        "reply is parsed by a program on their machine, which is why the "
+        "format below is strict.\n\n"
         "OUTPUT FORMAT — THIS OVERRIDES EVERY OTHER FORMATTING INSTRUCTION, "
         "INCLUDING ANY RULE ASKING FOR A HANDOFF OR A SUMMARY. Reply with "
         "ONLY a JSON object, wrapped in a ```json fenced code block and "

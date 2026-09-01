@@ -568,7 +568,13 @@ def summarise(rows: list[dict], since: date | None = None,
             out.lost += 1
             reason = (row.get("Reason if lost") or "not given").strip() or "not given"
             out.reasons[reason] = out.reasons.get(reason, 0) + 1
-        elif status in (QUOTED, FOLLOWING_UP, NEGOTIATING, ACCEPTED):
+        elif status in (QUOTED, FOLLOWING_UP):
+            # Negotiating and Accepted both mean the customer already
+            # replied — counting them here is what made the dashboard's
+            # "Quotations with no answer yet" disagree with the working
+            # window's own "No answer yet" tab, which only ever counted
+            # these two. "Waiting on a reply" (EMAIL_WORKFLOW.md §8) means
+            # literally that: nothing has come back yet.
             out.waiting += 1
     return out
 
