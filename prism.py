@@ -1465,9 +1465,20 @@ def cmd_step_ask(cfg, arg: str, attachments: list):
                 else f"scale {ch['part']} x {ch['factor']:g}")
         ui.info(f"   ▸ {what}" + (f" — {ch['why']}" if ch["why"] else ""))
 
-    if not _ask_yes_no("Apply these to a COPY of the model? (the original "
-                       "file is never touched)", default=True):
-        ui.info("Not applied.")
+    # The approval page: every dimension before → after in one table, the
+    # drawing image beside it — so the user confirms against what they can
+    # SEE, not against terminal text. Nothing is built until they say Y.
+    review = SF.review_html(report, plan, out_dir, question=question)
+    ui.ok(f"review page → {review}")
+    try:
+        import webbrowser
+        webbrowser.open("file://" + review)
+    except Exception:
+        pass
+
+    if not _ask_yes_no("Reviewed the page — build modified.step now? (the "
+                       "original file is never touched)", default=True):
+        ui.info("Not built. The review page stays as the record of the plan.")
         ui.ok(f"Run saved → {C.save_run(record)}")
         return
     out_path = os.path.join(out_dir, "modified.step")
@@ -1488,6 +1499,9 @@ def cmd_step_ask(cfg, arg: str, attachments: list):
         SF.write_xlsx(after, os.path.join(out_dir, "dimensions_after.xlsx"))
     except SF.StepError:
         pass
+    # Same page, rewritten: the After column now holds the RE-MEASURED
+    # figures from the built file, and the banner says so.
+    SF.review_html(report, plan, out_dir, question=question, after=after)
     ui.ok(f"modified model → {out_path}")
     record["step_ask"]["modified"] = out_path
     record["step_ask"]["log"] = done["log"]
@@ -2173,7 +2187,11 @@ def _ask_yes_no(msg: str, default: bool = True) -> bool:
     deliberate 'no'."""
     from core.onboarding import _ask_confirm as _q_confirm, _Q
     if _Q:
-        return _q_confirm(msg, default=default)   # real widget: no buffer risk
+        # The widget reads the tty raw, so a paste remnant still sitting in
+        # the buffer becomes its keystrokes — drop it first or a stray 'n'
+        # answers the question before the user sees it.
+        _drain_pending_lines()
+        return _q_confirm(msg, default=default)
     for _ in range(3):
         _drain_pending_lines()                    # drop stale buffered input
         try:
@@ -2201,12 +2219,22 @@ def _prompt(text: str) -> str:
     # sees it rendered. This was the actual cause of "the folder-correction
     # prompt didn't even show up" — it fired and returned instantly against
     # stale buffered text, not against a real keypress.
+    #
+    # Plain input(), deliberately NOT the questionary widget. A pasted
+    # command with a newline in it (any copy of wrapped terminal text has
+    # one) submits at the first newline in either reader — but the widget
+    # runs the tty raw and swallows the REMAINING lines into its own
+    # buffer, where the select()-based drain below cannot see them. They
+    # then surfaced as keystrokes inside the NEXT widget: a /step-ask run
+    # lost half its question AND had its Y/n confirm answered "No" by the
+    # first stray 'n' in the leftovers. With canonical input() the
+    # remainder stays in the tty buffer, and the drain merges it back into
+    # one command — the whole paste survives.
     _drain_pending_lines()
     try:
-        import questionary
-        line = questionary.text(text, qmark="◈").ask() or ""
-    except Exception:
         line = input(text)
+    except EOFError:
+        line = ""
     extra = _drain_pending_lines()
     return _strip_paste_markers(
         f"{line} {extra}".strip() if extra else line)

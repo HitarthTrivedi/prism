@@ -629,3 +629,138 @@ def apply_plan(path: str, plan: dict, out_path: str) -> dict:
     os.makedirs(os.path.dirname(out_path) or ".", exist_ok=True)
     asm.export(out_path)
     return {"out": out_path, "log": log}
+
+
+def predicted_parts(report: dict, plan: dict) -> list[dict]:
+    """What the parts SHOULD measure after the plan — arithmetic on the
+    measured figures, for the review page. The real answer still comes from
+    re-measuring the built file; this is the promise the user approves."""
+    import copy
+    parts = copy.deepcopy(report["parts"])
+    for ch in plan.get("changes") or []:
+        for p in parts:
+            if ch["part"] not in ("all", p["name"]):
+                continue
+            if ch["op"] == "enlarge_hole":
+                for h in p["holes"]:
+                    if abs(h["dia_mm"] - ch["dia_mm"]) <= 0.05:
+                        h["dia_mm"] = ch["new_dia_mm"]
+                merged: dict[float, int] = {}
+                for h in p["holes"]:
+                    merged[h["dia_mm"]] = merged.get(h["dia_mm"], 0) + h["count"]
+                p["holes"] = [{"dia_mm": d, "count": c}
+                              for d, c in sorted(merged.items())]
+            elif ch["op"] == "scale":
+                f = ch["factor"]
+                p["size_mm"] = tuple(round(v * f, 2) for v in p["size_mm"])
+                p["thickness_mm"] = round(p["thickness_mm"] * f, 2)
+                p["volume_cm3"] = round(p["volume_cm3"] * f ** 3, 2)
+                p["holes"] = [{"dia_mm": round(h["dia_mm"] * f, 2),
+                               "count": h["count"]} for h in p["holes"]]
+    return parts
+
+
+def _holes_str(part: dict) -> str:
+    return " · ".join(f"Ø{h['dia_mm']:g} x {h['count']}"
+                      for h in part["holes"]) or "—"
+
+
+def review_html(report: dict, plan: dict, out_dir: str,
+                question: str = "", after: dict | None = None) -> str:
+    """The approval page: every dimension before and after, side by side,
+    with the drawing image — written BEFORE anything is built, so the user
+    confirms against what they can see, not against terminal text. Called
+    again with `after` (the re-measured report) once modified.step exists,
+    so the same page becomes the record of what was actually done."""
+    import html as _html
+
+    before = report["parts"]
+    shown = ([{"name": p["name"], "size_mm": p["size_mm"],
+               "thickness_mm": p["thickness_mm"],
+               "volume_cm3": p["volume_cm3"], "holes": p["holes"]}
+              for p in after["parts"]] if after
+             else predicted_parts(report, plan))
+    by_after = {p["name"]: p for p in shown}
+
+    if after:
+        banner = ("<div class='banner built'>modified.step is BUILT — the "
+                  "After column is re-measured from the new file, not "
+                  "predicted.</div>")
+    else:
+        banner = ("<div class='banner'>Nothing is built yet. This page is "
+                  "the plan — go back to the terminal and answer Y to "
+                  "write modified.step, or N to stop here.</div>")
+
+    def fmt(size):
+        return f"{size[0]:.2f} x {size[1]:.2f} x {size[2]:.2f}"
+
+    change_rows = []
+    for ch in plan.get("changes") or []:
+        what = (f"Hole Ø{ch['dia_mm']:g} → Ø{ch['new_dia_mm']:g}"
+                if ch["op"] == "enlarge_hole"
+                else f"Scale x {ch['factor']:g}")
+        change_rows.append(
+            f"<tr><td>{_html.escape(ch['part'])}</td>"
+            f"<td>{_html.escape(what)}</td>"
+            f"<td>{_html.escape(ch.get('why') or '')}</td></tr>")
+
+    part_rows = []
+    for p in before:
+        q = by_after.get(p["name"], p)
+        changed_size = p["size_mm"] != q["size_mm"]
+        changed_holes = _holes_str(p) != _holes_str(q)
+        mark = " class='changed'"
+        part_rows.append(
+            "<tr>"
+            f"<td>{_html.escape(p['name'])}</td>"
+            f"<td>{fmt(p['size_mm'])}</td>"
+            f"<td{mark if changed_size else ''}>{fmt(q['size_mm'])}</td>"
+            f"<td>{_holes_str(p)}</td>"
+            f"<td{mark if changed_holes else ''}>{_holes_str(q)}</td>"
+            f"<td>{p['thickness_mm']:.2f} → {q['thickness_mm']:.2f}</td>"
+            "</tr>")
+
+    advice = "".join(f"<li>{_html.escape(a)}</li>"
+                     for a in plan.get("advice") or [])
+    img = ("<h2>The part as measured</h2><img src='drawing.png'>"
+           if os.path.exists(os.path.join(out_dir, "drawing.png")) else "")
+
+    page = (
+        "<!doctype html><meta charset='utf-8'>"
+        f"<title>{_html.escape(report['file'])} — change review</title>"
+        "<style>body{font-family:-apple-system,Segoe UI,sans-serif;margin:32px "
+        "auto;max-width:1000px;color:#1c2733;background:#fafbfc;padding:0 16px}"
+        "h1{font-size:22px}h2{font-size:15px;margin-top:28px}"
+        "table{border-collapse:collapse;width:100%;font-size:13.5px}"
+        "th,td{border:1px solid #d7dade;padding:7px 10px;text-align:left}"
+        "th{background:#eef1f4}td.changed{background:#e7f6ec;font-weight:600}"
+        ".banner{background:#fff4d6;border:1px solid #e3c96e;padding:12px "
+        "16px;border-radius:8px;margin:14px 0;font-weight:600}"
+        ".banner.built{background:#e7f6ec;border-color:#7cc796}"
+        ".q{color:#41586e}img{max-width:100%;border:1px solid #d7dade;"
+        "border-radius:8px}.note{color:#8a6d1f;font-size:12.5px}</style>"
+        f"<h1>{_html.escape(report['file'])} — change review</h1>"
+        f"<p class='q'>Asked: {_html.escape(question)}</p>"
+        f"{banner}"
+        "<h2>Changes Prism will make"
+        + (" (made)" if after else "") + "</h2>"
+        "<table><tr><th>Part</th><th>Change</th><th>Why</th></tr>"
+        + "".join(change_rows) + "</table>"
+        "<h2>Every dimension, before → after</h2>"
+        "<table><tr><th>Part</th><th>Size before (mm)</th>"
+        f"<th>Size {'after' if after else 'after (predicted)'} (mm)</th>"
+        "<th>Holes before</th>"
+        f"<th>Holes {'after' if after else 'after (predicted)'}</th>"
+        "<th>t (mm)</th></tr>"
+        + "".join(part_rows) + "</table>"
+        + (f"<h2>For the designer (not applied)</h2><ul>{advice}</ul>"
+           if advice else "")
+        + img
+        + "<p class='note'>Measured offline by Prism — the STEP file never "
+          "left this machine; the edits run locally on a copy.</p>")
+
+    os.makedirs(out_dir, exist_ok=True)
+    path = os.path.join(out_dir, "review.html")
+    with open(path, "w", encoding="utf-8") as f:
+        f.write(page)
+    return path
