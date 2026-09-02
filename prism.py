@@ -12,6 +12,7 @@ hands the output forward.
     python3 prism.py --dry "…"  # show the routing plan only
     python3 prism.py --config   # re-run setup
 """
+import json
 import os
 import re
 import shutil
@@ -39,10 +40,27 @@ def run_query(cfg: dict, query: str, dry: bool, attachments: list | None = None,
     if attachments:
         ui.info(f"📎  {len(attachments)} file(s) attached to this task.")
     ui.info("🧠  asking Groq to split your task…")
-    try:
-        routing = router.route(query, cfg, attachments)
-    except Exception as e:
-        ui.err(str(e))
+    routing = None
+    for attempt in (1, 2):
+        try:
+            routing = router.route(query, cfg, attachments)
+            break
+        except json.JSONDecodeError:
+            # Raw parser noise ("Expecting ',' delimiter: line 7 column 13")
+            # is not an answer a person can act on. A garbled reply from a
+            # language model is usually a one-off — ask once more, and if it
+            # repeats say what to actually do about it.
+            if attempt == 1:
+                ui.warn("Groq's plan came back garbled — asking once more…")
+                continue
+            ui.err("Groq couldn't produce a readable plan for this task. "
+                   "Try rewording it in one sentence, or run the matching "
+                   "command directly (/help lists them).")
+            return
+        except Exception as e:
+            ui.err(str(e))
+            return
+    if routing is None:
         return
 
     ui.routing_plan(routing, C.active_agents(cfg))
@@ -2125,6 +2143,21 @@ def _flush_stdin_noise() -> None:
     _drain_pending_lines()
 
 
+def _strip_paste_markers(text: str) -> str:
+    """Remove bracketed-paste escape sequences from assembled input.
+
+    A terminal with bracketed paste on (macOS Terminal, iTerm, most Linux
+    terminals) wraps every paste in ESC[200~ … ESC[201~. The speak/type gate
+    reads its first character raw, so the marker's ESC arrived as "the first
+    typed character": the line no longer started with "/", a pasted
+    /step-ask command fell past the dispatcher into the task router, and the
+    interpreter hijacked the file path out of it — while the prompt echoed
+    an invisible escape code. Seen live; this strips the markers (and any
+    stray ESC) wherever input is put together."""
+    return (text.replace("\x1b[200~", "").replace("\x1b[201~", "")
+            .replace("\x1b", ""))
+
+
 def _ask_yes_no(msg: str, default: bool = True) -> bool:
     """A Y/n prompt that will NOT accept leftover buffered text as an answer.
 
@@ -2144,7 +2177,8 @@ def _ask_yes_no(msg: str, default: bool = True) -> bool:
     for _ in range(3):
         _drain_pending_lines()                    # drop stale buffered input
         try:
-            raw = input(f"{msg} [{'Y/n' if default else 'y/N'}] ").strip()
+            raw = _strip_paste_markers(
+                input(f"{msg} [{'Y/n' if default else 'y/N'}] ")).strip()
         except EOFError:
             return default
         low = raw.lower()
@@ -2174,7 +2208,8 @@ def _prompt(text: str) -> str:
     except Exception:
         line = input(text)
     extra = _drain_pending_lines()
-    return f"{line} {extra}".strip() if extra else line
+    return _strip_paste_markers(
+        f"{line} {extra}".strip() if extra else line)
 
 
 def _confirm_task(task: str) -> str:
@@ -2244,9 +2279,8 @@ def _get_input(cfg, attachments) -> tuple[str, bool]:
         except EOFError:
             return "", False
         extra = _drain_pending_lines()
-        full = ch + rest
-        if extra:
-            full = f"{full} {extra}"
+        full = _strip_paste_markers(
+            f"{ch}{rest} {extra}" if extra else ch + rest).strip()
         return _maybe_extract_files(full, cfg, attachments), False
 
     ui.info("🎤  recording — press SPACE again when you're done")
