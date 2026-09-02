@@ -114,7 +114,7 @@ def _is_formula(value) -> bool:
     return isinstance(value, str) and value.startswith("=")
 
 
-def _fill_drill_table(ws, job: dict, filled: list) -> int:
+def _fill_drill_table(ws, job: dict, filled: list, writes: dict) -> int:
     """One row per measured tool under 'HOLE SIZE'; leftover pre-printed
     placeholder rows zeroed so the form's own SUM counts only real drills.
     Stops at the first row that mentions TOTAL — that row is the form's."""
@@ -136,9 +136,9 @@ def _fill_drill_table(ws, job: dict, filled: list) -> int:
         if written < len(tools):
             t = tools[written]
             if not _is_formula(size_cell.value):
-                size_cell.value = _round2(t["dia_mm"])
+                writes[size_cell.coordinate] = _round2(t["dia_mm"])
             if not _is_formula(count_cell.value):
-                count_cell.value = t["hits"]
+                writes[count_cell.coordinate] = t["hits"]
             filled.append((size_cell.coordinate, "drill",
                            f"Ø{_round2(t['dia_mm']):g} x {t['hits']}"))
             written += 1
@@ -146,31 +146,181 @@ def _fill_drill_table(ws, job: dict, filled: list) -> int:
             # A pre-printed placeholder past the measured list — zero it so
             # the form's SUM row adds up to the real drill count.
             if not _is_formula(size_cell.value):
-                size_cell.value = None
+                writes[size_cell.coordinate] = None
             if not _is_formula(count_cell.value):
-                count_cell.value = 0
+                writes[count_cell.coordinate] = 0
         row += 1
     return written
+
+
+# ── writing: patch the copy, never rebuild it ────────────────────────────────
+# openpyxl's save() REBUILDS the workbook, and everything it does not model
+# is silently rebuilt wrong or dropped: the client's logo drawing came back
+# mangled and their printer settings (the page setup their form prints with)
+# vanished. The client's form is their document — photos, layout, print
+# margins and all — so the filled copy starts as a byte-for-byte copy of the
+# template and ONLY the sheet XML carrying the changed cells is rewritten.
+
+_XLSX_NS = "http://schemas.openxmlformats.org/spreadsheetml/2006/main"
+_REL_NS = ("http://schemas.openxmlformats.org/officeDocument/2006/"
+           "relationships")
+
+
+def _sheet_parts(zf) -> dict:
+    """{sheet title: 'xl/worksheets/sheetN.xml'} via workbook.xml + rels."""
+    import xml.etree.ElementTree as ET
+    rels = {}
+    root = ET.fromstring(zf.read("xl/_rels/workbook.xml.rels"))
+    for rel in root:
+        target = rel.get("Target", "").lstrip("/")
+        rels[rel.get("Id")] = (target if target.startswith("xl/")
+                               else "xl/" + target)
+    out = {}
+    wb = ET.fromstring(zf.read("xl/workbook.xml"))
+    for sheet in wb.iter(f"{{{_XLSX_NS}}}sheet"):
+        rid = sheet.get(f"{{{_REL_NS}}}id")
+        if rid in rels:
+            out[sheet.get("name")] = rels[rid]
+    return out
+
+
+def _cell_ref(coord: str) -> tuple[int, int]:
+    m = re.match(r"([A-Z]+)(\d+)", coord)
+    col = 0
+    for ch in m.group(1):
+        col = col * 26 + (ord(ch) - 64)
+    return int(m.group(2)), col
+
+
+def _cell_body(value) -> tuple[str, str]:
+    """(extra attribute, inner XML) for a cell holding `value`."""
+    if value is None:
+        return "", ""
+    if isinstance(value, str):
+        esc = (value.replace("&", "&amp;").replace("<", "&lt;")
+               .replace(">", "&gt;"))
+        return ' t="inlineStr"', f"<is><t>{esc}</t></is>"
+    num = str(value) if isinstance(value, int) else f"{value:g}"
+    return "", f"<v>{num}</v>"
+
+
+def _patch_sheet_xml(xml: bytes, writes: dict) -> bytes:
+    """Set (or clear) cell values by STRING surgery, never by re-serialising
+    the document. An XML library round-trip renames the sheet's namespace
+    prefixes (mc: became ns1:) and Excel then reports the client's file as
+    corrupt — so every byte outside the touched <c> elements stays exactly
+    as the client's own Excel wrote it. A cell holding a formula is left
+    alone; a missing cell is inserted in column order."""
+    text = xml.decode("utf-8")
+
+    for coord, value in writes.items():
+        row_n, col_n = _cell_ref(coord)
+        extra, inner = _cell_body(value)
+        m = re.search(rf'<c\b([^>]*?\br="{coord}"[^>]*?)(/>|>)', text)
+        if m:
+            attrs = re.sub(r'\s+t="[^"]*"', "", m.group(1))
+            if m.group(2) == "/>":
+                old_end = m.end()
+                body = ""
+            else:
+                close = text.index("</c>", m.end()) + len("</c>")
+                body = text[m.end():close - len("</c>")]
+                old_end = close
+            if "<f" in body:
+                continue                              # their arithmetic
+            new = (f"<c{attrs}{extra}/>" if not inner
+                   else f"<c{attrs}{extra}>{inner}</c>")
+            text = text[:m.start()] + new + text[old_end:]
+            continue
+        if value is None:
+            continue                                  # nothing to clear
+        cell = (f'<c r="{coord}"{extra}/>' if not inner
+                else f'<c r="{coord}"{extra}>{inner}</c>')
+        rm = re.search(rf'<row\b[^>]*?\br="{row_n}"[^>]*?(/>|>)', text)
+        if rm:
+            if rm.group(1) == "/>":
+                text = (text[:rm.start(1)] + ">" + cell + "</row>"
+                        + text[rm.end(1):])
+                continue
+            close = text.index("</row>", rm.end())
+            pos = close
+            for cm in re.finditer(r'<c\b[^>]*?\br="([A-Z]+\d+)"',
+                                  text[rm.end():close]):
+                if _cell_ref(cm.group(1))[1] > col_n:
+                    pos = rm.end() + cm.start()
+                    break
+            text = text[:pos] + cell + text[pos:]
+            continue
+        row_xml = f'<row r="{row_n}">{cell}</row>'
+        pos = None
+        for rm2 in re.finditer(r'<row\b[^>]*?\br="(\d+)"', text):
+            if int(rm2.group(1)) > row_n:
+                pos = rm2.start()
+                break
+        if pos is None:
+            end = text.find("</sheetData>")
+            if end == -1:
+                sd = re.search(r"<sheetData\s*/>", text)
+                if sd is None:
+                    continue
+                text = (text[:sd.start()] + "<sheetData>" + row_xml
+                        + "</sheetData>" + text[sd.end():])
+                continue
+            pos = end
+        text = text[:pos] + row_xml + text[pos:]
+    return text.encode("utf-8")
+
+
+def _patch_xlsx(template_path: str, out_path: str,
+                writes_by_sheet: dict) -> None:
+    """Copy the template byte-for-byte, then rewrite only the sheet XML
+    that carries changed cells — logo, drawings, print setup, styles and
+    every other part of the client's file stay exactly as they made it."""
+    import shutil
+    import zipfile
+
+    os.makedirs(os.path.dirname(out_path) or ".", exist_ok=True)
+    with zipfile.ZipFile(template_path) as zin:
+        parts = _sheet_parts(zin)
+        patched = {}
+        for title, writes in writes_by_sheet.items():
+            if writes and title in parts:
+                patched[parts[title]] = _patch_sheet_xml(
+                    zin.read(parts[title]), writes)
+        if not patched:
+            shutil.copyfile(template_path, out_path)
+            return
+        with zipfile.ZipFile(out_path, "w",
+                             zipfile.ZIP_DEFLATED) as zout:
+            for item in zin.infolist():
+                data = patched.get(item.filename) or zin.read(item.filename)
+                zout.writestr(item, data)
 
 
 def fill_form(job: dict, template_path: str, out_path: str,
               meta: dict | None = None) -> dict:
     """Write a filled COPY of the client's form; the template is never
-    touched. Returns {"out", "filled": [(cell, label, value)…],
-    "drill_rows": n}."""
+    touched, and neither is anything in the copy except the cells that
+    got a measured value. Returns {"out", "filled": [(cell, label,
+    value)…], "drill_rows": n}."""
     if not HAVE_XLSX:
         raise FormError("Filling an Excel form needs the openpyxl package.")
     template_path = os.path.abspath(os.path.expanduser(template_path))
     if not os.path.exists(template_path):
         raise FormError(f"No such template: {template_path}")
 
+    # openpyxl is the READER — it finds the labels, the formulas and the
+    # drill table. It never saves: writing goes through _patch_xlsx so the
+    # client's photos and layout survive.
     wb = openpyxl.load_workbook(template_path)
     answers = job.get("answers") or {}
     meta = meta or {}
     filled: list = []
     drills = 0
+    writes_by_sheet: dict = {}
 
     for ws in wb.worksheets:
+        writes = writes_by_sheet.setdefault(ws.title, {})
         for row in ws.iter_rows():
             for cell in row:
                 text = _label_text(cell.value)
@@ -188,12 +338,11 @@ def fill_form(job: dict, template_path: str, out_path: str,
                     target = ws.cell(row=cell.row, column=cell.column + 1)
                     if _is_formula(target.value):
                         break   # their arithmetic, never ours
-                    target.value = value
+                    writes[target.coordinate] = value
                     filled.append((target.coordinate, cell.value.strip(),
                                    value))
                     break
-        drills += _fill_drill_table(ws, job, filled)
+        drills += _fill_drill_table(ws, job, filled, writes)
 
-    os.makedirs(os.path.dirname(out_path) or ".", exist_ok=True)
-    wb.save(out_path)
+    _patch_xlsx(template_path, out_path, writes_by_sheet)
     return {"out": out_path, "filled": filled, "drill_rows": drills}
