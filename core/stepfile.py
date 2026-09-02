@@ -438,3 +438,194 @@ def auto_brief(report: dict) -> str:
         "dimensions are in millimetres and hole positions are indicative.",
     ]
     return "\n".join(lines)
+
+
+# ── /step-ask: a question → Groq's advice → an agent's plan → applied ───────
+# The customer's model still never leaves this machine. Groq gets measured
+# numbers and the question; the browser agent gets those plus Groq's advice;
+# and the geometry edits themselves happen HERE, in cadquery, on a copy.
+
+PLAN_OPS = ("enlarge_hole", "scale")
+
+
+def _part_lines(report: dict) -> str:
+    lines = []
+    for i, part in enumerate(report["parts"], 1):
+        L, W, H = part["size_mm"]
+        lines.append(f"{i}) {part['name']} — {L:.2f} x {W:.2f} x {H:.2f} mm "
+                     f"· wall/sheet t≈{part['thickness_mm']:.2f} mm · "
+                     f"volume {part['volume_cm3']:.2f} cm3")
+        if part["holes"]:
+            lines.append("   holes: " + " · ".join(
+                f"Ø{h['dia_mm']:g} x {h['count']}" for h in part["holes"]))
+    return "\n".join(lines)
+
+
+def ask_prompt(report: dict, question: str) -> str:
+    """What Groq is asked. Numbers and the question — never the model."""
+    o = report["overall_mm"]
+    return (
+        f"You are advising a {report['mode']} moulding shop on a customer's "
+        "part. The CAD model is confidential and cannot be shown to you — "
+        "everything known about it was measured offline and is below.\n\n"
+        f"Job: {report['file']} · assembly overall "
+        f"{o[0]:.2f} x {o[1]:.2f} x {o[2]:.2f} mm · "
+        f"{len(report['parts'])} part(s)\n"
+        f"{_part_lines(report)}\n\n"
+        f"The customer asks: {question}\n\n"
+        "Give short, numbered, practical suggestions grounded ONLY in the "
+        "figures above — do not invent features you cannot see. Where a "
+        "suggestion is a hole size change or an overall scale change, state "
+        "it precisely: which part, current Ø, new Ø (or scale factor), and "
+        "why. Mark anything that would need the customer's designer (ribs, "
+        "draft, wall changes) as their decision, not ours.")
+
+
+def plan_prompt(report: dict, question: str, suggestions: str) -> str:
+    """What the reviewing agent is asked: turn the advice into a strict
+    machine plan of ONLY the operations Prism can execute locally."""
+    return (
+        "You are the reviewing engineer. Below are offline measurements of "
+        "a confidential CAD model (the model itself is not shared) and a "
+        "first advisor's suggestions. Decide which changes are right, then "
+        "answer with ONE JSON object and nothing else.\n\n"
+        f"MEASURED ({report['mode']} moulding, {report['file']}):\n"
+        f"{_part_lines(report)}\n\n"
+        f"THE CUSTOMER ASKED: {question}\n\n"
+        f"FIRST ADVISOR SAID:\n{suggestions}\n\n"
+        "Prism can execute exactly two operations on the model, locally:\n"
+        '  {"op": "enlarge_hole", "part": "<part name or all>", '
+        '"dia_mm": <current>, "new_dia_mm": <bigger>, "why": "..."}\n'
+        '  {"op": "scale", "part": "<part name or all>", '
+        '"factor": <0.2..5>, "why": "..."}\n\n'
+        "Answer format:\n"
+        '{"changes": [ ...only the two ops above, only if truly right... ],\n'
+        ' "advice":  [ "every other worthwhile suggestion, as a sentence" ]}\n\n'
+        "Rules: use only part names and hole diameters that appear in the "
+        "measurements. A hole can only be enlarged, never shrunk. When no "
+        "executable change is justified, return an empty changes list — an "
+        "honest empty list beats an invented edit.")
+
+
+def _valid_change(ch) -> dict | None:
+    if not isinstance(ch, dict):
+        return None
+    part = str(ch.get("part") or "all").strip() or "all"
+    why = str(ch.get("why") or "")[:240]
+    try:
+        if ch.get("op") == "enlarge_hole":
+            dia, new = float(ch["dia_mm"]), float(ch["new_dia_mm"])
+            if not 0 < dia < new:
+                return None
+            return {"op": "enlarge_hole", "part": part, "dia_mm": round(dia, 2),
+                    "new_dia_mm": round(new, 2), "why": why}
+        if ch.get("op") == "scale":
+            factor = float(ch["factor"])
+            if not 0.2 <= factor <= 5 or factor == 1:
+                return None
+            return {"op": "scale", "part": part,
+                    "factor": round(factor, 4), "why": why}
+    except (KeyError, TypeError, ValueError):
+        return None
+    return None
+
+
+def parse_plan(texts: list[str]) -> tuple[dict | None, str]:
+    """Newest capture that parses — the tab also holds the prompt Prism
+    typed, which carries the example schema inside it."""
+    import json
+    for t in reversed([t for t in texts if t and t.strip()]):
+        s, e = t.find("{"), t.rfind("}") + 1
+        if s == -1 or e <= s:
+            continue
+        try:
+            raw = json.loads(t[s:e])
+        except ValueError:
+            continue
+        if not isinstance(raw, dict) or not (
+                "changes" in raw or "advice" in raw):
+            continue
+        changes = [c for c in map(_valid_change, raw.get("changes") or [])
+                   if c]
+        advice = [str(a).strip() for a in (raw.get("advice") or [])
+                  if str(a).strip()][:12]
+        return {"changes": changes, "advice": advice}, ""
+    return None, "The agent returned no JSON plan Prism could read."
+
+
+def _enlarged(shape, dia: float, new_dia: float):
+    """Cut a bigger cylinder along every existing axis of the Ø`dia` holes.
+    Enlarge only — shrinking would mean adding material, which a boolean
+    cut cannot do and _valid_change refuses upstream."""
+    bb = shape.BoundingBox()
+    span = (bb.xlen ** 2 + bb.ylen ** 2 + bb.zlen ** 2) ** 0.5 or 1.0
+    seen, cutters = set(), []
+    for f in shape.Faces():
+        if f.geomType() != "CYLINDER":
+            continue
+        cyl = BRepAdaptor_Surface(TopoDS.Face_s(f.wrapped)).Cylinder()
+        if abs(2 * cyl.Radius() - dia) > 0.05:
+            continue
+        ax = cyl.Axis()
+        loc, d = ax.Location(), ax.Direction()
+        key = (round(loc.X(), 1), round(loc.Y(), 1), round(loc.Z(), 1))
+        if key in seen:
+            continue
+        seen.add(key)
+        start = _cq.Vector(loc.X(), loc.Y(), loc.Z()) - \
+            _cq.Vector(d.X(), d.Y(), d.Z()) * span
+        cutters.append(_cq.Solid.makeCylinder(
+            new_dia / 2, 2 * span, pnt=start,
+            dir=_cq.Vector(d.X(), d.Y(), d.Z())))
+    for c in cutters:
+        shape = shape.cut(c)
+    return shape, len(seen)
+
+
+def _scaled(shape, factor: float):
+    """gp_Trsf, not transformGeometry: the general transform rewrites every
+    cylinder as a b-spline, and a hole that is no longer a CYLINDER face
+    vanishes from _holes_of — the re-measure would deny holes that exist."""
+    from OCP.BRepBuilderAPI import BRepBuilderAPI_Transform
+    from OCP.gp import gp_Pnt, gp_Trsf
+    t = gp_Trsf()
+    t.SetScale(gp_Pnt(0, 0, 0), factor)
+    return _cq.Shape.cast(
+        BRepBuilderAPI_Transform(shape.wrapped, t, True).Shape())
+
+
+def apply_plan(path: str, plan: dict, out_path: str) -> dict:
+    """Execute the validated plan on a COPY; the original file is never
+    written. Returns {"out": path, "log": [human lines]}."""
+    parts = load_parts(path)
+    by_name = dict(parts)
+    log = []
+    for ch in plan.get("changes") or []:
+        names = ([n for n, _s in parts] if ch["part"] == "all"
+                 else [n for n, _s in parts if n == ch["part"]])
+        if not names:
+            log.append(f"! no part called '{ch['part']}' — skipped")
+            continue
+        for name in names:
+            if ch["op"] == "enlarge_hole":
+                shape, n = _enlarged(by_name[name],
+                                     ch["dia_mm"], ch["new_dia_mm"])
+                if n:
+                    by_name[name] = shape
+                    log.append(f"Ø{ch['dia_mm']:g} → Ø{ch['new_dia_mm']:g} "
+                               f"on {name}: {n} hole(s) enlarged")
+                elif ch["part"] != "all":
+                    log.append(f"! no Ø{ch['dia_mm']:g} hole on {name} "
+                               "— skipped")
+            elif ch["op"] == "scale":
+                by_name[name] = _scaled(by_name[name], ch["factor"])
+                log.append(f"{name} scaled x {ch['factor']:g}")
+    if not any(not line.startswith("!") for line in log):
+        raise StepError("Nothing in the plan could be applied — "
+                        "the model was not written.")
+    asm = _cq.Assembly()
+    for name, _s in parts:
+        asm.add(by_name[name], name=name)
+    os.makedirs(os.path.dirname(out_path) or ".", exist_ok=True)
+    asm.export(out_path)
+    return {"out": out_path, "log": log}

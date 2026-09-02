@@ -244,6 +244,11 @@ HELP = """
                 measurement, then your image agent draws the professional
                 dimensioned sheet FROM THE MEASURED NUMBERS — the STEP file
                 still never leaves this machine.
+  [teal]/step-ask [metal|plastic] <file.step> <question>[/teal]  ask about
+                the part: Groq suggests from the measured figures, an agent
+                reviews them into an exact change plan, and Prism applies
+                the plan to a COPY of the model locally and re-measures it.
+                The STEP file never leaves this machine at any stage.
   [teal]/gerber <folder|zip|rar> [what to write][/teal]  read a PCB job and
                 measure what a fab asks for — board size, min track width, min
                 track spacing, min drill, hole count — from the real geometry.
@@ -1293,6 +1298,160 @@ def cmd_step_auto(cfg, arg: str, attachments: list):
     ui.ok(f"Run saved → {saved}")
 
 
+def cmd_step_ask(cfg, arg: str, attachments: list):
+    """/step-ask [metal|plastic] <file.step> <question> — advice, then a
+    reviewed change plan, then the changes applied to a COPY of the model.
+
+    Three hands, one rule. Groq gets the measured numbers and the question
+    and suggests; a browser agent reviews those suggestions against the
+    same numbers and answers with a strict JSON plan of only the operations
+    Prism can execute; Prism executes them HERE, in cadquery, and
+    re-measures the result. The customer's STEP file never leaves this
+    machine at any stage — the geometry work happens locally because Prism
+    is the one actually holding the file.
+    """
+    from core import router
+    from core import stepfile as SF
+
+    tokens = arg.strip().split()
+    mode = "plastic"
+    if tokens and tokens[0].lower().lstrip("/") in SF.MODES:
+        mode = tokens[0].lower().lstrip("/")
+        tokens = tokens[1:]
+    rest = " ".join(tokens)
+
+    target, question = "", ""
+    head = rest
+    while head:
+        cand = os.path.expanduser(head.strip().strip('"').strip("'"))
+        if os.path.exists(cand):
+            target = cand
+            question = rest[len(head):].strip()
+            break
+        if " " not in head:
+            break
+        head = head.rsplit(" ", 1)[0]
+    if not target:
+        for a in attachments:
+            if a["path"].lower().endswith((".step", ".stp")):
+                target, question = a["path"], rest
+                break
+    if not target:
+        ui.warn("Point Prism at the model and ask.\n"
+                "  /step-ask plastic ~/Downloads/housing.stp how do I make "
+                "this lighter?\n"
+                "  (or /attach the file, then /step-ask <question>)")
+        return
+    question = question or ("Suggest improvements for reliable, economical "
+                            f"{mode} moulding of this part.")
+
+    measured = _step_measured(f"{mode} {target}", attachments)
+    if measured is None:
+        return
+    report, out_dir, drawn = measured
+
+    api_key = cfg.get("api_key")
+    if not api_key:
+        ui.err("No Groq API key configured. Run /key to add one.")
+        return
+    ui.info("🧠  asking Groq — the measured numbers and your question only; "
+            "the STEP file stays here.")
+    try:
+        suggestions = router.groq_chat(
+            api_key, cfg.get("model", "llama-3.3-70b-versatile"),
+            SF.ask_prompt(report, question), temperature=0.4,
+            timeout=60).strip()
+    except Exception as e:
+        ui.err(f"Groq: {e}")
+        return
+    ui.panel(suggestions if len(suggestions) <= 2400
+             else suggestions[:2400] + "…",
+             title="💡  Suggested changes (from the measured figures)",
+             style="teal")
+
+    record = {"query": f"/step-ask {arg}".strip(),
+              "responses": {"groq": [suggestions]}, "links": {},
+              "step_ask": {"out_dir": out_dir, "question": question}}
+
+    agents = C.active_agents(cfg)
+    planner = next((agents[s] for s in ("brains", "content", "research")
+                    if agents.get(s)), None)
+    try:
+        from core import automation
+        from core import files as F
+    except Exception as e:
+        ui.warn(f"Automation deps not available ({e}) — the advice above "
+                "is the answer; nothing will be changed.")
+        planner = None
+    if not planner:
+        ui.ok(f"Run saved → {C.save_run(record)}")
+        return
+
+    if not _ask_yes_no(f"Have {planner} review this into an exact change "
+                       "plan Prism can apply?", default=True):
+        ui.ok(f"Run saved → {C.save_run(record)}")
+        return
+
+    files = [F.attach(drawn["png"])] if drawn.get("png") else []
+    responses, links = automation.run(
+        {}, cfg, attachments=files, chatgpt_analysis=False,
+        custom_stages=[("plan", planner,
+                        [SF.plan_prompt(report, question, suggestions)])],
+        query=f"review and plan CAD changes for {report['file']}")
+    record["responses"].update(responses)
+    record["links"] = links
+
+    texts = [t for t in (responses.get("plan") or []) if t.strip()]
+    plan, why = SF.parse_plan(texts)
+    if plan is None:
+        ui.err(why)
+        if links.get("plan"):
+            ui.info(f"Its tab: {links['plan']}")
+        ui.ok(f"Run saved → {C.save_run(record)}")
+        return
+
+    for a in plan["advice"]:
+        ui.info(f"   • (for the designer) {a}")
+    if not plan["changes"]:
+        ui.info("Nothing in the plan is a change Prism can apply by itself "
+                "— the advice above is the deliverable.")
+        ui.ok(f"Run saved → {C.save_run(record)}")
+        return
+    for ch in plan["changes"]:
+        what = (f"Ø{ch['dia_mm']:g} → Ø{ch['new_dia_mm']:g} on {ch['part']}"
+                if ch["op"] == "enlarge_hole"
+                else f"scale {ch['part']} x {ch['factor']:g}")
+        ui.info(f"   ▸ {what}" + (f" — {ch['why']}" if ch["why"] else ""))
+
+    if not _ask_yes_no("Apply these to a COPY of the model? (the original "
+                       "file is never touched)", default=True):
+        ui.info("Not applied.")
+        ui.ok(f"Run saved → {C.save_run(record)}")
+        return
+    out_path = os.path.join(out_dir, "modified.step")
+    try:
+        done = SF.apply_plan(target, plan, out_path)
+    except SF.StepError as e:
+        ui.err(str(e))
+        ui.ok(f"Run saved → {C.save_run(record)}")
+        return
+    for line in done["log"]:
+        (ui.warn if line.startswith("!") else ui.ok)(line)
+
+    after = SF.analyse(out_path, mode=mode)
+    ui.panel(SF.report_text(after),
+             title="After the changes (re-measured, not assumed)",
+             style="pink")
+    try:
+        SF.write_xlsx(after, os.path.join(out_dir, "dimensions_after.xlsx"))
+    except SF.StepError:
+        pass
+    ui.ok(f"modified model → {out_path}")
+    record["step_ask"]["modified"] = out_path
+    record["step_ask"]["log"] = done["log"]
+    ui.ok(f"Run saved → {C.save_run(record)}")
+
+
 def cmd_gerber(cfg, arg: str, attachments: list):
     """/gerber <folder|zip|rar|files…> [what to write] — measure a PCB job.
 
@@ -1887,6 +2046,9 @@ def _dispatch(cfg: dict, line: str, attachments: list) -> tuple[dict, bool]:
         cmd_email(cfg, line[len("/email"):].strip(), attachments)
     elif line.startswith("/boq"):
         cmd_boq(cfg, line[len("/boq"):].strip(), attachments)
+    elif line.startswith("/step-ask") or line.startswith("/stepask"):
+        cmd_step_ask(cfg, line.split(" ", 1)[1] if " " in line else "",
+                     attachments)
     elif line.startswith("/step-auto") or line.startswith("/stepauto"):
         cmd_step_auto(cfg, line.split(" ", 1)[1] if " " in line else "",
                       attachments)
