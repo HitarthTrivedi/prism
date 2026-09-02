@@ -1481,6 +1481,20 @@ def _apollo_url(base: str, filters: dict[str, list[str]]) -> str:
     return f"{root}?" + "&".join(parts)
 
 
+def _apollo_fallback_query(brief: str, limit: int = 60) -> str:
+    """A handful of plain words for Apollo's keyword box. Apollo's search is
+    not a chat prompt — a sentence typed into it matches nobody, while a few
+    words return a wide but real table — so the fallback takes the first
+    substantial line and keeps at most six words of it."""
+    import re as _re
+
+    line = next((ln.strip() for ln in brief.splitlines()
+                 if len(ln.strip()) > 20
+                 and not ln.strip().startswith("#")), brief.strip())
+    terms = _re.findall(r"[A-Za-z][A-Za-z&-]{2,}", line)
+    return " ".join(terms[:6])[:limit] or line[:limit]
+
+
 def _run_apollo(driver, agent_cfg: dict, stage: str, brief: str) -> list[str]:
     """Drive Apollo by URL from the filter block the previous stage wrote.
 
@@ -1507,13 +1521,13 @@ def _run_apollo(driver, agent_cfg: dict, stage: str, brief: str) -> list[str]:
         except Exception as e:
             ui.warn(f"   couldn't open the filtered search ({e})")
     else:
-        # Nothing structured came back. Take the longest line that looks like
-        # prose about who to find, and search on that.
+        # Nothing structured came back. Apollo's keyword box is not a chat
+        # prompt: a sentence typed into it matches nobody, while a handful
+        # of plain words returns a wide but real table — so the fallback is
+        # a few words, never a line of prose.
         ui.warn("   the previous stage sent no APOLLO filter block — falling "
-                "back to a plain keyword search")
-        words = [ln.strip() for ln in brief.splitlines()
-                 if len(ln.strip()) > 20 and not ln.strip().startswith("#")]
-        query = _bmp_safe((words[-1] if words else brief)[:cap])
+                "back to a short keyword search")
+        query = _bmp_safe(_apollo_fallback_query(brief))
         try:
             box = WebDriverWait(driver, agent_cfg.get("input_wait", 30)).until(
                 EC.presence_of_element_located(

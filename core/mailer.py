@@ -140,7 +140,31 @@ def prefers_lead_database(agent_name: str) -> bool:
     return (agent_name or "").strip() in LEAD_DATABASES
 
 
-def discovery_prompts(goal: str, finder: str = "") -> tuple[str, str]:
+def apollo_filter_prompt(goal: str) -> str:
+    """What Groq is asked BEFORE Apollo ever opens: turn the outreach goal
+    into Apollo's own filters. Apollo is a database, not a chatbot — it
+    takes short comma-separated values, one line per field, and rejects
+    anything long — so the filters are decided locally first and the block
+    below is all Apollo's stage prompt needs to carry."""
+    return (
+        "Turn this outreach goal into search filters for Apollo.io's People "
+        f"database.\nGOAL: {goal}\n\n"
+        "Apollo does not read sentences — every filter is a short "
+        "comma-separated value. Answer with EXACTLY this block and nothing "
+        "else, no bullets, no bold, no commentary:\n\n"
+        "HANDOFF FOR APOLLO\n"
+        "TITLES: 2-6 job titles of the person worth reaching\n"
+        "INDUSTRIES: 2-6 industry keywords describing the company\n"
+        "LOCATIONS: cities, states or countries from the goal\n"
+        "HEADCOUNT: one or more of 1-10, 11-20, 21-50, 51-100, 101-200, "
+        "201-500, 501-1000, 1001-2000, 2001-5000, 5001-10000, 10001+\n"
+        "KEYWORDS: up to 12 plain words further describing the company\n\n"
+        "Every line under 150 characters. Write 'any' for a field you "
+        "genuinely cannot narrow — never leave one out.")
+
+
+def discovery_prompts(goal: str, finder: str = "",
+                      filter_block: str = "") -> tuple[str, str]:
     """(research prompt, structuring prompt) for finding recipients that match
     a description — "the best-suited agencies in Vadodara", not one named
     org. Two stages because a research agent free-writes prose; asking it to
@@ -153,21 +177,35 @@ def discovery_prompts(goal: str, finder: str = "") -> tuple[str, str]:
     read its own results grid, not to recall companies — so the first prompt
     changes shape entirely. The structuring stage is identical either way,
     which is the point: whatever comes back becomes the same CSV.
+
+    `filter_block` is a ready 'HANDOFF FOR APOLLO' block (built locally by
+    Groq via apollo_filter_prompt). When given, it IS the research prompt's
+    payload: _run_apollo parses those exact lines into Apollo's search URL,
+    and the prose shrinks to one reading instruction — Apollo never gets a
+    paragraph, because a paragraph typed at Apollo returns nothing.
     """
     if prefers_lead_database(finder):
-        research = (
-            "Your ONLY task is to build a prospect list for this request: "
-            f"{goal}. Use the search filters — job title, company industry, "
-            "employee headcount, and location — to narrow to companies that "
-            "genuinely match, then read the results table. For each contact "
-            "with a verified work email, list: Company name, Website, Email, "
-            "and a one-line reason it fits. One per line, in the form: "
-            "Name — Website — Email — Reason. Only include rows where the "
-            "email is actually shown and marked verified; write exactly "
-            "'unknown' for anything locked, hidden behind credits, or shown "
-            "as a guess. Never reconstruct an address from a pattern. Do not "
-            "pad the list to hit a number."
-        )
+        if filter_block.strip():
+            research = (
+                "Read the filtered People table and list every contact with "
+                "a verified work email as: Name — Website — Email — Reason, "
+                "one per line. Write exactly 'unknown' for anything locked "
+                "or guessed; never reconstruct an address.\n\n"
+                + filter_block.strip())
+        else:
+            research = (
+                "Your ONLY task is to build a prospect list for this request: "
+                f"{goal}. Use the search filters — job title, company industry, "
+                "employee headcount, and location — to narrow to companies that "
+                "genuinely match, then read the results table. For each contact "
+                "with a verified work email, list: Company name, Website, Email, "
+                "and a one-line reason it fits. One per line, in the form: "
+                "Name — Website — Email — Reason. Only include rows where the "
+                "email is actually shown and marked verified; write exactly "
+                "'unknown' for anything locked, hidden behind credits, or shown "
+                "as a guess. Never reconstruct an address from a pattern. Do not "
+                "pad the list to hit a number."
+            )
         return research, _DISCOVERY_STRUCTURE
 
     research = (

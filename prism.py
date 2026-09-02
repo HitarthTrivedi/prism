@@ -651,7 +651,31 @@ def _discover_recipients(cfg, goal: str, source_files: list | None = None,
             f"draft AND send them an email — \"{goal}\"?", default=True):
         return []
 
-    research_q, structure_q = mailer.discovery_prompts(goal, agents[finder])
+    # A lead database takes FILTERS, not paragraphs — so the filters are
+    # decided here, by Groq, before Apollo ever opens. The block it writes
+    # is what _run_apollo parses straight into Apollo's own search URL; if
+    # Groq is unavailable the old prose prompt still works through the
+    # typed-search fallback.
+    filter_block = ""
+    if mailer.prefers_lead_database(agents[finder]):
+        try:
+            from core import router as _router
+            filter_block = _router.groq_chat(
+                cfg.get("api_key", ""),
+                cfg.get("model", "llama-3.3-70b-versatile"),
+                mailer.apollo_filter_prompt(goal), temperature=0, timeout=45)
+            if "HANDOFF FOR APOLLO" not in filter_block.upper():
+                filter_block = ""
+            else:
+                shown = "; ".join(
+                    ln.strip() for ln in filter_block.splitlines()
+                    if ":" in ln)[:200]
+                ui.info(f"🎯  filters decided locally first — {shown}")
+        except Exception:
+            filter_block = ""
+
+    research_q, structure_q = mailer.discovery_prompts(goal, agents[finder],
+                                                       filter_block)
     custom_stages = [
         ("research", agents[finder], [research_q]),
         ("structure", agents[structurer], [structure_q]),
