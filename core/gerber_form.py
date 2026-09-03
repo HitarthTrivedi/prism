@@ -514,3 +514,135 @@ def fill_form(job: dict, template_path: str, out_path: str,
     _patch_xlsx(template_path, out_path, writes_by_sheet)
     return {"out": out_path, "filled": filled, "drill_rows": drills,
             "units": units}
+
+
+# ── the AI fills the rest — from the email and pricing, never the design ────
+# The split IS the promise: Prism measures the Gerbers offline and fills
+# what it can; the fields left over (quantity, delivery, the customer's
+# terms) live in the inquiry email and the price list — files the owner
+# would forward to a colleague anyway. Those, and ONLY those, are shown to
+# an agent, which answers with field:value JSON. Prism validates the
+# answer and patches the cells itself — the AI never touches the file, and
+# an AI-read value can never overwrite a measured one, because only cells
+# that are STILL BLANK are ever offered.
+
+def blank_fields(path: str) -> list[str]:
+    """Labels on the form whose value cell is still empty — the fields
+    measurement could not fill. A label is any short text cell (a caption,
+    not a sentence) whose right-hand neighbour holds neither a value nor a
+    formula."""
+    if not HAVE_XLSX:
+        raise FormError("Reading an Excel form needs the openpyxl package.")
+    wb = openpyxl.load_workbook(path)
+    out, seen = [], set()
+    for ws in wb.worksheets:
+        for row in ws.iter_rows():
+            for cell in row:
+                if not isinstance(cell.value, str):
+                    continue
+                text = cell.value.strip()
+                if not text or len(text) > 40 or text.startswith("="):
+                    continue
+                target = ws.cell(row=cell.row, column=cell.column + 1)
+                if target.value is not None:
+                    continue
+                key = _label_text(text)
+                if key and key not in seen:
+                    seen.add(key)
+                    out.append(text.rstrip(":-").strip())
+    return out
+
+
+def ai_fill_prompt(filled: list, blanks: list[str], note: str = "") -> str:
+    """What the agent is asked. The design's absence is stated up front so
+    the agent neither asks for it nor pretends to have seen it."""
+    done = "\n".join(f"  {label}: {value}" for _c, label, value in filled
+                     if label != "drill")
+    todo = "\n".join(f"  - {b}" for b in blanks)
+    return (
+        "You are completing a PCB fabrication quotation form. The measured "
+        "half is DONE — Prism measured the Gerber files offline, and the "
+        "design itself is confidential and not shared with you.\n\n"
+        f"ALREADY FILLED (context only — never restate or change):\n{done}\n\n"
+        f"STILL BLANK fields:\n{todo}\n\n"
+        + (f"The owner's note: {note}\n\n" if note else "")
+        + "The attached documents are the customer's inquiry email, pricing "
+        "or spec sheets. Read them and answer with ONE JSON object and "
+        "nothing else:\n"
+        '{"fills": {"<field exactly as listed above>": "<value>", ...}}\n\n'
+        "Rules: every value must come from the attached documents (or plain "
+        "arithmetic on them). OMIT any field the documents do not answer — "
+        "an omitted field beats a guess. Keep values short: a number, a "
+        "word, a short phrase. Never invent a rate, a quantity or a spec.")
+
+
+def parse_fills(texts: list[str], blanks: list[str]) -> tuple[dict, str]:
+    """Newest capture that parses; only fields that were actually offered
+    survive, and values are clipped to cell size."""
+    import json
+    allowed = {_label_text(b): b for b in blanks}
+    for t in reversed([t for t in texts if t and t.strip()]):
+        s, e = t.find("{"), t.rfind("}") + 1
+        if s == -1 or e <= s:
+            continue
+        try:
+            raw = json.loads(t[s:e])
+        except ValueError:
+            continue
+        if not isinstance(raw, dict):
+            continue
+        fills = raw.get("fills") if isinstance(raw.get("fills"), dict) else (
+            raw if all(isinstance(v, (str, int, float))
+                       for v in raw.values()) else None)
+        if fills is None:
+            continue
+        out = {}
+        for key, value in fills.items():
+            label = allowed.get(_label_text(str(key)))
+            if label is None or value is None:
+                continue
+            if isinstance(value, (int, float)):
+                out[label] = value
+            else:
+                v = str(value).strip()
+                if v:
+                    out[label] = v[:120]
+        if out:
+            return out, ""
+        return {}, "The agent answered, but named no field that was blank."
+    return {}, "No JSON came back that Prism could read."
+
+
+def fill_by_label(path: str, out_path: str, fills: dict) -> dict:
+    """Patch {label: value} into the form the same way fill_form does —
+    value in the cell to the label's right, formulas never touched, every
+    other byte kept. Works on the already-filled copy, so the AI's fields
+    join the measured ones in one file."""
+    if not HAVE_XLSX:
+        raise FormError("Filling an Excel form needs the openpyxl package.")
+    wanted = {_label_text(k): v for k, v in fills.items()}
+    wb = openpyxl.load_workbook(path)
+    writes_by_sheet: dict = {}
+    filled: list = []
+    for ws in wb.worksheets:
+        writes = writes_by_sheet.setdefault(ws.title, {})
+        for row in ws.iter_rows():
+            for cell in row:
+                key = _label_text(cell.value)
+                if key not in wanted:
+                    continue
+                target = ws.cell(row=cell.row, column=cell.column + 1)
+                if _is_formula(target.value) or target.value is not None:
+                    continue        # measured or their arithmetic — never
+                writes[target.coordinate] = wanted[key]
+                filled.append((target.coordinate, cell.value.strip(),
+                               wanted[key]))
+    if os.path.abspath(out_path) == os.path.abspath(path):
+        # Patching a file into itself: zipfile would truncate the source
+        # mid-read. Stage next to it, then swap atomically.
+        tmp = out_path + ".patching"
+        _patch_xlsx(path, tmp, writes_by_sheet)
+        os.replace(tmp, out_path)
+    else:
+        _patch_xlsx(path, out_path, writes_by_sheet)
+    return {"out": out_path, "filled": filled}
