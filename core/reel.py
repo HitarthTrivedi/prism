@@ -1080,6 +1080,13 @@ def render(spec: dict, out_path: str, on_progress=None) -> str:
     from PIL import Image, ImageDraw
 
     exe = ffmpeg_path()
+    # Said before the first frame is drawn rather than found at minute four
+    # of the encode, where it costs the whole render and leaves a truncated
+    # .mp4 that looks like a file. KNOWN_ISSUES #12.
+    from . import ffmpeg as ffmpeg_tool
+    no_room = ffmpeg_tool.check_space(out_path)
+    if no_room:
+        raise ReelError(no_room)
     brand = Brand(**(spec.get("brand") or {}))
     fps = int(spec.get("fps", FPS))
     scenes = spec.get("scenes", [])

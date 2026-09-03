@@ -729,6 +729,12 @@ def render(spec: dict, out_path: str, on_progress=None,
     ok, why = available()
     if not ok:
         raise ReelError(why)
+    # Before the browser starts, not at minute four of the encode. See
+    # ffmpeg.check_space — KNOWN_ISSUES #12.
+    from . import ffmpeg as ffmpeg_tool
+    no_room = ffmpeg_tool.check_space(out_path)
+    if no_room:
+        raise ReelError(no_room)
     from playwright.sync_api import sync_playwright
 
     fps = int(spec.get("fps", DEFAULT_FPS))
