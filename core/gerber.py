@@ -290,7 +290,85 @@ def classify(paths: list[str]) -> list[dict]:
             "hint": _name_hint(os.path.basename(p)),
         })
     _resolve_numbered_layers(out)
+    _resolve_unknown_gerbers(out)
     return out
+
+
+def _resolve_unknown_gerbers(entries: list[dict]) -> None:
+    """Read the GEOMETRY of a Gerber whose name says nothing.
+
+    Older Indian CAD exports name every layer `031.GBR`, `03S.GBR`,
+    `03M.GBR` — the extension carries no meaning, and five real Eleteck
+    jobs measured as "no copper, no outline" because of it. The content
+    settles what the name cannot:
+
+      · copper — the file flashes PADS and draws TRACKS (both, in
+        numbers);
+      · outline — few or no pads, and its drawn length is roughly the
+        border of the whole job's bounding box (a frame, not artwork).
+
+    Everything else stays unknown ON PURPOSE: a silkscreen mistaken for
+    copper would put lettering strokes into "min track width". Finding
+    nothing is recoverable; a confident wrong layer is not.
+    """
+    unknowns = [e for e in entries
+                if e["role"] in ("unknown", "other")
+                and e["kind"] == "gerber" and e["size"] < 8_000_000]
+    if not unknowns:
+        return
+    stats = {}
+    for e in unknowns:
+        try:
+            layer = parse_gerber(e["path"])
+        except Exception:                               # noqa: BLE001
+            continue
+        pts = [p for _d, a, b in layer.draws for p in (a, b)]
+        pts += [at for _d, at in layer.flashes]
+        if not pts:
+            continue
+        xs, ys = [p[0] for p in pts], [p[1] for p in pts]
+        length = sum(((a[0] - b[0]) ** 2 + (a[1] - b[1]) ** 2) ** 0.5
+                     for _d, a, b in layer.draws)
+        stats[e["path"]] = {
+            "flashes": len(layer.flashes), "draws": len(layer.draws),
+            "bbox": (min(xs), min(ys), max(xs), max(ys)), "length": length}
+    if not stats:
+        return
+
+    all_x0 = min(s["bbox"][0] for s in stats.values())
+    all_y0 = min(s["bbox"][1] for s in stats.values())
+    all_x1 = max(s["bbox"][2] for s in stats.values())
+    all_y1 = max(s["bbox"][3] for s in stats.values())
+    perimeter = 2 * ((all_x1 - all_x0) + (all_y1 - all_y0))
+
+    coppers = [e for e in unknowns if e["path"] in stats
+               and stats[e["path"]]["flashes"] >= 8
+               and stats[e["path"]]["draws"] >= 15]
+    coppers.sort(key=lambda e: e["name"].lower())
+    for i, e in enumerate(coppers):
+        e["role"] = ("copper_top" if i == 0 else
+                     "copper_bottom" if i == len(coppers) - 1
+                     else "copper_inner")
+        e["label"] = (_ROLE_LABEL[e["role"]]
+                      + "  [recognised by its geometry, not its name]")
+
+    frames = []
+    for e in unknowns:
+        s = stats.get(e["path"])
+        if s is None or e in coppers or perimeter <= 0:
+            continue
+        b = s["bbox"]
+        covers = ((b[2] - b[0]) >= 0.7 * (all_x1 - all_x0)
+                  and (b[3] - b[1]) >= 0.7 * (all_y1 - all_y0))
+        ratio = s["length"] / perimeter
+        if covers and s["flashes"] <= 4 and 0.5 <= ratio <= 4:
+            frames.append((abs(ratio - 1), e))
+    if frames:
+        frames.sort(key=lambda t: t[0])
+        e = frames[0][1]
+        e["role"] = "outline"
+        e["label"] = (_ROLE_LABEL["outline"]
+                      + "  [recognised by its geometry, not its name]")
 
 
 def _resolve_numbered_layers(entries: list[dict]) -> None:
@@ -483,6 +561,12 @@ def parse_gerber(path: str) -> GerberLayer:
         if not op:
             continue
         g, xs, ys, is_, js, d = op.groups()
+        if d is not None and len(d) == 1:
+            # Old tools write D1/D2/D3 without the leading zero. Compared
+            # as strings against "01"/"02"/"03", every draw and flash in
+            # five real Eleteck jobs was silently ignored — whole layers
+            # read as empty.
+            d = "0" + d
         if d is None and (xs or ys):
             d = dop                      # modal: repeat the last operation
         elif d in ("01", "02", "03"):
@@ -718,7 +802,58 @@ def aperture_shape(shape: str, params: list[float], at=(0.0, 0.0), layer=None):
     return None
 
 
-def layer_copper(layer: GerberLayer):
+def glyph_dcodes(layer: GerberLayer) -> set:
+    """Apertures that are TEXT PENS, not track pens.
+
+    Old CAD text is stroked onto the copper with a thin round pen, and when
+    the letters overlap a track or pour they merge into a conductor island
+    — the pad-connectivity test in classify_copper() cannot see them. Five
+    real Eleteck jobs read "min line 10 mil" from their own part numbers on
+    boards routed at 12–50, and the Argus job read 9.8 against the fab's
+    11.8, all from this.
+
+    The tell is the SEGMENT, and the safeguards carry the weight. A letter
+    wiggles every fraction of a millimetre — the AST03 text pen's median
+    segment is 0.17 mm over 279 segments — while a track pen's segments
+    run straight between pads. A pen is called a text pen only when ALL of
+    these hold, so a genuinely thin routed board can never lose its answer:
+
+      · the pen is thin (≤ 0.45 mm) and busy (≥ 50 segments);
+      · its median segment is under 0.35 mm;
+      · a WIDER circular pen also draws serious length on the layer —
+        lettering annotates a board that has real tracks; a board routed
+        entirely at one thin width keeps that width.
+    """
+    per: dict[int, dict] = {}
+    for (d, a, b), is_dark in zip(layer.draws, layer.dark_flags):
+        if not is_dark:
+            continue
+        shape, params = layer.apertures.get(d, (None, []))
+        if shape != "C" or not params:
+            continue
+        seg = math.hypot(b[0] - a[0], b[1] - a[1])
+        row = per.setdefault(d, {"w": params[0], "lens": [], "total": 0.0})
+        row["lens"].append(seg)
+        row["total"] += seg
+
+    out = set()
+    for d, row in per.items():
+        if row["w"] > 0.45 or len(row["lens"]) < 40:
+            continue
+        lens = sorted(row["lens"])
+        median = lens[len(lens) // 2]
+        wider = sum(r["total"] for r in per.values()
+                    if r["w"] > row["w"] * 1.15)
+        # Tiny wiggles with any real tracks beside them; or slightly larger
+        # letters when the wider pens carry several times the ink (AST04's
+        # 12 mil class draws 21x the length of its 10 mil text pen).
+        if (median < 0.35 and wider >= 0.3 * row["total"]) or \
+                (median < 0.9 and wider >= 3.0 * row["total"]):
+            out.add(d)
+    return out
+
+
+def layer_copper(layer: GerberLayer, exclude_dcodes: set | None = None):
     """The layer's real copper, as one shapely geometry.
 
     Replayed as a SEQUENCE, in the order the file paints it. Clear-polarity
@@ -780,6 +915,8 @@ def layer_copper(layer: GerberLayer):
     for kind, payload, is_dark in layer.ops:
         if kind == "draw":
             dcode, a, b = payload
+            if exclude_dcodes and dcode in exclude_dcodes:
+                continue        # a text pen — lettering is not a conductor
             if (ops and ops[-1][0] == "path" and ops[-1][2] == is_dark
                     and ops[-1][1][0] == dcode and ops[-1][1][1][-1] == a):
                 ops[-1][1][1].append(b)
@@ -879,7 +1016,8 @@ def classify_copper(layer: GerberLayer, copper=None):
     return (conductors, markings) if conductors else (isl, [])
 
 
-def track_widths(layer: GerberLayer, conductors=None) -> list[dict]:
+def track_widths(layer: GerberLayer, conductors=None,
+                 exclude=None) -> list[dict]:
     """Every width copper was DRAWN with, and how much of it there is.
 
     Flashes are excluded — a 3 mm pad is not a 3 mm track — and so is
@@ -892,8 +1030,9 @@ def track_widths(layer: GerberLayer, conductors=None) -> list[dict]:
     """
     stats: dict[int, dict] = {}
     tree = STRtree(conductors) if (conductors and HAVE_SHAPELY) else None
+    exclude = exclude if exclude is not None else set()
     for (dcode, a, b), is_dark in zip(layer.draws, layer.dark_flags):
-        if not is_dark:
+        if not is_dark or dcode in exclude:
             continue
         shape, params = layer.apertures.get(dcode, (None, []))
         if shape != "C" or not params:
@@ -1731,6 +1870,17 @@ def analyse(paths: list[str], snap_mm: float = SNAP_MM, on_progress=None) -> dic
         row = {"name": entry["name"], "role": entry["role"], "widths": [],
                "min_width_mm": None, "spacing": None, "markings": 0,
                "conductors": 0, "widths_all": track_widths(layer)}
+        glyphs = glyph_dcodes(layer)
+        if glyphs:
+            pens = ", ".join(
+                f"{layer.apertures[d][1][0] / MM_PER_INCH * 1000:.0f} mil"
+                for d in sorted(glyphs) if layer.apertures.get(d, (0, []))[1])
+            warnings.append(
+                f"{entry['name']}: lettering stroked onto the copper with a "
+                f"thin text pen ({pens}) — excluded from track width and "
+                "spacing, which measure CONDUCTORS. Text overlapping a "
+                "track is invisible to the pad test; the stroke shape is "
+                "not.")
         conductors = None
         if HAVE_SHAPELY:
             try:
@@ -1738,6 +1888,23 @@ def analyse(paths: list[str], snap_mm: float = SNAP_MM, on_progress=None) -> dic
                 conductors, markings = classify_copper(layer, copper)
                 row["conductors"], row["markings"] = len(conductors), len(markings)
                 row["spacing"] = spacing(layer, snap_mm, conductors, copper)
+                if glyphs and row["spacing"] and row["spacing"].get("min_mm"):
+                    # Spacing is measured BOTH ways and the larger minimum
+                    # wins. With the text in, letter-to-letter gaps set the
+                    # answer (4.3 mil on a board whose conductors clear
+                    # 20). With the text out, a letter that BRIDGED two
+                    # pieces of one net leaves a fake gap between the
+                    # halves (0.05 mm on a witnessed job that clears
+                    # 0.094). Each error only ever shrinks the number, so
+                    # the true conductor clearance is the max of the two.
+                    try:
+                        c_ng = layer_copper(layer, exclude_dcodes=glyphs)
+                        cond_ng, _m = classify_copper(layer, c_ng)
+                        sp_ng = spacing(layer, snap_mm, cond_ng, c_ng)
+                        if (sp_ng.get("min_mm") or 0) > row["spacing"]["min_mm"]:
+                            row["spacing"] = sp_ng
+                    except GerberError:
+                        pass
                 # The everything-included figure is disclosure, not an
                 # answer — a customer who asks "what about the printing?"
                 # gets a number instead of a shrug. It costs a second full
@@ -1753,7 +1920,7 @@ def analyse(paths: list[str], snap_mm: float = SNAP_MM, on_progress=None) -> dic
                 warnings.append(str(e))
             except Exception as e:                          # pragma: no cover
                 warnings.append(f"{entry['name']}: spacing not measured ({e}).")
-        row["widths"] = track_widths(layer, conductors)
+        row["widths"] = track_widths(layer, conductors, exclude=glyphs)
         if not row["widths"]:
             row["widths"] = row["widths_all"]
         row["min_width_mm"] = row["widths"][0]["width_mm"] if row["widths"] else None
