@@ -70,6 +70,23 @@ def save(cfg: dict) -> None:
     temporary file first and swapping it in with os.replace (atomic on POSIX
     and on Windows) means the config is only ever the old one or the new one.
     """
+    # STALE-COPY GUARD. The GUI keeps a cfg dict in memory and hands copies to
+    # dialogs that live a while; a dialog saving its OWN older copy back would
+    # blank fields the user set meanwhile — most painfully the Groq key, the
+    # onboarded flag and the agent map, which reads as "why do I have to set
+    # Prism up AGAIN every launch". So before writing, any of those three this
+    # cfg would clear but that are still populated on disk are kept from disk.
+    # A real new value still overrides; only an accidental blanking is refused.
+    try:
+        if os.path.exists(CONFIG_PATH):
+            with open(CONFIG_PATH, "r", encoding="utf-8") as _f:
+                _disk = json.load(_f)
+            cfg = dict(cfg)
+            for _k in ("api_key", "onboarded", "agents"):
+                if not cfg.get(_k) and _disk.get(_k):
+                    cfg[_k] = _disk[_k]
+    except Exception:
+        pass        # an unreadable disk copy must not stop a legitimate save
     os.makedirs(CONFIG_DIR, exist_ok=True)
     tmp = f"{CONFIG_PATH}.tmp"
     try:
