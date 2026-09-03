@@ -1001,9 +1001,64 @@ def _fast_type(driver, element, text: str) -> bool:
             return ok && (el.innerText || el.textContent || '').trim().length > 0;
             """,
             element, text,
-        ))
+        )) and _text_landed(_composer_text(driver, element), text)
     except Exception:
         return False
+
+
+def _composer_text(driver, element) -> str:
+    """What is ACTUALLY in the box right now."""
+    try:
+        return driver.execute_script(
+            "const el = arguments[0];"
+            "return (el.tagName === 'TEXTAREA' || el.tagName === 'INPUT')"
+            " ? (el.value || '') : (el.innerText || el.textContent || '');",
+            element) or ""
+    except Exception:
+        return ""
+
+
+def _text_landed(actual: str, wanted: str) -> bool:
+    """Did the prompt reach the box — not "is the box non-empty".
+
+    That distinction is the bug this exists for. _fast_type's contenteditable
+    branch returned `ok && innerText.trim().length > 0`, so ANY text in the
+    editor counted as success: a partial insert, the previous prompt still
+    sitting there, or text that execCommand put somewhere else entirely
+    (execCommand acts on the document's selection, which after a file upload
+    is not reliably inside the composer). The textarea branch had always
+    checked `el.value === text` properly; only the editor every major tool
+    actually uses was taken on trust.
+
+    Whitespace-normalised and not exact, because a rich editor legitimately
+    reflows blank lines. The bulk of the text and its opening have to be
+    there, which no near-miss above passes.
+    """
+    tidy = lambda s: " ".join((s or "").split())
+    a, w = tidy(actual), tidy(wanted)
+    if not w:
+        return True
+    return len(a) >= int(len(w) * 0.9) and w[:60] in a
+
+
+def _prompt_was_sent(driver, element, wanted: str, timeout: int = 12) -> bool:
+    """Did the prompt actually go, or is it still sitting in the box?
+
+    Every chat tool empties its composer when it accepts a message, so the
+    prompt still being there after the submit is the signal that nothing
+    happened. Worth checking because the submit had no check at all:
+    `submitted = True` was set because `btn.click()` did not raise, and when
+    the composer is empty ChatGPT has no send button to click — so the
+    element_to_be_clickable wait timed out, the code fell through to ENTER on
+    an empty box, that did nothing, and Prism went on to wait 300 seconds for
+    a reply to a prompt it had never sent.
+    """
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        if not _text_landed(_composer_text(driver, element), wanted):
+            return True
+        time.sleep(0.5)
+    return False
 
 
 def _within(selector_list: str, descendant: str) -> str:
@@ -3326,6 +3381,10 @@ def run(routing: dict, cfg: dict, attachments=None, on_event=None,
                 if suffix:
                     questions = [q + "\n\n" + suffix for q in questions]
 
+                # Set when a prompt provably never reached the tool, so the
+                # stage does not then sit out its full wait_time cap watching
+                # a page nobody asked anything.
+                nothing_was_sent = False
                 for idx, prompt in enumerate(questions, 1):
                     try:
                         ui.info(f"   → prompt {idx}/{len(questions)}: {prompt[:80]}…")
@@ -3351,6 +3410,26 @@ def run(routing: dict, cfg: dict, attachments=None, on_event=None,
                                     textarea.send_keys(Keys.SHIFT, Keys.ENTER)
                         time.sleep(1)
 
+                        # The prompt has to BE there before it can be sent, and
+                        # neither route above proved it was. Re-finding the
+                        # element matters: uploading a file re-renders the
+                        # composer, so the node found before the upload can be
+                        # detached by now — typing into it succeeds and goes
+                        # nowhere, which is exactly the run that reported
+                        # "uploaded 1 file(s) → prompt 1/1" over a ChatGPT tab
+                        # whose box was empty.
+                        if not _text_landed(_composer_text(driver, textarea),
+                                            full_prompt):
+                            textarea = driver.find_element(
+                                By.CSS_SELECTOR, agent_cfg["textarea_selector"])
+                            _fast_type(driver, textarea, full_prompt)
+                            time.sleep(1)
+                        if not _text_landed(_composer_text(driver, textarea),
+                                            full_prompt):
+                            raise RuntimeError(
+                                f"the prompt would not go into {agent_name}'s "
+                                "message box — nothing was sent")
+
                         # Submit — try the button, fall back to Enter.
                         submitted = False
                         sel = agent_cfg.get("submit_selector", "")
@@ -3365,6 +3444,23 @@ def run(routing: dict, cfg: dict, attachments=None, on_event=None,
                         if not submitted:
                             textarea.send_keys(Keys.ENTER)
 
+                        # `submitted` only ever meant "click() did not raise".
+                        # A composer that still holds the prompt did not send
+                        # it — try the other route once, then say so rather
+                        # than waiting out the full cap for an answer to a
+                        # question nobody was asked.
+                        if not _prompt_was_sent(driver, textarea, full_prompt):
+                            try:
+                                textarea.send_keys(Keys.ENTER)
+                            except Exception:
+                                pass
+                            if not _prompt_was_sent(driver, textarea,
+                                                    full_prompt, timeout=8):
+                                raise RuntimeError(
+                                    f"{agent_name} would not accept the prompt "
+                                    "— it is still sitting in the message box")
+                        ui.info(f"   ✓  prompt {idx}/{len(questions)} sent")
+
                         if idx < len(questions):
                             # Let this answer finish before sending the next
                             # prompt. should_stop was missing here, unlike the
@@ -3376,6 +3472,30 @@ def run(routing: dict, cfg: dict, attachments=None, on_event=None,
                                        should_stop=stage_halt)
                     except Exception as e:
                         ui.err(f"   prompt error: {e}")
+                        if isinstance(e, RuntimeError):
+                            nothing_was_sent = True
+
+                if nothing_was_sent and not all_responses.get(stage):
+                    # Waiting the full cap here is how a stage that sent
+                    # nothing still cost five minutes and then reported "no
+                    # response scraped" — which reads as the tool being slow
+                    # rather than as Prism never having asked.
+                    note = (f"{agent_name} never received the prompt, so there "
+                            "is nothing to wait for. Its tab is open if you "
+                            "want to send it by hand.")
+                    ui.err(f"   {note}")
+                    all_links[stage] = _safe_url(driver, exclude=tuple(
+                        all_links.values()))
+                    emit("stage_error", {"stage": stage, "error": note,
+                                         "url": all_links.get(stage, "")})
+                    # Same shape every other failure uses, so
+                    # _retry_failed_stages can pick this stage up like any
+                    # other — a prompt that never landed is exactly the kind
+                    # worth retrying.
+                    failures[stage] = {"agent": agent_name,
+                                       "questions": questions,
+                                       "reason": note, "exhausted": False}
+                    continue
 
                 wait = agent_cfg.get("wait_time", 60)
                 # A caller that knows what a finished answer looks like says
