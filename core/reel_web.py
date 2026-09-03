@@ -110,12 +110,12 @@ def available() -> tuple[bool, str]:
         ffmpeg_path()
     except ReelError as e:
         return False, str(e)
-    try:
-        from playwright.sync_api import sync_playwright  # noqa: F401
-    except Exception:
-        return False, ("The web renderer needs Playwright:\n"
-                       "    pip install playwright && playwright install chromium")
-    return True, ""
+    # Checks the browser BINARY, not just that `import playwright` works —
+    # a packaged build has the Python package either way, and answering
+    # "ready" on the strength of that is what let a render start and then
+    # die on Playwright's own "Executable doesn't exist at …".
+    from . import browser
+    return browser.available()
 
 
 # ── the harness ─────────────────────────────────────────────────────────────
@@ -729,6 +729,12 @@ def render(spec: dict, out_path: str, on_progress=None,
     ok, why = available()
     if not ok:
         raise ReelError(why)
+    # Before the browser starts, not at minute four of the encode. See
+    # ffmpeg.check_space — KNOWN_ISSUES #12.
+    from . import ffmpeg as ffmpeg_tool
+    no_room = ffmpeg_tool.check_space(out_path)
+    if no_room:
+        raise ReelError(no_room)
     from playwright.sync_api import sync_playwright
 
     fps = int(spec.get("fps", DEFAULT_FPS))
@@ -754,8 +760,9 @@ def render(spec: dict, out_path: str, on_progress=None,
            "-pix_fmt", "yuv420p", "-movflags", "+faststart", out_path]
 
     faults: list[str] = []
+    from . import browser as _browser
     with sync_playwright() as p:
-        browser = p.chromium.launch(args=[
+        browser = _browser.launch_chromium(p, args=[
             "--force-color-profile=srgb",
             "--font-render-hinting=none",
             "--disable-lcd-text",
@@ -812,12 +819,13 @@ def inspect(spec: dict, at: float = 0.75) -> list[str]:
     if not ok:
         raise ReelError(why)
     from playwright.sync_api import sync_playwright
+    from . import browser as _browser
     fps = int(spec.get("fps", DEFAULT_FPS))
     plan, _ = _plan(spec, fps)
     faults: list[str] = []
     with sync_playwright() as p:
-        browser = p.chromium.launch(args=["--hide-scrollbars",
-                                          "--font-render-hinting=none"])
+        browser = _browser.launch_chromium(p, args=["--hide-scrollbars",
+                                                    "--font-render-hinting=none"])
         page = browser.new_page(viewport={"width": W, "height": H},
                                 device_scale_factor=1)
         try:
@@ -1917,11 +1925,12 @@ def parse_spec(text: str) -> dict:
 def still(spec: dict, at_frame: int, out_path: str) -> str:
     """One frame as a PNG. For looking at a design before committing to it."""
     from playwright.sync_api import sync_playwright
+    from . import browser as _browser
     fps = int(spec.get("fps", DEFAULT_FPS))
     with sync_playwright() as p:
-        browser = p.chromium.launch(args=["--hide-scrollbars",
-                                          "--font-render-hinting=none",
-                                          "--force-color-profile=srgb"])
+        browser = _browser.launch_chromium(p, args=["--hide-scrollbars",
+                                                    "--font-render-hinting=none",
+                                                    "--force-color-profile=srgb"])
         page = browser.new_page(viewport={"width": W, "height": H},
                                 device_scale_factor=1)
         try:

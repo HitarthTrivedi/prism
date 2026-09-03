@@ -141,6 +141,51 @@ def describe() -> str:
     return "not found"
 
 
+# A minute of 1080p H.264 out of this pipeline lands around 30-60 MB, and
+# FFmpeg needs working room on top of what it writes. 500 MB is comfortably
+# more than any reel Prism makes and small enough that it never refuses a
+# machine that could actually have finished.
+RENDER_HEADROOM_MB = 500
+
+
+def free_mb(path: str) -> int | None:
+    """Free space on the volume `path` will be written to, or None.
+
+    None when it cannot be determined — a filesystem that does not report it,
+    a path whose parents do not exist yet. The caller treats that as "carry
+    on": refusing to render because a disk-space probe failed would turn a
+    diagnostic into an outage.
+    """
+    import shutil as _shutil
+    probe = os.path.dirname(os.path.abspath(path)) or "."
+    while probe and not os.path.isdir(probe):
+        parent = os.path.dirname(probe)
+        if parent == probe:
+            return None
+        probe = parent
+    try:
+        return int(_shutil.disk_usage(probe).free / 1e6)
+    except OSError:
+        return None
+
+
+def check_space(out_path: str, need_mb: int = RENDER_HEADROOM_MB) -> str:
+    """"" if there is room to render, else a sentence saying there is not.
+
+    Checked BEFORE a render rather than discovered during one. A disk that
+    fills mid-encode gives FFmpeg's own "No space left on device" at minute
+    four of a seven-minute job, leaves a truncated .mp4 that looks like a
+    file, and costs the whole render — where the same fact stated up front
+    costs nothing and names the fix. KNOWN_ISSUES #12.
+    """
+    free = free_mb(out_path)
+    if free is None or free >= need_mb:
+        return ""
+    return (f"Not enough free space to make the video — about {free} MB left, "
+            f"and Prism needs around {need_mb} MB to work in. Free some space "
+            "and try again; nothing else has changed.")
+
+
 MISSING = (
     "Prism needs FFmpeg to turn the frames into a video. It is a free, "
     "standard program — Prism can fetch it for you, which takes about a "

@@ -27,7 +27,9 @@ machine, with one of:
 
   • ODA File Converter (free, more complete, GUI-first but scriptable):
         https://www.opendesign.com/guestfiles/oda_file_converter
-    Look for `ODAFileConverter` on PATH after installing.
+    On Windows it installs under %ProgramFiles%\\ODA\\ODAFileConverter*\\ and
+    does NOT add itself to PATH — find_dwg_converter() globs that location, so
+    no PATH surgery is needed there. On Linux, put `ODAFileConverter` on PATH.
 
 ensure_dxf() detects whichever is installed; if neither is, it raises a clear
 error naming both options rather than failing obscurely.
@@ -48,12 +50,17 @@ from __future__ import annotations
 import csv
 import math
 import os
+import platform
 import shutil
 import subprocess
 import sys
 import tempfile
 
 _CONVERTER_CANDIDATES = ["dwg2dxf", "ODAFileConverter", "ODAFileConverter.exe"]
+
+# An explicit path, for anyone who has a reason — same escape hatch
+# core/ffmpeg.py offers as PRISM_FFMPEG.
+ENV_CONVERTER = "PRISM_DWG_CONVERTER"
 
 # DXF $INSUNITS header codes worth naming — the common ones. Anything else is
 # reported as "unspecified (code N)" rather than guessed.
@@ -69,13 +76,142 @@ class BoqError(Exception):
 
 # ── DWG → DXF ──────────────────────────────────────────────────────────────
 
+def _installed_converter_paths() -> list[str]:
+    """Where a DWG converter actually lands when somebody installs one.
+
+    PATH alone was the whole search, and PATH is exactly where neither of
+    these puts itself:
+
+      · **ODA File Converter on Windows** installs to `C:\\Program Files\\ODA\\
+        ODAFileConverter <version>\\ODAFileConverter.exe` — a versioned folder,
+        and the installer adds nothing to PATH. So a customer who followed
+        Prism's own instructions, installed it, and restarted, was still told
+        "No DWG→DXF converter found on this machine".
+      · **LibreDWG from Homebrew on macOS** puts `dwg2dxf` in /opt/homebrew/bin
+        (or /usr/local/bin on Intel). That is on PATH in Terminal and NOT in
+        the environment a Finder-launched .app inherits — so it worked when a
+        developer ran Prism from a shell and failed for every customer who
+        double-clicked it.
+
+    Both are cases of "it IS installed and Prism cannot see it", which is
+    worse than not having it: the person has already done the work.
+    """
+    import glob
+    system = platform.system()
+    found: list[str] = []
+
+    if system == "Windows":
+        for var in ("PROGRAMFILES", "PROGRAMFILES(X86)", "PROGRAMW6432",
+                    "LOCALAPPDATA"):
+            root = os.environ.get(var)
+            if not root:
+                continue
+            # The folder carries the version, so it has to be matched
+            # rather than named: ODAFileConverter 25.4.0, 26.2.0, and so on.
+            #
+            # Sorted by _oda_version_key, NOT reverse-lexicographically as
+            # this first shipped — that ordering put "ODAFileConverter 9.0"
+            # above "25.4.0", because it compares "9" against "2" one
+            # character at a time. It passed its test by luck (25 vs 26 both
+            # start with a 2). mtime breaks a tie between two installs of the
+            # same version.
+            found += sorted(
+                glob.glob(os.path.join(root, "ODA", "ODAFileConverter*",
+                                       "ODAFileConverter.exe")),
+                key=lambda hit: (_oda_version_key(hit),
+                                 os.path.getmtime(hit)
+                                 if os.path.exists(hit) else 0),
+                reverse=True)          # newest version first
+            found.append(os.path.join(root, "ODA", "ODAFileConverter.exe"))
+    elif system == "Darwin":
+        found += [
+            "/Applications/ODAFileConverter.app/Contents/MacOS/ODAFileConverter",
+            os.path.expanduser("~/Applications/ODAFileConverter.app/Contents/"
+                               "MacOS/ODAFileConverter"),
+            "/opt/homebrew/bin/dwg2dxf",     # Apple Silicon Homebrew
+            "/usr/local/bin/dwg2dxf",        # Intel Homebrew
+        ]
+    else:
+        found += [
+            "/usr/bin/ODAFileConverter",
+            "/usr/local/bin/ODAFileConverter",
+            "/usr/bin/dwg2dxf",
+            "/usr/local/bin/dwg2dxf",
+        ]
+    return found
+
+
+
+def _oda_version_key(exe_path: str) -> tuple[int, int, int]:
+    """Pull a (major, minor, patch) version out of ODA's install-folder name
+    (e.g. '…\\ODAFileConverter 26.7.0\\…' or '…\\ODAFileConverter_title 25.6.0\\…',
+    and older 2-part or version-less folders). The version-less default folder
+    'ODAFileConverter' has no digits, so it sorts as (0, 0, 0) and loses to any
+    explicitly versioned install. Tolerates 1-, 2- or 3-component numbers so a
+    'ODAFileConverter 25.6' folder still ranks above a version-less one."""
+    import re
+    # Both separators, not os.path's. This is a WINDOWS path being parsed,
+    # and os.path.dirname on POSIX does not treat "\\" as a separator — so
+    # the whole path came back as one basename, no digits matched, and every
+    # install scored (0, 0, 0). Harmless on Windows, where it worked; fatal
+    # to testing it anywhere else, which is where the suite runs.
+    folder = exe_path.replace("\\", "/").rstrip("/").rsplit("/", 2)
+    folder = folder[-2] if len(folder) >= 2 else ""
+    m = re.search(r"(\d+)(?:\.(\d+))?(?:\.(\d+))?", folder)
+    if not m:
+        return (0, 0, 0)
+    return tuple(int(g) if g else 0 for g in m.groups())
+
+
+
 def find_dwg_converter() -> str | None:
+    """The DWG→DXF converter this machine should use, or None.
+
+    Four places, in the order core/ffmpeg.py already established for FFmpeg:
+    an explicit override, Prism's own tools directory, PATH, and then the
+    places an installer actually puts these — see _installed_converter_paths.
+
+    Prism's own tools folder is searched BEFORE PATH on purpose: a binary
+    somebody placed there deliberately should beat whatever PATH happens to
+    hold. Searched recursively, because the normal shape of a hand-placed
+    converter is an unzipped folder, not a loose executable.
+    """
+    override = os.environ.get(ENV_CONVERTER, "").strip()
+    if override and os.path.isfile(override) and os.access(override, os.X_OK):
+        return override
+
+    # ~/.prism/tools/** — the same directory FFmpeg is fetched into, so a
+    # converter dropped there is found with no PATH change, on any OS. Reached
+    # before PATH, and cheap: a small tree, walked once.
+    try:
+        from . import ffmpeg as _ffmpeg
+        tools = _ffmpeg.tools_dir()
+    except Exception:
+        tools = ""
+    if tools and os.path.isdir(tools):
+        import glob
+        for name in ("dwg2dxf.exe", "dwg2dxf",
+                     "ODAFileConverter.exe", "ODAFileConverter"):
+            for hit in sorted(glob.glob(os.path.join(tools, "**", name),
+                                        recursive=True)):
+                if os.path.isfile(hit):
+                    return hit
+
+    # Anything actually on PATH — `dwg2dxf` on macOS/Linux, or an
+    # ODAFileConverter a user deliberately PATH-added. shutil.which() honours
+    # PATHEXT on Windows, so the bare name already covers the .exe.
     for name in _CONVERTER_CANDIDATES:
         found = shutil.which(name)
         if found:
             return found
-    return None
 
+    # Last: where an installer actually puts these. ODA's Windows installer
+    # adds nothing to PATH, and Homebrew's bin is absent from the environment
+    # a Finder-launched .app inherits — both are "installed, and invisible".
+    for path in _installed_converter_paths():
+        if os.path.isfile(path) and os.access(path, os.X_OK):
+            return path
+    return None
 
 def _read_dxf(path: str):
     """Open a DXF, tolerating the kind of minor structural errors a
@@ -135,12 +271,30 @@ def dwg_to_dxf(dwg_path: str, out_dir: str | None = None) -> tuple[str, list[str
     docstring for what each fallback costs."""
     converter = find_dwg_converter()
     if not converter:
+        # Named per OS, because the previous text offered `brew install` and
+        # "on Linux…" and nothing else — so the one platform with no route at
+        # all was Windows, which is most of the customers this add-on is sold
+        # to. ODA File Converter is free, has a Windows installer, and is the
+        # answer on all three.
+        system = platform.system()
+        if system == "Windows":
+            how = ("  • ODA File Converter (free, Windows installer):\n"
+                   "    https://www.opendesign.com/guestfiles/oda_file_converter\n"
+                   "    Prism finds it automatically in its default install "
+                   "location afterwards — no PATH change needed. (Installed it "
+                   "somewhere custom? Add that folder to PATH.)\n")
+        elif system == "Darwin":
+            how = ("  • brew install libredwg     (gives the `dwg2dxf` tool)\n"
+                   "  • or ODA File Converter (free):\n"
+                   "    https://www.opendesign.com/guestfiles/oda_file_converter\n")
+        else:
+            how = ("  • ODA File Converter (free, .deb/.rpm — the simplest "
+                   "supported option):\n"
+                   "    https://www.opendesign.com/guestfiles/oda_file_converter\n"
+                   "    (or build LibreDWG from source to get `dwg2dxf`)\n")
         raise BoqError(
             "No DWG→DXF converter found on this machine. Install one:\n"
-            "  • brew install libredwg        (macOS, gives `dwg2dxf`)\n"
-            "  • On Linux, install ODA File Converter (the simplest supported option): "
-            "https://www.opendesign.com/guestfiles/oda_file_converter\n"
-            "    (or build LibreDWG from source to get `dwg2dxf`)\n"
+            + how +
             "Then re-run /boq — or convert it yourself and attach the .dxf directly."
         )
     out_dir = out_dir or tempfile.mkdtemp(prefix="prism_boq_")
@@ -193,19 +347,45 @@ def dwg_to_dxf(dwg_path: str, out_dir: str | None = None) -> tuple[str, list[str
             )
     else:
         # ODA File Converter's CLI takes (in_dir, out_dir, ver, type, recurse,
-        # audit, [filter]) — it converts a whole folder, not a single file.
+        # audit, [filter]) — it converts a whole folder, not a single file, so
+        # point it at the source's directory and filter to just this file.
         in_dir = os.path.dirname(os.path.abspath(dwg_path))
         cmd = [converter, in_dir, out_dir, "ACAD2018", "DXF", "0", "1",
                os.path.basename(dwg_path)]
+        # ODA's converter is a Qt GUI binary (CLI and GUI are one .exe), so a
+        # plain launch flashes a window on every run. Best-effort suppression,
+        # Windows-only: STARTUPINFO/SW_HIDE hides the window, CREATE_NO_WINDOW
+        # any console. Both are advisory for a GUI app that calls show() itself,
+        # so a brief flash may still slip through — but neither can break the
+        # conversion, and on macOS/Linux this stays the old call unchanged
+        # (startupinfo=None, creationflags=0).
+        run_kwargs: dict = {}
+        if os.name == "nt":
+            si = subprocess.STARTUPINFO()
+            si.dwFlags |= subprocess.STARTF_USESHOWWINDOW
+            si.wShowWindow = subprocess.SW_HIDE
+            run_kwargs["startupinfo"] = si
+            run_kwargs["creationflags"] = getattr(subprocess, "CREATE_NO_WINDOW", 0)
         try:
-            result = subprocess.run(cmd, capture_output=True, text=True, timeout=180)
+            result = subprocess.run(cmd, capture_output=True, text=True,
+                                    timeout=180, **run_kwargs)
         except Exception as e:
             raise BoqError(f"DWG→DXF conversion failed to run: {e}")
-        if result.returncode != 0 and not os.path.exists(out_path):
+        # ODA's return code is unreliable across versions (it can exit non-zero
+        # on success and, worse, zero after writing an empty .dxf), so trust the
+        # file, not the code: it must exist, be non-empty, and actually open in
+        # ezdxf — the same bar the dwg2dxf branch above holds its output to.
+        # This is the branch every Windows run takes; it must not be the weaker.
+        if not (os.path.exists(out_path) and os.path.getsize(out_path) > 0):
             raise BoqError(
-                f"DWG→DXF conversion failed (exit {result.returncode}): "
+                f"DWG→DXF conversion produced no usable .dxf (exit "
+                f"{result.returncode}): "
                 f"{(result.stderr or result.stdout or '').strip()[:400]}"
             )
+        try:
+            _read_dxf(out_path)
+        except BoqError as e:
+            raise BoqError(f"The converter wrote a .dxf that couldn't be read: {e}")
 
     if not os.path.exists(out_path):
         raise BoqError("Converter ran but produced no .dxf — check the source file opens in AutoCAD.")
@@ -573,7 +753,8 @@ def roles_text(cad, templates, images, notes) -> str:
     return "\n".join(lines)
 
 
-def standards_prompt(user_request: str, project_context: str = "") -> str:
+def standards_prompt(user_request: str, project_context: str = "",
+                     measured_text: str = "") -> str:
     """The RESEARCH stage: the design norms a quantity surveyor would look up
     before estimating a trade that hasn't been drawn yet.
 
@@ -582,17 +763,35 @@ def standards_prompt(user_request: str, project_context: str = "") -> str:
     a real pipeline rather than piling everything onto the writer. Camera
     spacing, max cable runs, containment conventions and the applicable
     standards are exactly what turns a derived quantity from a guess into a
-    defensible assumption."""
+    defensible assumption.
+
+    `measured_text`, when the drawing was measured, is the list of components
+    actually present. It is passed NOT for the researcher to quote back, but
+    to TARGET the research: norms for the real parts (a magnetic separator,
+    idler rollers, specific bolt grades) beat generic ones. Without it the
+    research is a guess at the trade from the request text alone."""
     where = f" Project context: {project_context}." if project_context.strip() else ""
+    # The component/layer names the drawing actually contains, so the norms
+    # looked up are for THESE parts. Names carry the signal (what to research);
+    # the researcher is told plainly not to echo the quantities or write a BOQ.
+    measured_block = (
+        "\n\nThe drawing HAS already been measured (a later stage owns the "
+        "actual numbers). Use the component / layer names below ONLY to decide "
+        "WHICH standards, standard sizes, material grades and rate bases to "
+        "research — for these specific parts, not generic ones. Do NOT quote "
+        "these quantities back, describe the site, or write a BOQ:\n"
+        f"{measured_text.strip()}"
+    ) if measured_text.strip() else ""
     return (
         "You are the RESEARCH stage of a Bill-of-Quantities pipeline. Your "
         "ONLY task is to set out the CURRENT STANDARD DESIGN NORMS a "
         "quantity surveyor or services estimator would apply when sizing "
         f"and estimating this work: {user_request}.{where}"
         "\n\nDo NOT write a BOQ, do not invent site quantities, and do not "
-        "describe this specific site — you have not seen it. Give the "
-        "general engineering rules of thumb and standards that a later stage "
-        "will apply to real measured site dimensions."
+        "describe this specific site. Give the general engineering rules of "
+        "thumb and standards that a later stage will apply to real measured "
+        "site dimensions."
+        f"{measured_block}"
         "\n\nCover, with SPECIFIC NUMBERS wherever they exist:"
         "\n  · typical spacing / coverage per device (e.g. metres between "
         "perimeter cameras, effective IR range, lux and lens guidance)"
@@ -811,10 +1010,28 @@ def formatting_prompt(quantities_text: str, project_context: str = "",
         "recalculate or contradict them."
     ) if has_cad else ""
     step2 = "\n\nSTEP 2 — BUILD THE BOQ." if has_cad else "\n\n"
+    # Stating a "basis" is not enough on its own: the writer will still invent a
+    # precise-but-wrong spec (a real run produced a "250 mm emergency-stop
+    # button" and "100 mm proximity sensor"). One physically-impossible figure
+    # makes an estimator distrust the whole document, so fabricated specifics
+    # are forbidden outright — describe the type, cite a genuine standard, or
+    # mark it TBC. Applies in every mode (measured, derived, spec-only).
+    plausibility_rule = (
+        " DO NOT FABRICATE COMPONENT SPECIFICATIONS. For a catalogue/bought-out "
+        "item, describe it by type and duty (e.g. 'emergency-stop pushbutton, "
+        "mushroom head, IP66, panel-mount') and leave the exact model, size and "
+        "rating to the supplier's selection — or cite a genuine standard value. "
+        "Never invent a precise-looking figure. Any dimension or rating you DO "
+        "state must be physically plausible for that component (a mushroom "
+        "E-stop head is ~40 mm across, not 250 mm; an inductive proximity "
+        "sensor is an M12–M30 barrel, not 100 mm). When unsure, give the type "
+        "and mark the exact size/rating 'to supplier spec (TBC)' rather than "
+        "guess — one impossible number discredits the entire BOQ."
+    )
     instructions = (
         f"Your task is: produce a professional Bill of Quantities (BOQ) "
         f"document.{context}{ground_truth}{cad_note}"
-        f"{step2}{derive_rule}{scope_rule} {structure} "
+        f"{step2}{derive_rule}{scope_rule} {structure}{plausibility_rule} "
         "Leave Rate/Amount columns blank for the quantity surveyor to fill "
         "in. Present it as clean tables. Note prominently at the top that "
         "rates are not included and quantities should be independently "

@@ -21,14 +21,59 @@ import webbrowser
 from . import agents as A
 from . import ui
 
-# Common Chrome binary locations across platforms.
-_CHROME_BINARIES = [
-    "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome",   # macOS
-    "/usr/bin/google-chrome",                                         # Linux
-    "/usr/bin/google-chrome-stable",
-    r"C:\Program Files\Google\Chrome\Application\chrome.exe",         # Windows
-    r"C:\Program Files (x86)\Google\Chrome\Application\chrome.exe",
-]
+def _chrome_binaries() -> list[str]:
+    """Where Chrome might be, on this machine specifically.
+
+    This was a flat list with two hardcoded Windows paths, both under
+    C:\\Program Files. Chrome's installer defaults to a PER-USER install
+    whenever it is run without administrator rights — which is the normal
+    case in an office — and that lands in %LOCALAPPDATA%\\Google\\Chrome\\
+    Application instead. Neither hardcoded path exists on such a machine.
+
+    The result was a split personality that took a while to make sense of:
+    RUNS worked, because undetected-chromedriver has its own finder and does
+    check LOCALAPPDATA, while LOGIN TABS said "Chrome not found — opening in
+    your default browser instead. Logins there will NOT carry into Prism's
+    runs." So the customer signed in, in the wrong browser, was told it would
+    not count, and then every tool in every run met a sign-in wall. Reported
+    as "the agents don't open".
+
+    Same four environment variables uc's own find_chrome_executable() uses,
+    for the same reason, plus PROGRAMW6432 — which is where a 32-bit process
+    has to look to see the real 64-bit Program Files.
+    """
+    if platform.system() == "Windows":
+        roots = [os.environ.get(v) for v in
+                 ("PROGRAMFILES", "PROGRAMFILES(X86)", "LOCALAPPDATA",
+                  "PROGRAMW6432")]
+        found, seen = [], set()
+        for root in roots:
+            if not root:
+                continue
+            path = os.path.join(root, "Google", "Chrome", "Application",
+                                "chrome.exe")
+            key = os.path.normcase(path)
+            if key not in seen:
+                seen.add(key)
+                found.append(path)
+        return found
+    if platform.system() == "Darwin":
+        return [
+            "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome",
+            os.path.expanduser("~/Applications/Google Chrome.app/Contents/"
+                               "MacOS/Google Chrome"),
+        ]
+    return [
+        "/usr/bin/google-chrome",
+        "/usr/bin/google-chrome-stable",
+        "/opt/google/chrome/chrome",
+        "/snap/bin/google-chrome",
+    ]
+
+
+# Resolved at import: these are installation locations, not something that
+# moves while Prism is running.
+_CHROME_BINARIES = _chrome_binaries()
 
 # Windows opens a console window for every subprocess unless told not to, and
 # in a frozen GUI build that is a black rectangle flashing over the app. Zero
@@ -279,7 +324,12 @@ def seed_profile(force: bool = False) -> bool:
 def _clear_profile_locks():
     """A run that was killed (or a crash) leaves SingletonLock behind, and the
     next launch then fails with 'profile appears to be in use'. The profile is
-    Prism's alone, so a leftover lock is always stale."""
+    Prism's alone, so a leftover lock is always stale.
+
+    POSIX only, in effect — Windows Chrome does not use these files at all,
+    it guards a profile with a named kernel object. _release_profile() is the
+    half that works there.
+    """
     for name in ("SingletonLock", "SingletonCookie", "SingletonSocket"):
         path = os.path.join(PROFILE_DIR, name)
         try:
@@ -287,6 +337,170 @@ def _clear_profile_locks():
                 os.remove(path)
         except OSError:
             pass
+
+
+def _chrome_pids_using_profile() -> list[int] | None:
+    """PIDs of every Chrome process currently holding Prism's OWN profile.
+
+    None — not [] — when the probe itself could not run. "I looked and found
+    nothing" and "I could not look" lead to opposite next steps, and
+    collapsing them is how a fix becomes a silent no-op: on Windows this
+    shells out to PowerShell, and if that fails for any reason (execution
+    policy, WMI disabled, no powershell.exe on PATH) an empty list would
+    read as "the profile is free", _release_profile would do nothing, and
+    the customer would get the original "cannot connect to chrome" back with
+    no clue why. The caller says so out loud instead.
+
+    Two conditions, and BOTH are load-bearing, because the result of this is
+    fed to a kill:
+
+      · the command line carries `--user-data-dir=<Prism's profile>`, which
+        nothing but Prism ever passes. The user's everyday Chrome cannot
+        match it, and must not — killing that would take their real work
+        with it.
+      · the program being run is Chrome itself.
+
+    The second one was missing at first and it mattered immediately: `ps`
+    reports full command lines, so ANY process whose arguments merely
+    mention the path matched — a shell running a script that names it, an
+    editor with the folder open. Caught by this function killing the very
+    shell that was testing it.
+    """
+    marker = "--user-data-dir=" + PROFILE_DIR
+    try:
+        if platform.system() == "Windows":
+            # Win32_Process, not tasklist: the command line is the only place
+            # the profile appears, and tasklist does not report it. The
+            # profile path goes through the ENVIRONMENT rather than into the
+            # script text, so a path containing a quote or a bracket can
+            # neither break the command nor be read as a wildcard.
+            #
+            # NOT ONE DOUBLE QUOTE in the script, which is why the obvious
+            # `-Filter "Name='chrome.exe'"` is a Where-Object test instead.
+            # Python builds a Windows command line with list2cmdline, which
+            # escapes an embedded " as \" — and powershell's -Command does
+            # not unescape it the way a C program's argv would, so the filter
+            # arrives as a parse error. That fails the whole probe, and a
+            # failed probe on Windows is precisely the case this function
+            # exists to handle. Verified by printing list2cmdline's output.
+            out = subprocess.check_output(
+                ["powershell", "-NoProfile", "-NonInteractive", "-Command",
+                 "Get-CimInstance Win32_Process | Where-Object { "
+                 "$_.Name -eq 'chrome.exe' -and $_.CommandLine -and "
+                 "$_.CommandLine.Contains($env:PRISM_PROFILE_ARG) } "
+                 "| ForEach-Object { $_.ProcessId }"],
+                text=True, stderr=subprocess.DEVNULL, timeout=30,
+                creationflags=_NO_WINDOW,
+                env={**os.environ, "PRISM_PROFILE_ARG": marker})
+        else:
+            raw = subprocess.check_output(["ps", "-Ao", "pid=,args="],
+                                          text=True, stderr=subprocess.DEVNULL,
+                                          timeout=15)
+            out = "\n".join(_posix_chrome_pids(raw, marker))
+    except Exception:
+        return None                    # could not look — not "nothing there"
+    pids = []
+    for token in out.split():
+        try:
+            pids.append(int(token))
+        except ValueError:
+            continue
+    return pids
+
+
+def _posix_chrome_pids(ps_output: str, marker: str) -> list[str]:
+    """The `ps -Ao pid=,args=` lines that are a Chrome on this profile."""
+    out = []
+    for line in ps_output.splitlines():
+        parts = line.split(None, 1)
+        if len(parts) != 2 or marker not in parts[1]:
+            continue
+        program = os.path.basename(parts[1].split()[0]).lower()
+        if "chrome" in program or "chromium" in program:
+            out.append(parts[0])
+    return out
+
+
+def _release_profile() -> int:
+    """Close any Chrome still holding Prism's profile. Returns how many.
+
+    Chrome allows exactly one browser process per user-data-dir. A second
+    launch does not fail and does not get its own browser — it hands its
+    command line to the instance already there and EXITS. undetected-
+    chromedriver launches Chrome itself with --remote-debugging-port and then
+    points chromedriver at that port, so when the launch it just made exits
+    instead of running, chromedriver reports:
+
+        session not created: cannot connect to chrome at 127.0.0.1:53695
+
+    which is the error a customer sent from Windows, and which Prism showed
+    them as a Chrome/driver VERSION mismatch — sending them to update a
+    browser that was working perfectly.
+
+    Two ordinary things leave a Chrome on the profile: Login tabs (see
+    open_login_tabs — it launches a plain Chrome on this same profile, and
+    people leave that window open), and a Prism that was killed or crashed
+    while a run was going, which never reaches shutdown(). On POSIX the
+    stale SingletonLock at least made this visible; on Windows there is no
+    lock file to find, and it simply repeats every run until a reboot.
+
+    Only reached when there is no live driver to reuse (see _get_driver), so
+    a Chrome found here is one Prism can no longer talk to — closing it
+    costs nothing and is the only way to get a browser at all.
+    """
+    pids = _chrome_pids_using_profile()
+    if pids is None:
+        # Said out loud, because the next thing the customer may see is the
+        # "cannot connect to chrome" this exists to prevent — and then the
+        # question is whether the guard ran and found nothing, or never ran.
+        ui.warn("   couldn't check for a leftover Chrome on Prism's profile. "
+                "If the browser fails to start, close every Chrome window and "
+                "try again.")
+        return 0
+    if not pids:
+        return 0
+    ui.info(f"   🧹  closing {len(pids)} leftover Chrome process(es) still "
+            f"holding Prism's browser profile")
+
+    # Ask first, insist second. A hard kill costs the very thing this profile
+    # exists for: Chrome keeps new cookies in memory and writes them out on a
+    # clean shutdown, so force-killing a window somebody has just signed in
+    # through throws that sign-in away — and the next run walks into the
+    # login wall the profile was supposed to prevent.
+    _signal_pids(pids, force=False)
+    left = pids
+    for _ in range(24):                 # up to ~6s to close gracefully
+        time.sleep(0.25)
+        left = _chrome_pids_using_profile()
+        if not left:
+            return len(pids)
+
+    _signal_pids(left, force=True)
+    for _ in range(12):
+        time.sleep(0.25)
+        if not _chrome_pids_using_profile():
+            break
+    return len(pids)
+
+
+def _signal_pids(pids: list[int], force: bool) -> None:
+    """Close (or, forced, kill) each process. Never raises."""
+    import signal as _signal
+    for pid in pids:
+        try:
+            if platform.system() == "Windows":
+                # /T takes the child processes with it — Chrome is a process
+                # tree, and the browser process alone leaving would strand
+                # its renderers on the profile.
+                subprocess.run(["taskkill", "/PID", str(pid), "/T"]
+                               + (["/F"] if force else []),
+                               stdout=subprocess.DEVNULL,
+                               stderr=subprocess.DEVNULL, timeout=15,
+                               creationflags=_NO_WINDOW)
+            else:
+                os.kill(pid, _signal.SIGKILL if force else _signal.SIGTERM)
+        except Exception:
+            continue
 
 
 # Preferences is a settings file. Anything past this is not settings.
@@ -445,13 +659,19 @@ def _setup_chrome_driver(version_main=None, reseed: bool = False):
         ui.info("   🍪  reusing Prism's browser profile (logins persist "
                 "between runs)")
     _clear_profile_locks()
+    _release_profile()
     _prune_preferences()
     _ensure_session_restore()
     tmp = PROFILE_DIR
 
-    opts = uc.ChromeOptions()
-    opts.add_argument("--profile-directory=Default")
-    opts.add_argument("--disable-blink-features=AutomationControlled")
+    # Built fresh per attempt: uc raises "you cannot reuse the ChromeOptions
+    # object" on a second Chrome() with the same instance, because it appends
+    # to the argument list rather than replacing it — so a retry needs its own.
+    def _options():
+        o = uc.ChromeOptions()
+        o.add_argument("--profile-directory=Default")
+        o.add_argument("--disable-blink-features=AutomationControlled")
+        return o
 
     # Match the driver to Chrome. A pin exists to work around DETECTION
     # failing, not to override what is actually installed — and Chrome
@@ -515,26 +735,77 @@ def _setup_chrome_driver(version_main=None, reseed: bool = False):
                     pass
 
     try:
-        drv = uc.Chrome(options=opts, user_data_dir=tmp,
+        drv = uc.Chrome(options=_options(), user_data_dir=tmp,
                         version_main=version_main)
         _reset_to_blank_tab(drv)
         return drv
     except Exception as e:
-        # Chrome updates itself about monthly, and for a day or two after a
-        # major release there may be no matching driver to download — as there
-        # is none on a machine behind a proxy that blocks the fetch. The raw
-        # Selenium traceback tells a business owner nothing, and this is the
-        # first thing that happens when they press Start the work.
-        detail = str(e).strip().splitlines()[0][:180] if str(e).strip() else ""
+        # One retry, because the two most common failures here are both
+        # recoverable and neither is a broken installation:
+        #
+        #   · A Chrome appeared on the profile between _release_profile()
+        #     above and this launch — Login tabs opened in another window,
+        #     say. Clear it and the second attempt gets its own browser.
+        #   · The driver for THIS major version cannot be had. Chrome
+        #     auto-updates roughly monthly and Chrome-for-Testing publishes
+        #     the matching chromedriver a little behind it, so for a day or
+        #     two `version_main=N` resolves to nothing (uc raises a bare
+        #     KeyError with the version number in it, and nothing else).
+        #     Unpinned, uc takes the latest stable driver instead, which
+        #     drives the new Chrome in every case the pin was going to fail.
+        _release_profile()
+        if version_main is not None:
+            ui.warn(f"   couldn't start Chrome for v{version_main} — retrying "
+                    "with whatever driver is current")
+        try:
+            drv = uc.Chrome(options=_options(), user_data_dir=tmp,
+                            version_main=None)
+            _reset_to_blank_tab(drv)
+            return drv
+        except Exception as retry_error:
+            e = retry_error   # the newer, and after a version drop the truer, one
+
+        # The raw Selenium traceback tells a business owner nothing, and this
+        # is the first thing that happens when they press Start the work.
+        #
+        # Two lines of it, not one: Selenium puts the failure on line one
+        # ("session not created: cannot connect to chrome at 127.0.0.1:53695")
+        # and WHY on line two ("from chrome not reachable"), and keeping only
+        # the first is what made every one of these look identical in the
+        # screenshots customers send.
+        lines = [ln.strip() for ln in str(e).strip().splitlines() if ln.strip()]
+        detail = " — ".join(lines[:2])[:240]
+        low = detail.lower()
+
+        # Three different failures used to be reported as one, and the one
+        # they were all reported as — "Chrome updated and the driver hasn't
+        # caught up" — sent people to update a browser that was fine.
+        if "could not determine browser executable" in low:
+            why = ("Prism drives Google Chrome, and it isn't installed here.\n\n"
+                   "  1. Install Google Chrome from google.com/chrome.\n"
+                   "  2. Start it once, then try again.\n\n"
+                   "Chrome specifically — Prism cannot use Edge, Safari or "
+                   "Firefox.")
+        elif "cannot connect to chrome" in low or "chrome not reachable" in low:
+            why = ("Chrome started and then closed again before Prism could "
+                   "reach it.\n\n"
+                   "  1. Close every Chrome window — including any Prism "
+                   "opened for signing in — and try again.\n"
+                   "  2. If it keeps happening, restart the computer; that "
+                   "clears it for certain.\n"
+                   "  3. Some antivirus and 'endpoint protection' tools block "
+                   "one program from starting another. If you have one, allow "
+                   "Prism through it.")
+        else:
+            why = ("This is almost always a version mismatch — Chrome updated "
+                   "itself and the matching driver isn't available yet.\n\n"
+                   "  1. Update Chrome (Chrome menu → About Google Chrome) and "
+                   "try again.\n"
+                   "  2. If you have pinned a version in Settings → Chrome, "
+                   "clear that box so Prism detects it automatically.")
+
         raise RuntimeError(
-            "Prism couldn't start Chrome.\n\n"
-            "This is almost always a version mismatch — Chrome updated itself "
-            "and the matching driver isn't available yet.\n\n"
-            "Two things fix it:\n"
-            "  1. Update Chrome (Chrome menu → About Google Chrome) and try "
-            "again.\n"
-            "  2. If you have pinned a version in Settings → Chrome, clear "
-            "that box so Prism detects it automatically.\n\n"
+            "Prism couldn't start Chrome.\n\n" + why + "\n\n"
             + (f"Technical detail: {detail}" if detail else "")) from e
 
 
@@ -578,6 +849,29 @@ def _upload_files(driver, agent_cfg, attachments, agent_name: str = ""):
 
     who = agent_name or "this tool"
     sel = agent_cfg.get("upload_selector", "input[type='file']")
+
+    # WAIT for it, don't just look once. run() navigates to the tool and
+    # sleeps `page_wait` (4 seconds by default) before getting here, and four
+    # seconds is not how long chatgpt.com or claude.ai take to render their
+    # composer on a cold profile — which is every Prism profile, since it
+    # keeps its own. The typing path has always waited properly for
+    # `textarea_selector` (WebDriverWait, input_wait, 15-30s); the upload path
+    # looked exactly once and, finding nothing, reported the tool as having no
+    # upload field at all and carried on without the customer's drawing. Same
+    # page, same moment, two different answers — the difference was only that
+    # one of them waited.
+    #
+    # presence, not visibility: a chat composer's <input type=file> is always
+    # hidden behind a paperclip button, and a visibility wait would time out
+    # on every tool in the registry. ChromeDriver sets files on a hidden input
+    # perfectly well — that is how this has always worked.
+    from selenium.webdriver.support.ui import WebDriverWait
+    from selenium.webdriver.support import expected_conditions as EC
+    try:
+        WebDriverWait(driver, agent_cfg.get("upload_wait", 20)).until(
+            EC.presence_of_element_located((By.CSS_SELECTOR, sel)))
+    except Exception:
+        pass        # fall through to the same message as before
     inputs = driver.find_elements(By.CSS_SELECTOR, sel)
     if not inputs:
         ui.warn(f"   ⚠️   {who} has no file-upload field on this page — "
@@ -585,6 +879,23 @@ def _upload_files(driver, agent_cfg, attachments, agent_name: str = ""):
                 "answer blind to them")
         return 0
     paths = F.upload_paths(attachments)
+    # ChromeDriver rejects the WHOLE send when any one path is missing
+    # ("invalid argument: File not found"), so one stale entry took every
+    # other attachment down with it. Files harvested from an earlier stage
+    # live in the system temp directory, which Windows and macOS both clean
+    # underneath a long run — so this is a normal thing to meet, not a
+    # corrupt state, and the right answer is to send the rest and say which
+    # one went.
+    missing = [p for p in paths if not os.path.isfile(p)]
+    if missing:
+        paths = [p for p in paths if os.path.isfile(p)]
+        ui.warn(f"   ⚠️   {len(missing)} attachment(s) are no longer on disk "
+                f"and can't be sent to {who}: "
+                + ", ".join(os.path.basename(p) for p in missing[:3])
+                + (f" (+{len(missing) - 3} more)" if len(missing) > 3 else ""))
+    if not paths:
+        return 0
+
     target = inputs[0]
     uploaded = 0
     try:
@@ -600,13 +911,25 @@ def _upload_files(driver, agent_cfg, attachments, agent_name: str = ""):
         bulk_reason = str(e).strip().splitlines()[0][:120] if str(e).strip() else "no detail"
         reasons = []
         for p in paths:
-            try:
-                for inp in driver.find_elements(By.CSS_SELECTOR, sel):
+            # EVERY matching input, not just the first. The try used to sit
+            # OUTSIDE this inner loop, so the first input raising jumped
+            # straight to the handler and the others were never reached —
+            # which made the fallback identical to the bulk attempt that had
+            # just failed. Pages that keep several file inputs around (a
+            # composer's, plus one behind an "attach" menu) only accept one
+            # of them, and it is not reliably the first in the DOM.
+            sent, detail = False, "no file input accepted it"
+            for inp in driver.find_elements(By.CSS_SELECTOR, sel):
+                try:
                     inp.send_keys(p)
-                    uploaded += 1
+                    sent = True
                     break
-            except Exception as pe:
-                detail = str(pe).strip().splitlines()[0][:120] if str(pe).strip() else "no detail"
+                except Exception as pe:
+                    text = str(pe).strip().splitlines()[0] if str(pe).strip() else ""
+                    detail = text[:120] or detail
+            if sent:
+                uploaded += 1
+            else:
                 reasons.append(f"{os.path.basename(p)} ({detail})")
         if uploaded:
             ui.info(f"   📎  uploaded {uploaded} file(s)")
@@ -678,9 +1001,109 @@ def _fast_type(driver, element, text: str) -> bool:
             return ok && (el.innerText || el.textContent || '').trim().length > 0;
             """,
             element, text,
-        ))
+        )) and _text_landed(_composer_text(driver, element), text)
     except Exception:
         return False
+
+
+def _composer_text(driver, element) -> str:
+    """What is ACTUALLY in the box right now."""
+    try:
+        return driver.execute_script(
+            "const el = arguments[0];"
+            "return (el.tagName === 'TEXTAREA' || el.tagName === 'INPUT')"
+            " ? (el.value || '') : (el.innerText || el.textContent || '');",
+            element) or ""
+    except Exception:
+        return ""
+
+
+def _text_landed(actual: str, wanted: str) -> bool:
+    """Did the prompt reach the box — not "is the box non-empty".
+
+    That distinction is the bug this exists for. _fast_type's contenteditable
+    branch returned `ok && innerText.trim().length > 0`, so ANY text in the
+    editor counted as success: a partial insert, the previous prompt still
+    sitting there, or text that execCommand put somewhere else entirely
+    (execCommand acts on the document's selection, which after a file upload
+    is not reliably inside the composer). The textarea branch had always
+    checked `el.value === text` properly; only the editor every major tool
+    actually uses was taken on trust.
+
+    Whitespace-normalised and not exact, because a rich editor legitimately
+    reflows blank lines. The bulk of the text and its opening have to be
+    there, which no near-miss above passes.
+    """
+    tidy = lambda s: " ".join((s or "").split())
+    a, w = tidy(actual), tidy(wanted)
+    if not w:
+        return True
+    return len(a) >= int(len(w) * 0.9) and w[:60] in a
+
+
+def _prompt_was_sent(driver, element, wanted: str, timeout: int = 12) -> bool:
+    """Did the prompt actually go, or is it still sitting in the box?
+
+    Every chat tool empties its composer when it accepts a message, so the
+    prompt still being there after the submit is the signal that nothing
+    happened. Worth checking because the submit had no check at all:
+    `submitted = True` was set because `btn.click()` did not raise, and when
+    the composer is empty ChatGPT has no send button to click — so the
+    element_to_be_clickable wait timed out, the code fell through to ENTER on
+    an empty box, that did nothing, and Prism went on to wait 300 seconds for
+    a reply to a prompt it had never sent.
+    """
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        if not _text_landed(_composer_text(driver, element), wanted):
+            return True
+        time.sleep(0.5)
+    return False
+
+
+def _within(selector_list: str, descendant: str) -> str:
+    """"<list> img" done properly — `<a> img, <b> img`, not `<a>, <b> img`.
+
+    A response_selector is a selector LIST: ChatGPT's is three alternatives,
+    Claude's four, because those sites serve different markup to different
+    accounts on the same day. `f"{sel} img"` reads as "everything in the list
+    EXCEPT the last one, plus images inside the last one" — the descendant
+    combinator binds tighter than the comma. Written out, ChatGPT's came to:
+
+        [data-message-author-role='assistant'],      ← the message DIV itself
+        [data-message-role='assistant'],             ← ditto
+        .markdown.prose img                          ← only this branch scoped
+
+    So the harvesters got message CONTAINERS back, not images or links. Both
+    then treated a <div> as the thing they were looking for: `get_attribute
+    ("src")` and `get_attribute("href")` are None on a div, so every one was
+    skipped — and because the list HAD matched something, neither fell back
+    to searching the whole page. The net effect was that a generated image
+    and a generated .docx were invisible to Prism on the two most-used tools
+    in the registry, every single time.
+
+    Splitting is comma-aware of brackets, parens and quotes: `[data-x='a,b']`
+    and `:is(.a, .b)` are both legal in a selector and both contain a comma
+    that does not end an alternative.
+    """
+    parts, current, depth, quote = [], [], 0, ""
+    for char in selector_list:
+        if quote:
+            if char == quote:
+                quote = ""
+        elif char in "'\"":
+            quote = char
+        elif char in "([":
+            depth += 1
+        elif char in ")]":
+            depth = max(0, depth - 1)
+        elif char == "," and depth == 0:
+            parts.append("".join(current))
+            current = []
+            continue
+        current.append(char)
+    parts.append("".join(current))
+    return ", ".join(f"{p.strip()} {descendant}" for p in parts if p.strip())
 
 
 def _harvest_images(driver, agent_cfg, stage: str) -> list[dict]:
@@ -700,7 +1123,7 @@ def _harvest_images(driver, agent_cfg, stage: str) -> list[dict]:
     imgs = []
     try:
         if sel:
-            imgs = driver.find_elements(By.CSS_SELECTOR, f"{sel} img")
+            imgs = driver.find_elements(By.CSS_SELECTOR, _within(sel, "img"))
         if not imgs:
             imgs = driver.find_elements(By.CSS_SELECTOR, "img")
     except Exception:
@@ -780,6 +1203,87 @@ _HARVESTABLE_EXTS = (
     ".mp3", ".wav", ".m4a", ".ogg", ".flac", ".aac",
 )
 
+# A blob: download button (ChatGPT/Claude canvas export) hands back an
+# extension-less href and usually no `download` filename, so the deliverable
+# used to land as "..._file1" with NO suffix — the OS typed it as a generic
+# "File", Prism couldn't preview it, and it read as "the PDF wasn't taken" even
+# though the bytes were right there. The real type is recoverable two ways: the
+# data: URL FileReader returns names the MIME type, and failing that the bytes
+# start with a recognisable magic number. This map covers the office/doc types
+# `mimetypes.guess_extension` gets wrong or refuses cross-platform.
+_MIME_EXT = {
+    "application/pdf": ".pdf",
+    "text/plain": ".txt",
+    "text/markdown": ".md",
+    "text/csv": ".csv",
+    "text/html": ".html",
+    "application/json": ".json",
+    "application/zip": ".zip",
+    "application/msword": ".doc",
+    "application/vnd.openxmlformats-officedocument.wordprocessingml.document": ".docx",
+    "application/vnd.ms-excel": ".xls",
+    "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet": ".xlsx",
+    "application/vnd.ms-powerpoint": ".ppt",
+    "application/vnd.openxmlformats-officedocument.presentationml.presentation": ".pptx",
+}
+
+
+def _guess_ext(mime: str, raw: bytes) -> str:
+    """Best-effort file extension when the download link gave none: trust the
+    MIME type the data: URL declared, fall back to a magic-number sniff, else
+    empty (caller keeps whatever it had)."""
+    mime = (mime or "").split(";")[0].strip().lower()
+    if mime and mime != "application/octet-stream":
+        hit = _MIME_EXT.get(mime)
+        if hit:
+            return hit
+        import mimetypes
+        guess = mimetypes.guess_extension(mime)
+        if guess:
+            return ".jpg" if guess == ".jpe" else guess
+    # Content sniff — a blob download often reports octet-stream regardless.
+    if raw[:5] == b"%PDF-":
+        return ".pdf"
+    if raw[:2] == b"PK":
+        return ".zip"          # also docx/pptx/xlsx, but .zip at least opens
+    if raw[:4] == b"%!PS":
+        return ".ps"
+    return ""
+
+
+def _download_attr(anchor) -> str | None:
+    """The anchor's `download` ATTRIBUTE — None when it doesn't have one.
+
+    `get_attribute("download")` cannot answer this. Selenium's getAttribute
+    returns the DOM PROPERTY in preference to the attribute, and
+    HTMLAnchorElement.download is a DOMString that reads back as "" on every
+    anchor ever written, attribute or no attribute. So the obvious
+    `download_attr is not None` test below was true for every <a href> on the
+    page, and _harvest_files stopped being a filter at all: it fetched the
+    first four links in DOM order — sidebar entries, "Help", the tool's own
+    logo link — saved them extension-less (there is no extension to take from
+    a nav link), and hit its cap of 4 long before reaching the .docx the
+    stage had actually produced. That is the "documents and images aren't
+    coming back from the agents" report, and both halves of it: the real file
+    was never fetched, and what did get saved had no usable extension.
+
+    get_dom_attribute() is the one that reads the attribute itself, and it
+    keeps the distinction the caller needs: None when there is no attribute,
+    "" for a bare `<a href="/api/file/9" download>` — which IS a deliverable,
+    it just carries no filename to take an extension from. Guarded with
+    getattr because it arrived in Selenium 4 and the engine's pin is only
+    >=4.0.0; on that old path "" has to be read as absent, since the property
+    fallback cannot tell the two apart and treating it as present is the very
+    bug this exists to fix.
+    """
+    getter = getattr(anchor, "get_dom_attribute", None)
+    try:
+        if getter:
+            return getter("download")
+        return anchor.get_attribute("download") or None
+    except Exception:
+        return None
+
 
 def _harvest_files(driver, agent_cfg, stage: str) -> list[dict]:
     """Non-image sibling of _harvest_images. A code, presentation or format
@@ -820,13 +1324,14 @@ def _harvest_files(driver, agent_cfg, stage: str) -> list[dict]:
     sel = agent_cfg.get("response_selector", "")
     candidates: list[tuple[str, str | None]] = []
     try:
-        links = driver.find_elements(By.CSS_SELECTOR, f"{sel} a[href]") if sel else []
+        links = (driver.find_elements(By.CSS_SELECTOR, _within(sel, "a[href]"))
+                 if sel else [])
         if not links:
             links = driver.find_elements(By.CSS_SELECTOR, "a[href]")
         for a in links:
             try:
                 candidates.append((a.get_attribute("href") or "",
-                                   a.get_attribute("download")))
+                                   _download_attr(a)))
             except Exception:
                 continue
     except Exception:
@@ -875,6 +1380,11 @@ def _harvest_files(driver, agent_cfg, stage: str) -> list[dict]:
             if data and data.startswith("data:"):
                 header, b64 = data.split(",", 1)
                 raw = base64.b64decode(b64)
+                if not ext and raw:
+                    # header looks like "data:application/pdf;base64" — the part
+                    # after "data:" is the MIME type the browser attached.
+                    mime = header[5:] if header.startswith("data:") else ""
+                    ext = _guess_ext(mime, raw)
         except Exception:
             raw = None
         if not raw:
@@ -896,7 +1406,166 @@ def _harvest_files(driver, agent_cfg, stage: str) -> list[dict]:
         out.append(att)
         if len(out) >= 4:
             break
+
+    # Nothing fetchable — try the click-to-download path. Claude's file skill
+    # and ChatGPT's canvas serve a generated file through a Download BUTTON
+    # that runs JS to save it, with no <a href> whose bytes we can fetch; the
+    # reply says "Download the … PDF" and the artifact folder stayed empty.
+    if not out:
+        out = _harvest_via_download(driver, agent_cfg, stage)
     return out
+
+
+def _click_download_control(driver, agent_cfg: dict) -> bool:
+    """Click whatever serves a generated file: an explicit download anchor, a
+    download-labelled icon button, or visible 'Download' text — searched inside
+    the reply first, then the whole page. Returns whether something was
+    clicked. Never raises."""
+    from selenium.webdriver.common.by import By
+    # _within, not f"{scope}…". A response_selector is a selector LIST, and a
+    # descendant combinator binds tighter than the comma — so `f"{scope}
+    # a[download]"` meant "every branch except the last, PLUS a[download]
+    # inside the last one". Verified in a real Chrome against ChatGPT's
+    # registered selector with a genuine <a download> in the reply: it
+    # matched the message DIV, this function clicked that div, returned True,
+    # and _harvest_via_download then waited 45s for a download that was never
+    # going to start. The feature could not work on either of the two
+    # most-used tools in the registry.
+    sel = agent_cfg.get("response_selector", "")
+    css_list = [_within(sel, "a[download]"),
+                _within(sel, "[aria-label*='download' i]"),
+                _within(sel, "[data-testid*='download' i]"),
+                "a[download]", "[aria-label*='download' i]"]
+    for css in css_list:
+        if not css:
+            continue
+        try:
+            els = driver.find_elements(By.CSS_SELECTOR, css.strip())
+        except Exception:
+            continue
+        for el in els:
+            try:
+                # A container is not a control. Without this, one slip in a
+                # selector is worth 45 seconds of waiting on a clicked <div>
+                # — which is exactly what the bug above cost.
+                role = (el.get_attribute("role") or "").lower()
+                if el.tag_name.lower() not in ("a", "button") and role != "button":
+                    continue
+                if el.is_displayed() and el.is_enabled():
+                    driver.execute_script(
+                        "arguments[0].scrollIntoView({block:'center'});", el)
+                    el.click()
+                    return True
+            except Exception:
+                continue
+    # Last resort: a visible link/button whose text is literally "Download …".
+    return _click_by_text(driver, ["download"], timeout=4)
+
+
+def _harvest_via_download(driver, agent_cfg, stage: str) -> list[dict]:
+    """Capture a file that is only reachable by CLICKING a download control —
+    the sibling of _harvest_files' fetch path, for tools that hand the file
+    over through JS rather than a fetchable link. Point Chrome's download at a
+    scratch folder we own (so our file is distinguishable from the user's own
+    ~/Downloads traffic), click the control, and harvest whatever lands.
+
+    Best-effort and never raises: if the download can't be redirected, or
+    nothing lands, or a plain link navigates instead of downloading, it gives
+    back an empty list and restores the chat tab, leaving the run unharmed."""
+    from . import files as F
+
+    folder = os.path.join(tempfile.gettempdir(),
+                          f"prism_dl_{stage}_{os.getpid()}")
+    try:
+        os.makedirs(folder, exist_ok=True)
+        driver.execute_cdp_cmd("Page.setDownloadBehavior",
+                               {"behavior": "allow", "downloadPath": folder})
+    except Exception:
+        return []
+
+    origin = ""
+    try:
+        origin = driver.current_url
+    except Exception:
+        pass
+    before = set(os.listdir(folder))
+    if not _click_download_control(driver, agent_cfg):
+        _restore_downloads(driver, folder)
+        return []
+
+    # Wait for a COMPLETE file — Chrome writes *.crdownload while in flight, and
+    # a big PDF from a code tool can take a while to serialise and stream.
+    start, tried_menu, target = time.time(), False, None
+    while time.time() - start < 45:
+        time.sleep(1)
+        now = set(os.listdir(folder)) - before
+        fresh = [f for f in now
+                 if not f.endswith((".crdownload", ".tmp", ".part"))]
+        inflight = any(f.endswith((".crdownload", ".tmp", ".part")) for f in now)
+        if fresh:
+            # Newest, not alphabetically first: two files landing meant the
+            # wrong one was picked, and "a.pdf" beating "report.pdf" is not a
+            # rule anybody intended.
+            cand = max((os.path.join(folder, f) for f in fresh),
+                       key=lambda f: os.path.getmtime(f)
+                       if os.path.exists(f) else 0)
+            s1 = os.path.getsize(cand) if os.path.exists(cand) else -1
+            time.sleep(1)
+            s2 = os.path.getsize(cand) if os.path.exists(cand) else -2
+            if s1 == s2 and s1 > 0:          # size settled → done writing
+                target = cand
+                break
+        elif not inflight and not tried_menu and time.time() - start > 6:
+            # Nothing landed and nothing is downloading — the first click may
+            # have opened a "Download as…" menu instead. Try a menu item once.
+            tried_menu = True
+            _click_by_text(driver, ["pdf", "download"], timeout=2)
+
+    # A plain link (no Content-Disposition) navigates instead of downloading —
+    # put the chat tab back so the saved stage URL and any later step are intact.
+    try:
+        if origin and driver.current_url != origin:
+            driver.get(origin)
+    except Exception:
+        pass
+
+    if not target:
+        _restore_downloads(driver, folder)
+        return []
+    try:
+        att = F.attach(target)
+    except Exception:
+        _restore_downloads(driver, folder)
+        return []
+    # The file is copied out by _save_artifacts / re-uploaded from its temp
+    # path, so the scratch folder itself is not kept.
+    _restore_downloads(driver, folder, keep=target)
+    if att.get("kind") == "image":
+        return []          # _harvest_images already owns real pictures
+    att["_generated"] = True
+    return [att]
+
+
+def _restore_downloads(driver, folder: str, keep: str = "") -> None:
+    """Give Chrome its download folder back, and stop littering temp.
+
+    Page.setDownloadBehavior is a SESSION setting and was never reset, so
+    after one harvest every download in that browser went to a temp folder
+    for the rest of the run — including the user's own, since Prism keeps
+    its browser open on purpose and people use it. Silent, and it survives
+    long after the stage that caused it.
+    """
+    try:
+        driver.execute_cdp_cmd("Page.setDownloadBehavior",
+                               {"behavior": "default"})
+    except Exception:
+        pass
+    if keep:
+        return              # the harvested file still lives in there
+    try:
+        shutil.rmtree(folder, ignore_errors=True)
+    except Exception:
+        pass
 
 
 def _save_artifacts(items: list[dict], query: str, stage: str,
@@ -2201,7 +2870,8 @@ def run(routing: dict, cfg: dict, attachments=None, on_event=None,
         custom_stages: list[tuple[str, str, list[str]]] | None = None,
         should_stop=None, failover: bool = True,
         reel_design_stage: str = "", pipeline_files_out: list | None = None,
-        motion_design_stage: str = "", skip_signal=None):
+        motion_design_stage: str = "", resume_urls: dict | None = None,
+        skip_signal=None):
     """Execute the pipeline. Returns (responses, links).
 
     attachments: list of records from core.files.attach() — uploaded to each
@@ -2657,7 +3327,11 @@ def run(routing: dict, cfg: dict, attachments=None, on_event=None,
             if not first_tab:
                 _open_tab(driver, agent_name)
             first_tab = False
-            driver.get(agent_cfg["url"])
+            # A follow-up RESUMES the exact conversation this stage answered in
+            # (its saved tab URL) instead of the tool's blank home page — so it
+            # continues the SAME chat, with all its context, rather than opening
+            # a fresh one. resume_urls is empty on an ordinary run.
+            driver.get((resume_urls or {}).get(stage) or agent_cfg["url"])
             time.sleep(agent_cfg.get("page_wait", 4))
 
             # Only NON-EMPTY prior outputs count — a failed scrape must not
@@ -2825,6 +3499,13 @@ def run(routing: dict, cfg: dict, attachments=None, on_event=None,
             if answer_language and not machine_shaped:
                 handoff += "\n\n" + answer_language
 
+            # (Removed the "answer in the chat, never in a document/artifact"
+            # instruction: the engine now HARVESTS artifact/canvas files
+            # (_harvest_files) and saves them to the task's Artifacts folder, so
+            # a document IS captured and downloadable. Forcing chat-only was
+            # actively stopping document stages — the BOQ especially — from
+            # producing the very PDF the customer wants.)
+
             if agent_cfg.get("search_tool") == "apollo":
                 # Deliberately does NOT get `context`. That blob opens with
                 # "Context from the previous pipeline stage (RESEARCH) —" and
@@ -2923,6 +3604,10 @@ def run(routing: dict, cfg: dict, attachments=None, on_event=None,
                 if suffix:
                     questions = [q + "\n\n" + suffix for q in questions]
 
+                # Set when a prompt provably never reached the tool, so the
+                # stage does not then sit out its full wait_time cap watching
+                # a page nobody asked anything.
+                nothing_was_sent = False
                 for idx, prompt in enumerate(questions, 1):
                     try:
                         ui.info(f"   → prompt {idx}/{len(questions)}: {prompt[:80]}…")
@@ -2948,6 +3633,26 @@ def run(routing: dict, cfg: dict, attachments=None, on_event=None,
                                     textarea.send_keys(Keys.SHIFT, Keys.ENTER)
                         time.sleep(1)
 
+                        # The prompt has to BE there before it can be sent, and
+                        # neither route above proved it was. Re-finding the
+                        # element matters: uploading a file re-renders the
+                        # composer, so the node found before the upload can be
+                        # detached by now — typing into it succeeds and goes
+                        # nowhere, which is exactly the run that reported
+                        # "uploaded 1 file(s) → prompt 1/1" over a ChatGPT tab
+                        # whose box was empty.
+                        if not _text_landed(_composer_text(driver, textarea),
+                                            full_prompt):
+                            textarea = driver.find_element(
+                                By.CSS_SELECTOR, agent_cfg["textarea_selector"])
+                            _fast_type(driver, textarea, full_prompt)
+                            time.sleep(1)
+                        if not _text_landed(_composer_text(driver, textarea),
+                                            full_prompt):
+                            raise RuntimeError(
+                                f"the prompt would not go into {agent_name}'s "
+                                "message box — nothing was sent")
+
                         # Submit — try the button, fall back to Enter.
                         submitted = False
                         sel = agent_cfg.get("submit_selector", "")
@@ -2962,6 +3667,23 @@ def run(routing: dict, cfg: dict, attachments=None, on_event=None,
                         if not submitted:
                             textarea.send_keys(Keys.ENTER)
 
+                        # `submitted` only ever meant "click() did not raise".
+                        # A composer that still holds the prompt did not send
+                        # it — try the other route once, then say so rather
+                        # than waiting out the full cap for an answer to a
+                        # question nobody was asked.
+                        if not _prompt_was_sent(driver, textarea, full_prompt):
+                            try:
+                                textarea.send_keys(Keys.ENTER)
+                            except Exception:
+                                pass
+                            if not _prompt_was_sent(driver, textarea,
+                                                    full_prompt, timeout=8):
+                                raise RuntimeError(
+                                    f"{agent_name} would not accept the prompt "
+                                    "— it is still sitting in the message box")
+                        ui.info(f"   ✓  prompt {idx}/{len(questions)} sent")
+
                         if idx < len(questions):
                             # Let this answer finish before sending the next
                             # prompt. should_stop was missing here, unlike the
@@ -2973,6 +3695,30 @@ def run(routing: dict, cfg: dict, attachments=None, on_event=None,
                                        should_stop=stage_halt)
                     except Exception as e:
                         ui.err(f"   prompt error: {e}")
+                        if isinstance(e, RuntimeError):
+                            nothing_was_sent = True
+
+                if nothing_was_sent and not all_responses.get(stage):
+                    # Waiting the full cap here is how a stage that sent
+                    # nothing still cost five minutes and then reported "no
+                    # response scraped" — which reads as the tool being slow
+                    # rather than as Prism never having asked.
+                    note = (f"{agent_name} never received the prompt, so there "
+                            "is nothing to wait for. Its tab is open if you "
+                            "want to send it by hand.")
+                    ui.err(f"   {note}")
+                    all_links[stage] = _safe_url(driver, exclude=tuple(
+                        all_links.values()))
+                    emit("stage_error", {"stage": stage, "error": note,
+                                         "url": all_links.get(stage, "")})
+                    # Same shape every other failure uses, so
+                    # _retry_failed_stages can pick this stage up like any
+                    # other — a prompt that never landed is exactly the kind
+                    # worth retrying.
+                    failures[stage] = {"agent": agent_name,
+                                       "questions": questions,
+                                       "reason": note, "exhausted": False}
+                    continue
 
                 wait = agent_cfg.get("wait_time", 60)
                 # A caller that knows what a finished answer looks like says
@@ -3306,6 +4052,42 @@ def run(routing: dict, cfg: dict, attachments=None, on_event=None,
                         else:
                             ui.err("   still no scene spec — the renderer will "
                                    "have nothing to draw")
+
+                    # Groq API fallback (browser-first, API-backstop). The
+                    # browser is tried exactly as before; only if it STILL has
+                    # no renderable spec here — the model refused the JSON
+                    # contract, wrote prose, or was cut off — do we ask Groq for
+                    # it. json_mode forces one JSON object and the call returns
+                    # the moment it is done (a real completion signal, no 300s
+                    # stability guess, no refusal), so a run reaches the renderer
+                    # with something to draw instead of nothing. Browser output
+                    # is always preferred; this never runs when it succeeded.
+                    have_spec = bool(stage_responses) and _reel.has_spec(
+                        stage_responses[-1])
+                    if not have_spec and cfg.get("api_key"):
+                        ui.info("   ⚡  no usable spec from the browser — asking "
+                                "Groq (API) for the JSON")
+                        emit("retry", {"stage": stage,
+                                       "reason": "groq spec fallback"})
+                        api_prompt = (
+                            (context or "")
+                            + "\n\n".join(questions)
+                            + "\n\n" + _reel.spec_instructions()
+                            + "\n\nReply with ONLY the JSON object — first "
+                              "character '{', last '}'.")
+                        try:
+                            from . import router as _router
+                            got = _router.groq_chat(
+                                cfg.get("api_key", ""), cfg.get("model", ""),
+                                api_prompt, json_mode=True, timeout=90)
+                            if _reel.has_spec(got):
+                                stage_responses = [got]
+                                ui.ok("   ✓  Groq produced a valid scene spec")
+                            else:
+                                ui.warn("   Groq's reply still wasn't a usable "
+                                        "spec — nothing to render")
+                        except Exception as e:
+                            ui.warn(f"   Groq spec fallback failed: {e}")
             # The artwork exists and is good. NOW make it editable — a second
             # prompt in the same chat rather than a different first prompt.
             stage_responses, canva_url = _make_editable(
