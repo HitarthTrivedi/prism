@@ -17,6 +17,19 @@ import os
 import re
 import shutil
 import time
+
+try:
+    # Not decoration. Without readline, input() reads the terminal through
+    # C stdio, which slurps a WHOLE BUFFER: line one of a pasted command
+    # comes back, line two hides inside libc where select()-based draining
+    # cannot see it — and leaks out at the next Y/n prompt, where the first
+    # stray 'n' answers No. Watched happen twice on real /step-ask runs.
+    # With readline active, input() reads exactly one line from the tty
+    # itself; whatever remains stays IN the tty buffer, where the drains
+    # already catch it. Arrow-key editing and history are the side bonus.
+    import readline  # noqa: F401
+except ImportError:                                     # pragma: no cover
+    pass
 import sys
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
