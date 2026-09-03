@@ -82,6 +82,101 @@ def _in_units(v_mm, units: str):
     return round(float(v_mm) * _PER_MM[units], _DECIMALS[units])
 
 
+# ── the extras a job knows beyond the nine headline figures ─────────────────
+# Everything here is read off the job the measurement already built — file
+# roles, drill flags, and the CAM tool's own text reports. A fact the job
+# does not carry stays None, and the form cell stays blank: an empty cell on
+# the client's form is a question for their estimator, not a place for a
+# guess.
+
+_FINISHES = re.compile(
+    r"\b(ENIG|HASL|HAL(?:\s*LF)?|OSP|IMMERSION\s+(?:GOLD|SILVER|TIN))\b",
+    re.IGNORECASE)
+_MATERIALS = re.compile(
+    r"\b(FR-?4|CEM-?[13]|POLYIMIDE|METAL\s*CORE|ALUMINI?UM)\b", re.IGNORECASE)
+_THICKNESS = re.compile(
+    r"THICK\w*\W{0,15}?(\d(?:\.\d{1,2})?)\s*MM", re.IGNORECASE)
+_COPPER_OZ = re.compile(r"(\d(?:\.\d)?)\s*OZ", re.IGNORECASE)
+_SCORING = re.compile(r"\bV[- ]?CUT\b|\bSCOR(?:E|ING)\b", re.IGNORECASE)
+
+
+def _report_text(job: dict, cap: int = 200_000) -> str:
+    """Every CAM report / stackup note in the job, as one searchable text."""
+    chunks = []
+    for f in job.get("files") or []:
+        name = (f.get("name") or "").lower()
+        if f.get("role") in ("report", "rules") or "stackup" in name:
+            try:
+                with open(f["path"], "r", errors="replace") as fh:
+                    chunks.append(fh.read(cap))
+            except Exception:                           # noqa: BLE001
+                pass
+    return "\n".join(chunks)
+
+
+def _sides_word(roles: set, top: str, bottom: str):
+    has_top, has_bottom = top in roles, bottom in roles
+    if has_top and has_bottom:
+        return "BOTH"
+    if has_top:
+        return "TOP"
+    if has_bottom:
+        return "BOTTOM"
+    return None
+
+
+def _job_extras(job: dict) -> dict:
+    files = job.get("files") or []
+    roles = {f.get("role") for f in files}
+    out = {
+        "sm_sides": _sides_word(roles, "mask_top", "mask_bottom"),
+        "legend_sides": _sides_word(roles, "silk_top", "silk_bottom"),
+    }
+
+    # Which side carries SMT pads — from the measured pad rows.
+    by_name = {f.get("name"): f.get("role") for f in files}
+    smt_roles = {by_name.get(r.get("name"))
+                 for r in job.get("smt") or [] if r.get("count")}
+    out["smt_side"] = _sides_word(smt_roles, "copper_top", "copper_bottom")
+
+    # Slots: the drill file says so itself — G85 slot commands, or a rout
+    # pass. No drill file at all means "don't know", not "no".
+    drills = job.get("drills") or {}
+    drill_files = [f for f in files if f.get("role") == "drill"]
+    if drill_files:
+        slot = bool(drills.get("is_rout"))
+        if not slot:
+            for f in drill_files:
+                try:
+                    with open(f["path"], "r", errors="replace") as fh:
+                        slot = "G85" in fh.read(2_000_000)
+                except Exception:                       # noqa: BLE001
+                    pass
+                if slot:
+                    break
+        out["slots"] = "YES" if slot else "NO"
+
+    # Stackup facts mined from the CAM tool's own text reports — taken only
+    # when the report states them, in the report's own words.
+    text = _report_text(job)
+    if text:
+        m = _MATERIALS.search(text)
+        if m:
+            out["material_type"] = m.group(1).upper().replace("FR4", "FR-4")
+        m = _THICKNESS.search(text)
+        if m:
+            out["material_thickness"] = f"{m.group(1)} mm"
+        m = _COPPER_OZ.search(text)
+        if m:
+            out["copper_weight"] = f"{m.group(1)} oz"
+        m = _FINISHES.search(text)
+        if m:
+            out["final_finish"] = m.group(1).upper()
+        if _SCORING.search(text):
+            out["scoring"] = "YES"
+    return out
+
+
 # (label regex, getter(answers, meta) -> value or None, is_length). Matched
 # against the cell text lowercased with trailing ':'/'-' stripped, so
 # "CUSTOMER:-" and "Board X" both read naturally. First match wins; order
@@ -110,6 +205,21 @@ _LABELS = [
      if a.get("min_pitch_mm") else None, True),
     (r"^min\.?\s*smt\s*length$", lambda a, m: _smt_lw(a)[0], True),
     (r"^min\.?\s*smt\s*width$", lambda a, m: _smt_lw(a)[1], True),
+    (r"^min\.?\s*annular\s*ring$",
+     lambda a, m: _round2(a["min_annular_ring_mm"])
+     if a.get("min_annular_ring_mm") else None, True),
+    (r"^no\.?\s*of\s*tools$", lambda a, m: a.get("drill_tools"), False),
+    (r"^smt\s*sides?$", lambda a, m: a.get("smt_side"), False),
+    (r"^sm\s*sides?$", lambda a, m: a.get("sm_sides"), False),
+    (r"^legend\s*sides?$", lambda a, m: a.get("legend_sides"), False),
+    (r"^slots?$", lambda a, m: a.get("slots"), False),
+    (r"^material\s*type$", lambda a, m: a.get("material_type"), False),
+    (r"^mat\.?\s*thickness$",
+     lambda a, m: a.get("material_thickness"), False),
+    (r"^cu\.?\s*wt\.?(\s*finish)?$",
+     lambda a, m: a.get("copper_weight"), False),
+    (r"^final\s*finish$", lambda a, m: a.get("final_finish"), False),
+    (r"^scoring$", lambda a, m: a.get("scoring"), False),
     (r"^customer$", lambda a, m: m.get("customer") or None, False),
     (r"^part\s*no\.?$", lambda a, m: m.get("part") or None, False),
     (r"^date$", lambda a, m: m.get("date")
@@ -334,7 +444,9 @@ def fill_form(job: dict, template_path: str, out_path: str,
     # drill table. It never saves: writing goes through _patch_xlsx so the
     # client's photos and layout survive.
     wb = openpyxl.load_workbook(template_path)
-    answers = job.get("answers") or {}
+    # The headline figures, plus everything else the job knows — file-role
+    # facts and CAM-report facts land in the same lookup the labels read.
+    answers = {**(job.get("answers") or {}), **_job_extras(job)}
     meta = meta or {}
     filled: list = []
     drills = 0

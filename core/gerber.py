@@ -1106,6 +1106,72 @@ def pad_pitch(layer: GerberLayer, snap_mm: float = SNAP_MM) -> dict | None:
     return None
 
 
+def annular_ring(outer_layers: list, drills: dict) -> dict | None:
+    """Smallest annular ring on the board: pad radius minus hole radius at
+    every drilled position that has a pad over it on an outer copper layer.
+
+    The fab's check sheet asks for this because it is what breakout risk is
+    priced from. Measured, never assumed: each drill position is looked up
+    against the flashed pads (a 0.05 mm grid keeps a 15k-hole board cheap),
+    and a hole with no pad — an NPTH mounting hole — simply doesn't count.
+    """
+    if not drills or not drills.get("positions"):
+        return None
+    all_holes = [pt for pts in drills["positions"].values() for pt in pts]
+    flash_pts = [at for layer in outer_layers for _d, at in layer.flashes]
+    if not all_holes or not flash_pts:
+        return None
+
+    # The drill file and the Gerbers routinely carry DIFFERENT origins —
+    # on a real job the pads sat at x≈260 while the holes sat at x≈5, and
+    # every lookup missed. The true offset is the one difference that
+    # repeats: every hole-to-its-own-pad pair votes for it, random pairs
+    # scatter. Sampled, so a 15k-hole board stays cheap.
+    from collections import Counter
+    votes: Counter = Counter()
+    for hx, hy in all_holes[:200]:
+        for fx, fy in flash_pts[:800]:
+            votes[(round(fx - hx, 2), round(fy - hy, 2))] += 1
+    (dx, dy), n = votes.most_common(1)[0]
+    if n < max(3, len(all_holes[:200]) // 5):
+        dx = dy = 0.0       # no repeating offset — trust the raw coords
+
+    STEP = 0.05
+    grid: dict[tuple, float] = {}
+    for layer in outer_layers:
+        for dcode, at in layer.flashes:
+            d = _pad_dims(layer, dcode, at)
+            if not d:
+                continue
+            key = (round(at[0] / STEP), round(at[1] / STEP))
+            half = min(d) / 2
+            if half < grid.get(key, 1e9):
+                grid[key] = half
+    if not grid:
+        return None
+    best, at_best = None, 0
+    for tool in drills["tools"]:
+        if not tool["hits"] or tool.get("plated") is False:
+            continue
+        r_hole = tool["dia_mm"] / 2
+        for (x, y) in drills["positions"].get(tool["tool"], []):
+            kx, ky = round((x + dx) / STEP), round((y + dy) / STEP)
+            half = min((grid[k] for k in
+                        ((kx, ky), (kx - 1, ky), (kx + 1, ky),
+                         (kx, ky - 1), (kx, ky + 1))
+                        if k in grid), default=None)
+            if half is None or half <= r_hole:
+                continue        # no pad here, or tangent — not a ring
+            ring = half - r_hole
+            if best is None or ring < best - 1e-9:
+                best, at_best = ring, 1
+            elif abs(ring - best) <= 1e-9:
+                at_best += 1
+    if best is None:
+        return None
+    return {"min_mm": best, "holes_at_min": at_best}
+
+
 def smt_pads(layer: GerberLayer, holes: list[tuple]) -> dict:
     """The pads on this layer with no hole under them, and the smallest.
 
@@ -1781,6 +1847,15 @@ def analyse(paths: list[str], snap_mm: float = SNAP_MM, on_progress=None) -> dic
     with_smt = [r for r in smt_rows if r["min_mm"] is not None]
     best_smt = min(with_smt, key=lambda r: r["min_mm"]) if with_smt else None
 
+    try:
+        ring = annular_ring(
+            [parsed[e["path"]] for e in to_measure
+             if e["role"] in ("copper_top", "copper_bottom")
+             and e["path"] in parsed], drills)
+    except Exception as e:                              # pragma: no cover
+        ring = None
+        warnings.append(f"Annular ring not measured ({e}).")
+
     used_tools = [t for t in (drills["tools"] if drills else []) if t["hits"]]
     unused = [t for t in (drills["tools"] if drills else []) if not t["hits"]]
     if unused:
@@ -1836,6 +1911,9 @@ def analyse(paths: list[str], snap_mm: float = SNAP_MM, on_progress=None) -> dic
             "spacing_pairs_at_min": _pairs_at(copper_results, min_gap),
             "min_drill_mm": min((t["dia_mm"] for t in used_tools), default=None),
             "drill_count": drills["total"] if drills else None,
+            "drill_tools": len(used_tools) or None,
+            "min_annular_ring_mm": ring["min_mm"] if ring else None,
+            "annular_holes_at_min": ring["holes_at_min"] if ring else 0,
             "layers": len(copper_results) + len(planes),
             "routed_layers": len(copper_results),
             "plane_layers": len(planes),
