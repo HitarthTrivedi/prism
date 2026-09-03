@@ -65,7 +65,18 @@ class RawKeys:
         import select
         readable, _, _ = select.select([sys.stdin], [], [], 0)
         if readable:
-            return sys.stdin.read(1)
+            # os.read, NEVER sys.stdin.read(1). The buffered text wrapper
+            # slurps everything available — a whole pasted command — into
+            # its own internal buffer just to hand back one character. The
+            # rest then haunts the session from inside Python, invisible to
+            # every select()-based drain, and a stray 'n' from a paste's
+            # second line answered a Y/n prompt on two real runs. A raw
+            # one-byte read takes the keypress and leaves the terminal's
+            # buffer exactly as it was.
+            try:
+                return os.read(self.fd, 1).decode(errors="ignore")
+            except OSError:
+                return None
         return None
 
     def wait(self) -> str:

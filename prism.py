@@ -17,6 +17,19 @@ import os
 import re
 import shutil
 import time
+
+try:
+    # Not decoration. Without readline, input() reads the terminal through
+    # C stdio, which slurps a WHOLE BUFFER: line one of a pasted command
+    # comes back, line two hides inside libc where select()-based draining
+    # cannot see it — and leaks out at the next Y/n prompt, where the first
+    # stray 'n' answers No. Watched happen twice on real /step-ask runs.
+    # With readline active, input() reads exactly one line from the tty
+    # itself; whatever remains stays IN the tty buffer, where the drains
+    # already catch it. Arrow-key editing and history are the side bonus.
+    import readline  # noqa: F401
+except ImportError:                                     # pragma: no cover
+    pass
 import sys
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
@@ -1499,9 +1512,20 @@ def cmd_step_ask(cfg, arg: str, attachments: list):
         SF.write_xlsx(after, os.path.join(out_dir, "dimensions_after.xlsx"))
     except SF.StepError:
         pass
+    # The visual half of the proof: the modified model drawn FROM THE
+    # BUILT FILE, so the review page shows before and after side by side.
+    try:
+        drawn_after = SF.render_sheet(after, os.path.join(out_dir, "after"))
+        if drawn_after.get("png"):
+            shutil.copyfile(drawn_after["png"],
+                            os.path.join(out_dir, "drawing_after.png"))
+    except Exception:                                   # noqa: BLE001
+        pass
     # Same page, rewritten: the After column now holds the RE-MEASURED
     # figures from the built file, and the banner says so.
-    SF.review_html(report, plan, out_dir, question=question, after=after)
+    review = SF.review_html(report, plan, out_dir, question=question,
+                            after=after)
+    ui.ok(f"before/after page → {review}")
     ui.ok(f"modified model → {out_path}")
     record["step_ask"]["modified"] = out_path
     record["step_ask"]["log"] = done["log"]
