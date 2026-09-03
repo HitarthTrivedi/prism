@@ -94,6 +94,50 @@ def available() -> tuple[bool, str]:
                    "    playwright install chromium")
 
 
+def selftest() -> tuple[bool, str]:
+    """Actually start the browser and paint a frame. (ready, why not).
+
+    `available()` above only proves a FILE EXISTS at the path Playwright
+    would resolve. That is worth checking and it is not the thing that
+    broke: the shipped bug was a launch resolving to a DIFFERENT binary
+    (chrome-headless-shell) that the bundle did not carry, and a
+    file-exists check on Chromium would have passed cheerfully while every
+    render died.
+
+    So the build gate does the whole round trip — launch, load a page,
+    screenshot, close. It is the smallest thing that exercises the same
+    path a real render takes, it costs a second or two in
+    packaging/smoke_test.py, and it is the difference between CI saying
+    "the browser is in the bundle" and CI saying "a render works on this
+    platform".
+
+    --no-sandbox because CI runners and locked-down corporate Windows both
+    refuse the sandbox, and this is a liveness check rather than a place to
+    be running untrusted pages.
+    """
+    try:
+        from playwright.sync_api import sync_playwright
+    except Exception:
+        return False, INSTALL_HINT
+    try:
+        with sync_playwright() as pw:
+            browser = launch_chromium(pw, args=["--no-sandbox", "--disable-gpu",
+                                                "--disable-dev-shm-usage"])
+            try:
+                page = browser.new_page(viewport={"width": 200, "height": 120})
+                page.set_content(
+                    "<div style='width:200px;height:120px;background:#123'></div>")
+                frame = page.screenshot(type="jpeg", quality=60)
+            finally:
+                browser.close()
+    except Exception as e:
+        detail = str(e).strip().splitlines()[0] if str(e).strip() else ""
+        return False, detail[:200] or "the browser would not start"
+    if not frame:
+        return False, "the browser started but produced no frame"
+    return True, ""
+
+
 def launch_chromium(pw, args=None, **kwargs):
     """`pw.chromium.launch()` that runs the browser we actually ship.
 
