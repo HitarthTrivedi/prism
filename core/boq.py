@@ -150,7 +150,13 @@ def _oda_version_key(exe_path: str) -> tuple[int, int, int]:
     explicitly versioned install. Tolerates 1-, 2- or 3-component numbers so a
     'ODAFileConverter 25.6' folder still ranks above a version-less one."""
     import re
-    folder = os.path.basename(os.path.dirname(exe_path))
+    # Both separators, not os.path's. This is a WINDOWS path being parsed,
+    # and os.path.dirname on POSIX does not treat "\\" as a separator — so
+    # the whole path came back as one basename, no digits matched, and every
+    # install scored (0, 0, 0). Harmless on Windows, where it worked; fatal
+    # to testing it anywhere else, which is where the suite runs.
+    folder = exe_path.replace("\\", "/").rstrip("/").rsplit("/", 2)
+    folder = folder[-2] if len(folder) >= 2 else ""
     m = re.search(r"(\d+)(?:\.(\d+))?(?:\.(\d+))?", folder)
     if not m:
         return (0, 0, 0)
