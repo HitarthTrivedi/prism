@@ -67,39 +67,56 @@ def _size(answers: dict, key: str, idx: int):
     return _round2(pair[idx]) if pair and pair[idx] else None
 
 
-# (label regex, getter(answers, meta) -> value or None). Matched against the
-# cell text lowercased with trailing ':'/'-' stripped, so "CUSTOMER:-" and
-# "Board X" both read naturally. First match wins; order the specific
-# before the generic.
+# The unit every measured LENGTH is written in. Prism measures in mm; a fab
+# whose form (or customer) works in thou wants the same cells in mil or
+# inch. Counts, layer numbers and text never convert — only lengths do.
+UNITS = ("mm", "inch", "mil")
+_PER_MM = {"mm": 1.0, "inch": 1 / 25.4, "mil": 1000 / 25.4}
+_DECIMALS = {"mm": 2, "inch": 4, "mil": 2}
+
+
+def _in_units(v_mm, units: str):
+    """One length, mm → the chosen unit, at that unit's honest precision
+    (0.25 mm is 0.0098 inch — two decimals would round a track width to a
+    different track)."""
+    return round(float(v_mm) * _PER_MM[units], _DECIMALS[units])
+
+
+# (label regex, getter(answers, meta) -> value or None, is_length). Matched
+# against the cell text lowercased with trailing ':'/'-' stripped, so
+# "CUSTOMER:-" and "Board X" both read naturally. First match wins; order
+# the specific before the generic. `is_length` marks the values that follow
+# the chosen unit — everything else is a count or text and never converts.
 _LABELS = [
     (r"^no\.?\s*layers?$|^layers$|^no\s+layer$",
-     lambda a, m: a.get("layers") or None),
-    (r"^board\s*x$", lambda a, m: _size(a, "pcb_size_mm", 0)),
-    (r"^board\s*y$", lambda a, m: _size(a, "pcb_size_mm", 1)),
-    (r"^array\s*x$", lambda a, m: _size(a, "array_size_mm", 0)),
-    (r"^array\s*y$", lambda a, m: _size(a, "array_size_mm", 1)),
+     lambda a, m: a.get("layers") or None, False),
+    (r"^board\s*x$", lambda a, m: _size(a, "pcb_size_mm", 0), True),
+    (r"^board\s*y$", lambda a, m: _size(a, "pcb_size_mm", 1), True),
+    (r"^array\s*x$", lambda a, m: _size(a, "array_size_mm", 0), True),
+    (r"^array\s*y$", lambda a, m: _size(a, "array_size_mm", 1), True),
     (r"^pcs\s*/\s*array$|^pcbs?\s*(in|per)\s*(the\s*)?array$",
-     lambda a, m: a.get("pcbs_per_array") or None),
+     lambda a, m: a.get("pcbs_per_array") or None, False),
     (r"^min\.?\s*line$|^min\.?\s*track(\s*width)?$",
      lambda a, m: _round2(a["min_track_width_mm"])
-     if a.get("min_track_width_mm") else None),
+     if a.get("min_track_width_mm") else None, True),
     (r"^min\.?\s*space$|^min\.?\s*(track\s*)?spacing$",
      lambda a, m: _round2(a["min_track_spacing_mm"])
-     if a.get("min_track_spacing_mm") else None),
+     if a.get("min_track_spacing_mm") else None, True),
     (r"^smallest\s*hole$|^min\.?\s*drill(\s*size)?$",
      lambda a, m: _round2(a["min_drill_mm"])
-     if a.get("min_drill_mm") else None),
+     if a.get("min_drill_mm") else None, True),
     (r"^(min\.?\s*)?pitch$",
      lambda a, m: _round2(a["min_pitch_mm"])
-     if a.get("min_pitch_mm") else None),
-    (r"^min\.?\s*smt\s*length$", lambda a, m: _smt_lw(a)[0]),
-    (r"^min\.?\s*smt\s*width$", lambda a, m: _smt_lw(a)[1]),
-    (r"^customer$", lambda a, m: m.get("customer") or None),
-    (r"^part\s*no\.?$", lambda a, m: m.get("part") or None),
+     if a.get("min_pitch_mm") else None, True),
+    (r"^min\.?\s*smt\s*length$", lambda a, m: _smt_lw(a)[0], True),
+    (r"^min\.?\s*smt\s*width$", lambda a, m: _smt_lw(a)[1], True),
+    (r"^customer$", lambda a, m: m.get("customer") or None, False),
+    (r"^part\s*no\.?$", lambda a, m: m.get("part") or None, False),
     (r"^date$", lambda a, m: m.get("date")
-     or _dt.date.today().strftime("%d-%m-%Y")),
+     or _dt.date.today().strftime("%d-%m-%Y"), False),
 ]
-_COMPILED = [(re.compile(rx, re.IGNORECASE), get) for rx, get in _LABELS]
+_COMPILED = [(re.compile(rx, re.IGNORECASE), get, linear)
+             for rx, get, linear in _LABELS]
 
 _DRILL_HEADER = re.compile(r"hole\s*size", re.IGNORECASE)
 
@@ -114,7 +131,8 @@ def _is_formula(value) -> bool:
     return isinstance(value, str) and value.startswith("=")
 
 
-def _fill_drill_table(ws, job: dict, filled: list, writes: dict) -> int:
+def _fill_drill_table(ws, job: dict, filled: list, writes: dict,
+                      units: str = "mm") -> int:
     """One row per measured tool under 'HOLE SIZE'; leftover pre-printed
     placeholder rows zeroed so the form's own SUM counts only real drills.
     Stops at the first row that mentions TOTAL — that row is the form's."""
@@ -136,7 +154,7 @@ def _fill_drill_table(ws, job: dict, filled: list, writes: dict) -> int:
         if written < len(tools):
             t = tools[written]
             if not _is_formula(size_cell.value):
-                writes[size_cell.coordinate] = _round2(t["dia_mm"])
+                writes[size_cell.coordinate] = _in_units(t["dia_mm"], units)
             if not _is_formula(count_cell.value):
                 writes[count_cell.coordinate] = t["hits"]
             filled.append((size_cell.coordinate, "drill",
@@ -298,13 +316,16 @@ def _patch_xlsx(template_path: str, out_path: str,
 
 
 def fill_form(job: dict, template_path: str, out_path: str,
-              meta: dict | None = None) -> dict:
+              meta: dict | None = None, units: str = "mm") -> dict:
     """Write a filled COPY of the client's form; the template is never
     touched, and neither is anything in the copy except the cells that
-    got a measured value. Returns {"out", "filled": [(cell, label,
-    value)…], "drill_rows": n}."""
+    got a measured value. Every length goes in as `units` (mm, inch or
+    mil); counts and text never convert. Returns {"out", "filled":
+    [(cell, label, value)…], "drill_rows": n, "units"}."""
     if not HAVE_XLSX:
         raise FormError("Filling an Excel form needs the openpyxl package.")
+    if units not in UNITS:
+        raise FormError(f"Units must be one of {UNITS}, not {units!r}.")
     template_path = os.path.abspath(os.path.expanduser(template_path))
     if not os.path.exists(template_path):
         raise FormError(f"No such template: {template_path}")
@@ -326,7 +347,7 @@ def fill_form(job: dict, template_path: str, out_path: str,
                 text = _label_text(cell.value)
                 if not text:
                     continue
-                for rx, get in _COMPILED:
+                for rx, get, linear in _COMPILED:
                     if not rx.match(text):
                         continue
                     try:
@@ -335,6 +356,8 @@ def fill_form(job: dict, template_path: str, out_path: str,
                         value = None
                     if value is None:
                         break   # measured nothing — leave their form as drawn
+                    if linear and units != "mm":
+                        value = _in_units(value, units)
                     target = ws.cell(row=cell.row, column=cell.column + 1)
                     if _is_formula(target.value):
                         break   # their arithmetic, never ours
@@ -342,7 +365,8 @@ def fill_form(job: dict, template_path: str, out_path: str,
                     filled.append((target.coordinate, cell.value.strip(),
                                    value))
                     break
-        drills += _fill_drill_table(ws, job, filled, writes)
+        drills += _fill_drill_table(ws, job, filled, writes, units)
 
     _patch_xlsx(template_path, out_path, writes_by_sheet)
-    return {"out": out_path, "filled": filled, "drill_rows": drills}
+    return {"out": out_path, "filled": filled, "drill_rows": drills,
+            "units": units}
