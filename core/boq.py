@@ -48,12 +48,17 @@ from __future__ import annotations
 import csv
 import math
 import os
+import platform
 import shutil
 import subprocess
 import sys
 import tempfile
 
 _CONVERTER_CANDIDATES = ["dwg2dxf", "ODAFileConverter", "ODAFileConverter.exe"]
+
+# An explicit path, for anyone who has a reason — same escape hatch
+# core/ffmpeg.py offers as PRISM_FFMPEG.
+ENV_CONVERTER = "PRISM_DWG_CONVERTER"
 
 # DXF $INSUNITS header codes worth naming — the common ones. Anything else is
 # reported as "unspecified (code N)" rather than guessed.
@@ -69,11 +74,91 @@ class BoqError(Exception):
 
 # ── DWG → DXF ──────────────────────────────────────────────────────────────
 
+def _installed_converter_paths() -> list[str]:
+    """Where a DWG converter actually lands when somebody installs one.
+
+    PATH alone was the whole search, and PATH is exactly where neither of
+    these puts itself:
+
+      · **ODA File Converter on Windows** installs to `C:\\Program Files\\ODA\\
+        ODAFileConverter <version>\\ODAFileConverter.exe` — a versioned folder,
+        and the installer adds nothing to PATH. So a customer who followed
+        Prism's own instructions, installed it, and restarted, was still told
+        "No DWG→DXF converter found on this machine".
+      · **LibreDWG from Homebrew on macOS** puts `dwg2dxf` in /opt/homebrew/bin
+        (or /usr/local/bin on Intel). That is on PATH in Terminal and NOT in
+        the environment a Finder-launched .app inherits — so it worked when a
+        developer ran Prism from a shell and failed for every customer who
+        double-clicked it.
+
+    Both are cases of "it IS installed and Prism cannot see it", which is
+    worse than not having it: the person has already done the work.
+    """
+    import glob
+    system = platform.system()
+    found: list[str] = []
+
+    if system == "Windows":
+        for var in ("PROGRAMFILES", "PROGRAMFILES(X86)", "PROGRAMW6432",
+                    "LOCALAPPDATA"):
+            root = os.environ.get(var)
+            if not root:
+                continue
+            # The folder carries the version, so it has to be matched rather
+            # than named: ODAFileConverter 25.4.0, 26.2.0, and so on.
+            found += sorted(glob.glob(os.path.join(
+                root, "ODA", "ODAFileConverter*", "ODAFileConverter.exe")),
+                reverse=True)          # newest version first
+            found.append(os.path.join(root, "ODA", "ODAFileConverter.exe"))
+    elif system == "Darwin":
+        found += [
+            "/Applications/ODAFileConverter.app/Contents/MacOS/ODAFileConverter",
+            os.path.expanduser("~/Applications/ODAFileConverter.app/Contents/"
+                               "MacOS/ODAFileConverter"),
+            "/opt/homebrew/bin/dwg2dxf",     # Apple Silicon Homebrew
+            "/usr/local/bin/dwg2dxf",        # Intel Homebrew
+        ]
+    else:
+        found += [
+            "/usr/bin/ODAFileConverter",
+            "/usr/local/bin/ODAFileConverter",
+            "/usr/bin/dwg2dxf",
+            "/usr/local/bin/dwg2dxf",
+        ]
+    return found
+
+
 def find_dwg_converter() -> str | None:
+    """The DWG→DXF converter this machine should use, or None.
+
+    Four places, in the order core/ffmpeg.py already established for FFmpeg:
+    an explicit override, Prism's own tools directory, PATH, and then the
+    places an installer actually puts these — see _installed_converter_paths.
+    """
+    override = os.environ.get(ENV_CONVERTER, "").strip()
+    if override and os.path.isfile(override) and os.access(override, os.X_OK):
+        return override
+
+    # ~/.prism/tools — the same directory FFmpeg is fetched into, so a
+    # converter dropped there by hand is found without touching PATH.
+    try:
+        from . import ffmpeg as _ffmpeg
+        tools = _ffmpeg.tools_dir()
+    except Exception:
+        tools = ""
+    for name in _CONVERTER_CANDIDATES:
+        candidate = os.path.join(tools, name) if tools else ""
+        if candidate and os.path.isfile(candidate) and os.access(candidate, os.X_OK):
+            return candidate
+
     for name in _CONVERTER_CANDIDATES:
         found = shutil.which(name)
         if found:
             return found
+
+    for path in _installed_converter_paths():
+        if os.path.isfile(path) and os.access(path, os.X_OK):
+            return path
     return None
 
 
@@ -135,12 +220,27 @@ def dwg_to_dxf(dwg_path: str, out_dir: str | None = None) -> tuple[str, list[str
     docstring for what each fallback costs."""
     converter = find_dwg_converter()
     if not converter:
+        # Named per OS, because the previous text offered `brew install` and
+        # "on Linux…" and nothing else — so the one platform with no route at
+        # all was Windows, which is most of the customers this add-on is sold
+        # to. ODA File Converter is free, has a Windows installer, and is the
+        # answer on all three.
+        system = platform.system()
+        if system == "Windows":
+            how = ("  • ODA File Converter (free, Windows installer):\n"
+                   "    https://www.opendesign.com/guestfiles/oda_file_converter\n")
+        elif system == "Darwin":
+            how = ("  • brew install libredwg     (gives the `dwg2dxf` tool)\n"
+                   "  • or ODA File Converter (free):\n"
+                   "    https://www.opendesign.com/guestfiles/oda_file_converter\n")
+        else:
+            how = ("  • ODA File Converter (free, .deb/.rpm — the simplest "
+                   "supported option):\n"
+                   "    https://www.opendesign.com/guestfiles/oda_file_converter\n"
+                   "    (or build LibreDWG from source to get `dwg2dxf`)\n")
         raise BoqError(
             "No DWG→DXF converter found on this machine. Install one:\n"
-            "  • brew install libredwg        (macOS, gives `dwg2dxf`)\n"
-            "  • On Linux, install ODA File Converter (the simplest supported option): "
-            "https://www.opendesign.com/guestfiles/oda_file_converter\n"
-            "    (or build LibreDWG from source to get `dwg2dxf`)\n"
+            + how +
             "Then re-run /boq — or convert it yourself and attach the .dxf directly."
         )
     out_dir = out_dir or tempfile.mkdtemp(prefix="prism_boq_")

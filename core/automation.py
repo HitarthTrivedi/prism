@@ -21,14 +21,59 @@ import webbrowser
 from . import agents as A
 from . import ui
 
-# Common Chrome binary locations across platforms.
-_CHROME_BINARIES = [
-    "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome",   # macOS
-    "/usr/bin/google-chrome",                                         # Linux
-    "/usr/bin/google-chrome-stable",
-    r"C:\Program Files\Google\Chrome\Application\chrome.exe",         # Windows
-    r"C:\Program Files (x86)\Google\Chrome\Application\chrome.exe",
-]
+def _chrome_binaries() -> list[str]:
+    """Where Chrome might be, on this machine specifically.
+
+    This was a flat list with two hardcoded Windows paths, both under
+    C:\\Program Files. Chrome's installer defaults to a PER-USER install
+    whenever it is run without administrator rights — which is the normal
+    case in an office — and that lands in %LOCALAPPDATA%\\Google\\Chrome\\
+    Application instead. Neither hardcoded path exists on such a machine.
+
+    The result was a split personality that took a while to make sense of:
+    RUNS worked, because undetected-chromedriver has its own finder and does
+    check LOCALAPPDATA, while LOGIN TABS said "Chrome not found — opening in
+    your default browser instead. Logins there will NOT carry into Prism's
+    runs." So the customer signed in, in the wrong browser, was told it would
+    not count, and then every tool in every run met a sign-in wall. Reported
+    as "the agents don't open".
+
+    Same four environment variables uc's own find_chrome_executable() uses,
+    for the same reason, plus PROGRAMW6432 — which is where a 32-bit process
+    has to look to see the real 64-bit Program Files.
+    """
+    if platform.system() == "Windows":
+        roots = [os.environ.get(v) for v in
+                 ("PROGRAMFILES", "PROGRAMFILES(X86)", "LOCALAPPDATA",
+                  "PROGRAMW6432")]
+        found, seen = [], set()
+        for root in roots:
+            if not root:
+                continue
+            path = os.path.join(root, "Google", "Chrome", "Application",
+                                "chrome.exe")
+            key = os.path.normcase(path)
+            if key not in seen:
+                seen.add(key)
+                found.append(path)
+        return found
+    if platform.system() == "Darwin":
+        return [
+            "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome",
+            os.path.expanduser("~/Applications/Google Chrome.app/Contents/"
+                               "MacOS/Google Chrome"),
+        ]
+    return [
+        "/usr/bin/google-chrome",
+        "/usr/bin/google-chrome-stable",
+        "/opt/google/chrome/chrome",
+        "/snap/bin/google-chrome",
+    ]
+
+
+# Resolved at import: these are installation locations, not something that
+# moves while Prism is running.
+_CHROME_BINARIES = _chrome_binaries()
 
 # Windows opens a console window for every subprocess unless told not to, and
 # in a frozen GUI build that is a black rectangle flashing over the app. Zero
@@ -279,7 +324,12 @@ def seed_profile(force: bool = False) -> bool:
 def _clear_profile_locks():
     """A run that was killed (or a crash) leaves SingletonLock behind, and the
     next launch then fails with 'profile appears to be in use'. The profile is
-    Prism's alone, so a leftover lock is always stale."""
+    Prism's alone, so a leftover lock is always stale.
+
+    POSIX only, in effect — Windows Chrome does not use these files at all,
+    it guards a profile with a named kernel object. _release_profile() is the
+    half that works there.
+    """
     for name in ("SingletonLock", "SingletonCookie", "SingletonSocket"):
         path = os.path.join(PROFILE_DIR, name)
         try:
@@ -287,6 +337,145 @@ def _clear_profile_locks():
                 os.remove(path)
         except OSError:
             pass
+
+
+def _chrome_pids_using_profile() -> list[int]:
+    """PIDs of every Chrome process currently holding Prism's OWN profile.
+
+    Two conditions, and BOTH are load-bearing, because the result of this is
+    fed to a kill:
+
+      · the command line carries `--user-data-dir=<Prism's profile>`, which
+        nothing but Prism ever passes. The user's everyday Chrome cannot
+        match it, and must not — killing that would take their real work
+        with it.
+      · the program being run is Chrome itself.
+
+    The second one was missing at first and it mattered immediately: `ps`
+    reports full command lines, so ANY process whose arguments merely
+    mention the path matched — a shell running a script that names it, an
+    editor with the folder open. Caught by this function killing the very
+    shell that was testing it.
+    """
+    marker = "--user-data-dir=" + PROFILE_DIR
+    try:
+        if platform.system() == "Windows":
+            # Win32_Process, not tasklist: the command line is the only place
+            # the profile appears, and tasklist does not report it. Passed
+            # through the environment rather than interpolated into the
+            # script, so a path with a quote or a bracket in it can neither
+            # break the command nor be read as a wildcard. Name='chrome.exe'
+            # is the "is it Chrome" half.
+            out = subprocess.check_output(
+                ["powershell", "-NoProfile", "-NonInteractive", "-Command",
+                 "Get-CimInstance Win32_Process -Filter \"Name='chrome.exe'\" "
+                 "| Where-Object { $_.CommandLine -and "
+                 "$_.CommandLine.Contains($env:PRISM_PROFILE_ARG) } "
+                 "| ForEach-Object { $_.ProcessId }"],
+                text=True, stderr=subprocess.DEVNULL, timeout=30,
+                creationflags=_NO_WINDOW,
+                env={**os.environ, "PRISM_PROFILE_ARG": marker})
+        else:
+            raw = subprocess.check_output(["ps", "-Ao", "pid=,args="],
+                                          text=True, stderr=subprocess.DEVNULL,
+                                          timeout=15)
+            out = "\n".join(_posix_chrome_pids(raw, marker))
+    except Exception:
+        return []                      # no ps/powershell, or it timed out
+    pids = []
+    for token in out.split():
+        try:
+            pids.append(int(token))
+        except ValueError:
+            continue
+    return pids
+
+
+def _posix_chrome_pids(ps_output: str, marker: str) -> list[str]:
+    """The `ps -Ao pid=,args=` lines that are a Chrome on this profile."""
+    out = []
+    for line in ps_output.splitlines():
+        parts = line.split(None, 1)
+        if len(parts) != 2 or marker not in parts[1]:
+            continue
+        program = os.path.basename(parts[1].split()[0]).lower()
+        if "chrome" in program or "chromium" in program:
+            out.append(parts[0])
+    return out
+
+
+def _release_profile() -> int:
+    """Close any Chrome still holding Prism's profile. Returns how many.
+
+    Chrome allows exactly one browser process per user-data-dir. A second
+    launch does not fail and does not get its own browser — it hands its
+    command line to the instance already there and EXITS. undetected-
+    chromedriver launches Chrome itself with --remote-debugging-port and then
+    points chromedriver at that port, so when the launch it just made exits
+    instead of running, chromedriver reports:
+
+        session not created: cannot connect to chrome at 127.0.0.1:53695
+
+    which is the error a customer sent from Windows, and which Prism showed
+    them as a Chrome/driver VERSION mismatch — sending them to update a
+    browser that was working perfectly.
+
+    Two ordinary things leave a Chrome on the profile: Login tabs (see
+    open_login_tabs — it launches a plain Chrome on this same profile, and
+    people leave that window open), and a Prism that was killed or crashed
+    while a run was going, which never reaches shutdown(). On POSIX the
+    stale SingletonLock at least made this visible; on Windows there is no
+    lock file to find, and it simply repeats every run until a reboot.
+
+    Only reached when there is no live driver to reuse (see _get_driver), so
+    a Chrome found here is one Prism can no longer talk to — closing it
+    costs nothing and is the only way to get a browser at all.
+    """
+    pids = _chrome_pids_using_profile()
+    if not pids:
+        return 0
+    ui.info(f"   🧹  closing {len(pids)} leftover Chrome process(es) still "
+            f"holding Prism's browser profile")
+
+    # Ask first, insist second. A hard kill costs the very thing this profile
+    # exists for: Chrome keeps new cookies in memory and writes them out on a
+    # clean shutdown, so force-killing a window somebody has just signed in
+    # through throws that sign-in away — and the next run walks into the
+    # login wall the profile was supposed to prevent.
+    _signal_pids(pids, force=False)
+    left = pids
+    for _ in range(24):                 # up to ~6s to close gracefully
+        time.sleep(0.25)
+        left = _chrome_pids_using_profile()
+        if not left:
+            return len(pids)
+
+    _signal_pids(left, force=True)
+    for _ in range(12):
+        time.sleep(0.25)
+        if not _chrome_pids_using_profile():
+            break
+    return len(pids)
+
+
+def _signal_pids(pids: list[int], force: bool) -> None:
+    """Close (or, forced, kill) each process. Never raises."""
+    import signal as _signal
+    for pid in pids:
+        try:
+            if platform.system() == "Windows":
+                # /T takes the child processes with it — Chrome is a process
+                # tree, and the browser process alone leaving would strand
+                # its renderers on the profile.
+                subprocess.run(["taskkill", "/PID", str(pid), "/T"]
+                               + (["/F"] if force else []),
+                               stdout=subprocess.DEVNULL,
+                               stderr=subprocess.DEVNULL, timeout=15,
+                               creationflags=_NO_WINDOW)
+            else:
+                os.kill(pid, _signal.SIGKILL if force else _signal.SIGTERM)
+        except Exception:
+            continue
 
 
 # Preferences is a settings file. Anything past this is not settings.
@@ -445,13 +634,19 @@ def _setup_chrome_driver(version_main=None, reseed: bool = False):
         ui.info("   🍪  reusing Prism's browser profile (logins persist "
                 "between runs)")
     _clear_profile_locks()
+    _release_profile()
     _prune_preferences()
     _ensure_session_restore()
     tmp = PROFILE_DIR
 
-    opts = uc.ChromeOptions()
-    opts.add_argument("--profile-directory=Default")
-    opts.add_argument("--disable-blink-features=AutomationControlled")
+    # Built fresh per attempt: uc raises "you cannot reuse the ChromeOptions
+    # object" on a second Chrome() with the same instance, because it appends
+    # to the argument list rather than replacing it — so a retry needs its own.
+    def _options():
+        o = uc.ChromeOptions()
+        o.add_argument("--profile-directory=Default")
+        o.add_argument("--disable-blink-features=AutomationControlled")
+        return o
 
     # Match the driver to Chrome. A pin exists to work around DETECTION
     # failing, not to override what is actually installed — and Chrome
@@ -515,26 +710,77 @@ def _setup_chrome_driver(version_main=None, reseed: bool = False):
                     pass
 
     try:
-        drv = uc.Chrome(options=opts, user_data_dir=tmp,
+        drv = uc.Chrome(options=_options(), user_data_dir=tmp,
                         version_main=version_main)
         _reset_to_blank_tab(drv)
         return drv
     except Exception as e:
-        # Chrome updates itself about monthly, and for a day or two after a
-        # major release there may be no matching driver to download — as there
-        # is none on a machine behind a proxy that blocks the fetch. The raw
-        # Selenium traceback tells a business owner nothing, and this is the
-        # first thing that happens when they press Start the work.
-        detail = str(e).strip().splitlines()[0][:180] if str(e).strip() else ""
+        # One retry, because the two most common failures here are both
+        # recoverable and neither is a broken installation:
+        #
+        #   · A Chrome appeared on the profile between _release_profile()
+        #     above and this launch — Login tabs opened in another window,
+        #     say. Clear it and the second attempt gets its own browser.
+        #   · The driver for THIS major version cannot be had. Chrome
+        #     auto-updates roughly monthly and Chrome-for-Testing publishes
+        #     the matching chromedriver a little behind it, so for a day or
+        #     two `version_main=N` resolves to nothing (uc raises a bare
+        #     KeyError with the version number in it, and nothing else).
+        #     Unpinned, uc takes the latest stable driver instead, which
+        #     drives the new Chrome in every case the pin was going to fail.
+        _release_profile()
+        if version_main is not None:
+            ui.warn(f"   couldn't start Chrome for v{version_main} — retrying "
+                    "with whatever driver is current")
+        try:
+            drv = uc.Chrome(options=_options(), user_data_dir=tmp,
+                            version_main=None)
+            _reset_to_blank_tab(drv)
+            return drv
+        except Exception as retry_error:
+            e = retry_error   # the newer, and after a version drop the truer, one
+
+        # The raw Selenium traceback tells a business owner nothing, and this
+        # is the first thing that happens when they press Start the work.
+        #
+        # Two lines of it, not one: Selenium puts the failure on line one
+        # ("session not created: cannot connect to chrome at 127.0.0.1:53695")
+        # and WHY on line two ("from chrome not reachable"), and keeping only
+        # the first is what made every one of these look identical in the
+        # screenshots customers send.
+        lines = [ln.strip() for ln in str(e).strip().splitlines() if ln.strip()]
+        detail = " — ".join(lines[:2])[:240]
+        low = detail.lower()
+
+        # Three different failures used to be reported as one, and the one
+        # they were all reported as — "Chrome updated and the driver hasn't
+        # caught up" — sent people to update a browser that was fine.
+        if "could not determine browser executable" in low:
+            why = ("Prism drives Google Chrome, and it isn't installed here.\n\n"
+                   "  1. Install Google Chrome from google.com/chrome.\n"
+                   "  2. Start it once, then try again.\n\n"
+                   "Chrome specifically — Prism cannot use Edge, Safari or "
+                   "Firefox.")
+        elif "cannot connect to chrome" in low or "chrome not reachable" in low:
+            why = ("Chrome started and then closed again before Prism could "
+                   "reach it.\n\n"
+                   "  1. Close every Chrome window — including any Prism "
+                   "opened for signing in — and try again.\n"
+                   "  2. If it keeps happening, restart the computer; that "
+                   "clears it for certain.\n"
+                   "  3. Some antivirus and 'endpoint protection' tools block "
+                   "one program from starting another. If you have one, allow "
+                   "Prism through it.")
+        else:
+            why = ("This is almost always a version mismatch — Chrome updated "
+                   "itself and the matching driver isn't available yet.\n\n"
+                   "  1. Update Chrome (Chrome menu → About Google Chrome) and "
+                   "try again.\n"
+                   "  2. If you have pinned a version in Settings → Chrome, "
+                   "clear that box so Prism detects it automatically.")
+
         raise RuntimeError(
-            "Prism couldn't start Chrome.\n\n"
-            "This is almost always a version mismatch — Chrome updated itself "
-            "and the matching driver isn't available yet.\n\n"
-            "Two things fix it:\n"
-            "  1. Update Chrome (Chrome menu → About Google Chrome) and try "
-            "again.\n"
-            "  2. If you have pinned a version in Settings → Chrome, clear "
-            "that box so Prism detects it automatically.\n\n"
+            "Prism couldn't start Chrome.\n\n" + why + "\n\n"
             + (f"Technical detail: {detail}" if detail else "")) from e
 
 
@@ -578,6 +824,29 @@ def _upload_files(driver, agent_cfg, attachments, agent_name: str = ""):
 
     who = agent_name or "this tool"
     sel = agent_cfg.get("upload_selector", "input[type='file']")
+
+    # WAIT for it, don't just look once. run() navigates to the tool and
+    # sleeps `page_wait` (4 seconds by default) before getting here, and four
+    # seconds is not how long chatgpt.com or claude.ai take to render their
+    # composer on a cold profile — which is every Prism profile, since it
+    # keeps its own. The typing path has always waited properly for
+    # `textarea_selector` (WebDriverWait, input_wait, 15-30s); the upload path
+    # looked exactly once and, finding nothing, reported the tool as having no
+    # upload field at all and carried on without the customer's drawing. Same
+    # page, same moment, two different answers — the difference was only that
+    # one of them waited.
+    #
+    # presence, not visibility: a chat composer's <input type=file> is always
+    # hidden behind a paperclip button, and a visibility wait would time out
+    # on every tool in the registry. ChromeDriver sets files on a hidden input
+    # perfectly well — that is how this has always worked.
+    from selenium.webdriver.support.ui import WebDriverWait
+    from selenium.webdriver.support import expected_conditions as EC
+    try:
+        WebDriverWait(driver, agent_cfg.get("upload_wait", 20)).until(
+            EC.presence_of_element_located((By.CSS_SELECTOR, sel)))
+    except Exception:
+        pass        # fall through to the same message as before
     inputs = driver.find_elements(By.CSS_SELECTOR, sel)
     if not inputs:
         ui.warn(f"   ⚠️   {who} has no file-upload field on this page — "
@@ -585,6 +854,23 @@ def _upload_files(driver, agent_cfg, attachments, agent_name: str = ""):
                 "answer blind to them")
         return 0
     paths = F.upload_paths(attachments)
+    # ChromeDriver rejects the WHOLE send when any one path is missing
+    # ("invalid argument: File not found"), so one stale entry took every
+    # other attachment down with it. Files harvested from an earlier stage
+    # live in the system temp directory, which Windows and macOS both clean
+    # underneath a long run — so this is a normal thing to meet, not a
+    # corrupt state, and the right answer is to send the rest and say which
+    # one went.
+    missing = [p for p in paths if not os.path.isfile(p)]
+    if missing:
+        paths = [p for p in paths if os.path.isfile(p)]
+        ui.warn(f"   ⚠️   {len(missing)} attachment(s) are no longer on disk "
+                f"and can't be sent to {who}: "
+                + ", ".join(os.path.basename(p) for p in missing[:3])
+                + (f" (+{len(missing) - 3} more)" if len(missing) > 3 else ""))
+    if not paths:
+        return 0
+
     target = inputs[0]
     uploaded = 0
     try:
@@ -600,13 +886,25 @@ def _upload_files(driver, agent_cfg, attachments, agent_name: str = ""):
         bulk_reason = str(e).strip().splitlines()[0][:120] if str(e).strip() else "no detail"
         reasons = []
         for p in paths:
-            try:
-                for inp in driver.find_elements(By.CSS_SELECTOR, sel):
+            # EVERY matching input, not just the first. The try used to sit
+            # OUTSIDE this inner loop, so the first input raising jumped
+            # straight to the handler and the others were never reached —
+            # which made the fallback identical to the bulk attempt that had
+            # just failed. Pages that keep several file inputs around (a
+            # composer's, plus one behind an "attach" menu) only accept one
+            # of them, and it is not reliably the first in the DOM.
+            sent, detail = False, "no file input accepted it"
+            for inp in driver.find_elements(By.CSS_SELECTOR, sel):
+                try:
                     inp.send_keys(p)
-                    uploaded += 1
+                    sent = True
                     break
-            except Exception as pe:
-                detail = str(pe).strip().splitlines()[0][:120] if str(pe).strip() else "no detail"
+                except Exception as pe:
+                    text = str(pe).strip().splitlines()[0] if str(pe).strip() else ""
+                    detail = text[:120] or detail
+            if sent:
+                uploaded += 1
+            else:
                 reasons.append(f"{os.path.basename(p)} ({detail})")
         if uploaded:
             ui.info(f"   📎  uploaded {uploaded} file(s)")
@@ -683,6 +981,51 @@ def _fast_type(driver, element, text: str) -> bool:
         return False
 
 
+def _within(selector_list: str, descendant: str) -> str:
+    """"<list> img" done properly — `<a> img, <b> img`, not `<a>, <b> img`.
+
+    A response_selector is a selector LIST: ChatGPT's is three alternatives,
+    Claude's four, because those sites serve different markup to different
+    accounts on the same day. `f"{sel} img"` reads as "everything in the list
+    EXCEPT the last one, plus images inside the last one" — the descendant
+    combinator binds tighter than the comma. Written out, ChatGPT's came to:
+
+        [data-message-author-role='assistant'],      ← the message DIV itself
+        [data-message-role='assistant'],             ← ditto
+        .markdown.prose img                          ← only this branch scoped
+
+    So the harvesters got message CONTAINERS back, not images or links. Both
+    then treated a <div> as the thing they were looking for: `get_attribute
+    ("src")` and `get_attribute("href")` are None on a div, so every one was
+    skipped — and because the list HAD matched something, neither fell back
+    to searching the whole page. The net effect was that a generated image
+    and a generated .docx were invisible to Prism on the two most-used tools
+    in the registry, every single time.
+
+    Splitting is comma-aware of brackets, parens and quotes: `[data-x='a,b']`
+    and `:is(.a, .b)` are both legal in a selector and both contain a comma
+    that does not end an alternative.
+    """
+    parts, current, depth, quote = [], [], 0, ""
+    for char in selector_list:
+        if quote:
+            if char == quote:
+                quote = ""
+        elif char in "'\"":
+            quote = char
+        elif char in "([":
+            depth += 1
+        elif char in ")]":
+            depth = max(0, depth - 1)
+        elif char == "," and depth == 0:
+            parts.append("".join(current))
+            current = []
+            continue
+        current.append(char)
+    parts.append("".join(current))
+    return ", ".join(f"{p.strip()} {descendant}" for p in parts if p.strip())
+
+
 def _harvest_images(driver, agent_cfg, stage: str) -> list[dict]:
     """A generated image can't travel in a text handoff. Pull every real image
     out of the response area — fetched through the page's own session so
@@ -700,7 +1043,7 @@ def _harvest_images(driver, agent_cfg, stage: str) -> list[dict]:
     imgs = []
     try:
         if sel:
-            imgs = driver.find_elements(By.CSS_SELECTOR, f"{sel} img")
+            imgs = driver.find_elements(By.CSS_SELECTOR, _within(sel, "img"))
         if not imgs:
             imgs = driver.find_elements(By.CSS_SELECTOR, "img")
     except Exception:
@@ -781,6 +1124,40 @@ _HARVESTABLE_EXTS = (
 )
 
 
+def _download_attr(anchor) -> str | None:
+    """The anchor's `download` ATTRIBUTE — None when it doesn't have one.
+
+    `get_attribute("download")` cannot answer this. Selenium's getAttribute
+    returns the DOM PROPERTY in preference to the attribute, and
+    HTMLAnchorElement.download is a DOMString that reads back as "" on every
+    anchor ever written, attribute or no attribute. So the obvious
+    `download_attr is not None` test below was true for every <a href> on the
+    page, and _harvest_files stopped being a filter at all: it fetched the
+    first four links in DOM order — sidebar entries, "Help", the tool's own
+    logo link — saved them extension-less (there is no extension to take from
+    a nav link), and hit its cap of 4 long before reaching the .docx the
+    stage had actually produced. That is the "documents and images aren't
+    coming back from the agents" report, and both halves of it: the real file
+    was never fetched, and what did get saved had no usable extension.
+
+    get_dom_attribute() is the one that reads the attribute itself, and it
+    keeps the distinction the caller needs: None when there is no attribute,
+    "" for a bare `<a href="/api/file/9" download>` — which IS a deliverable,
+    it just carries no filename to take an extension from. Guarded with
+    getattr because it arrived in Selenium 4 and the engine's pin is only
+    >=4.0.0; on that old path "" has to be read as absent, since the property
+    fallback cannot tell the two apart and treating it as present is the very
+    bug this exists to fix.
+    """
+    getter = getattr(anchor, "get_dom_attribute", None)
+    try:
+        if getter:
+            return getter("download")
+        return anchor.get_attribute("download") or None
+    except Exception:
+        return None
+
+
 def _harvest_files(driver, agent_cfg, stage: str) -> list[dict]:
     """Non-image sibling of _harvest_images. A code, presentation or format
     stage's real deliverable is a DOCUMENT, DECK, CODE file or ARCHIVE, not a
@@ -820,13 +1197,14 @@ def _harvest_files(driver, agent_cfg, stage: str) -> list[dict]:
     sel = agent_cfg.get("response_selector", "")
     candidates: list[tuple[str, str | None]] = []
     try:
-        links = driver.find_elements(By.CSS_SELECTOR, f"{sel} a[href]") if sel else []
+        links = (driver.find_elements(By.CSS_SELECTOR, _within(sel, "a[href]"))
+                 if sel else [])
         if not links:
             links = driver.find_elements(By.CSS_SELECTOR, "a[href]")
         for a in links:
             try:
                 candidates.append((a.get_attribute("href") or "",
-                                   a.get_attribute("download")))
+                                   _download_attr(a)))
             except Exception:
                 continue
     except Exception:

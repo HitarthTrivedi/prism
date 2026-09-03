@@ -48,34 +48,20 @@ def _find_electron_binary() -> Optional[str]:
     return shutil.which("electron")
 
 
-def _find_playwright_chromium() -> Optional[str]:
-    """Locate the Playwright-managed Chromium binary."""
-    try:
-        from playwright.sync_api import sync_playwright  # noqa: F401
-        cache_root = pathlib.Path.home() / ".cache" / "ms-playwright"
-        if cache_root.exists():
-            patterns = [
-                "chromium-*/chrome-linux64/chrome",
-                "chromium_headless_shell-*/chrome-headless-shell-linux64/chrome-headless-shell",
-                "chromium-*/chrome-linux/chrome",
-                "chromium_headless_shell-*/chrome-linux/headless_shell",
-            ]
-            for pattern in patterns:
-                matches = sorted(cache_root.glob(pattern))
-                for m in reversed(matches):
-                    if m.is_file() and os.access(m, os.X_OK):
-                        return str(m)
-    except ImportError:
-        pass
-    return None
-
-
 def _playwright_available() -> bool:
-    try:
-        from playwright.sync_api import sync_playwright  # noqa: F401
-        return _find_playwright_chromium() is not None
-    except ImportError:
-        return False
+    """Whether Playwright's Chromium is actually on this machine.
+
+    This used to glob `~/.cache/ms-playwright` for `chromium-*/chrome-linux64
+    /chrome` and friends — Linux paths, and the OS cache directory. Both are
+    wrong everywhere that matters: Windows and macOS lay the browser out
+    differently, and a frozen build carries its copy INSIDE the playwright
+    package (PLAYWRIGHT_BROWSERS_PATH=0, set in prism_gui/core_bridge.py),
+    not in the cache directory at all. So every packaged build answered "no
+    headless browser available" with the browser shipped right beside it.
+    core.browser asks Playwright itself instead.
+    """
+    from .. import browser
+    return browser.chromium_path() is not None
 
 
 # Temporary kill-switch, 2026-08-30: the render pipeline has a known bug
@@ -135,6 +121,7 @@ def _render_via_playwright(
       3. Written to FFmpeg stdin in MJPEG stream format
     """
     from playwright.sync_api import sync_playwright
+    from .. import browser as _browser
 
     runtime_dir = os.path.join(os.path.dirname(__file__), "runtime")
     index_html  = pathlib.Path(runtime_dir) / "index.html"
@@ -168,8 +155,8 @@ def _render_via_playwright(
 
     try:
         with sync_playwright() as pw:
-            browser = pw.chromium.launch(
-                headless=True,
+            browser = _browser.launch_chromium(
+                pw,
                 args=["--no-sandbox", "--disable-gpu", "--disable-software-rasterizer",
                       "--disable-dev-shm-usage", "--disable-setuid-sandbox"],
             )

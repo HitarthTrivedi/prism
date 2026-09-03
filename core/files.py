@@ -73,6 +73,46 @@ def _classify(path: str) -> str:
     return "binary"
 
 
+def _docx_text(document) -> str | None:
+    """Everything a .docx says — paragraphs AND tables, in document order.
+
+    This was `"\\n".join(p.text for p in d.paragraphs)`, and `d.paragraphs`
+    is body paragraphs ONLY: it does not descend into tables. Measured on
+    this repo's own sample_boq.docx, that read 1,924 characters and dropped
+    11,214 — nine tables, 111 rows, 85% of the file. A bill of quantities, a
+    quotation, a rate list and a purchase order are all *mostly table*, so
+    the part being thrown away was the part the customer attached the file
+    for; the tool then answered from a heading and an intro paragraph.
+
+    Order matters as much as inclusion. Appending the tables after all the
+    prose would put a table's numbers under the wrong heading, which is a
+    worse kind of wrong than leaving them out — so the body's own children
+    are walked in sequence instead.
+
+    Matched on tag name rather than by importing docx.oxml's CT_P/CT_Tbl:
+    those are internal classes that have moved between python-docx releases,
+    and this file is read by a frozen build that cannot be patched quickly.
+    """
+    from docx.table import Table
+    from docx.text.paragraph import Paragraph
+
+    lines: list[str] = []
+    for child in document.element.body.iterchildren():
+        tag = child.tag.rsplit("}", 1)[-1]
+        if tag == "p":
+            lines.append(Paragraph(child, document).text)
+        elif tag == "tbl":
+            try:
+                for row in Table(child, document).rows:
+                    cells = [c.text.strip().replace("\n", " ") for c in row.cells]
+                    if any(cells):
+                        lines.append(" | ".join(cells))
+            except Exception:       # noqa: BLE001
+                continue            # a malformed table must not lose the prose
+    text = "\n".join(lines).strip()
+    return text or None
+
+
 def _extract_text(path: str, kind: str) -> str | None:
     try:
         if kind == "text":
@@ -98,8 +138,7 @@ def _extract_text(path: str, kind: str) -> str | None:
                 import docx  # python-docx
             except Exception:
                 return None
-            d = docx.Document(path)
-            return "\n".join(p.text for p in d.paragraphs) or None
+            return _docx_text(docx.Document(path))
         # Last resort: sniff whether an unknown binary is actually decodable text.
         with open(path, "rb") as f:
             head = f.read(4096)
