@@ -94,8 +94,9 @@ _FINISHES = re.compile(
     re.IGNORECASE)
 _MATERIALS = re.compile(
     r"\b(FR-?4|CEM-?[13]|POLYIMIDE|METAL\s*CORE|ALUMINI?UM)\b", re.IGNORECASE)
-_THICKNESS = re.compile(
-    r"THICK\w*\W{0,15}?(\d(?:\.\d{1,2})?)\s*MM", re.IGNORECASE)
+_THICKNESS = re.compile(     # "thickness 1.6 mm" and "1.6mm thick" both
+    r"THICK\w*\W{0,15}?(\d(?:\.\d{1,2})?)\s*MM"
+    r"|(\d(?:\.\d{1,2})?)\s*MM\W{0,10}?THICK", re.IGNORECASE)
 _COPPER_OZ = re.compile(r"(\d(?:\.\d)?)\s*OZ", re.IGNORECASE)
 _INNER_OZ = re.compile(
     r"(?:I/?L|INNER)\W{0,20}?(\d(?:\.\d)?)\s*OZ", re.IGNORECASE)
@@ -134,7 +135,12 @@ def _sides_word(roles: set, top: str, bottom: str):
     return None
 
 
-def _job_extras(job: dict) -> dict:
+def _job_extras(job: dict, notes: str = "") -> dict:
+    """`notes` is the user's own words about the job — the ask-box text.
+    A Gerber export rarely states material, colour or finish (the Argus
+    job's 14 report files contain none of them: those specs live in the
+    customer's email); the estimator DOES know them, so 'FR4 1.6mm 1oz
+    green mask HASL' typed once fills the same cells the reports would."""
     files = job.get("files") or []
     roles = {f.get("role") for f in files}
     out = {
@@ -166,15 +172,16 @@ def _job_extras(job: dict) -> dict:
         out["slots"] = "YES" if slot else "NO"
 
     # Stackup facts mined from the CAM tool's own text reports — taken only
-    # when the report states them, in the report's own words.
-    text = _report_text(job)
+    # when the report (or the user's own note) states them.
+    text = (notes or "") + "\n" + _report_text(job)
+    text = text.strip()
     if text:
         m = _MATERIALS.search(text)
         if m:
             out["material_type"] = m.group(1).upper().replace("FR4", "FR-4")
         m = _THICKNESS.search(text)
         if m:
-            out["material_thickness"] = f"{m.group(1)} mm"
+            out["material_thickness"] = f"{m.group(1) or m.group(2)} mm"
         m = _COPPER_OZ.search(text)
         if m:
             out["copper_weight"] = f"{m.group(1)} oz"
@@ -450,7 +457,8 @@ def _patch_xlsx(template_path: str, out_path: str,
 
 
 def fill_form(job: dict, template_path: str, out_path: str,
-              meta: dict | None = None, units: str = "mm") -> dict:
+              meta: dict | None = None, units: str = "mm",
+              notes: str = "") -> dict:
     """Write a filled COPY of the client's form; the template is never
     touched, and neither is anything in the copy except the cells that
     got a measured value. Every length goes in as `units` (mm, inch or
@@ -470,7 +478,7 @@ def fill_form(job: dict, template_path: str, out_path: str,
     wb = openpyxl.load_workbook(template_path)
     # The headline figures, plus everything else the job knows — file-role
     # facts and CAM-report facts land in the same lookup the labels read.
-    answers = {**(job.get("answers") or {}), **_job_extras(job)}
+    answers = {**(job.get("answers") or {}), **_job_extras(job, notes)}
     meta = meta or {}
     filled: list = []
     drills = 0
