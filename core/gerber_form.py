@@ -82,6 +82,126 @@ def _in_units(v_mm, units: str):
     return round(float(v_mm) * _PER_MM[units], _DECIMALS[units])
 
 
+# ── the extras a job knows beyond the nine headline figures ─────────────────
+# Everything here is read off the job the measurement already built — file
+# roles, drill flags, and the CAM tool's own text reports. A fact the job
+# does not carry stays None, and the form cell stays blank: an empty cell on
+# the client's form is a question for their estimator, not a place for a
+# guess.
+
+_FINISHES = re.compile(
+    r"\b(ENIG|HASL|HAL(?:\s*LF)?|OSP|IMMERSION\s+(?:GOLD|SILVER|TIN))\b",
+    re.IGNORECASE)
+_MATERIALS = re.compile(
+    r"\b(FR-?4|CEM-?[13]|POLYIMIDE|METAL\s*CORE|ALUMINI?UM)\b", re.IGNORECASE)
+_THICKNESS = re.compile(     # "thickness 1.6 mm" and "1.6mm thick" both
+    r"THICK\w*\W{0,15}?(\d(?:\.\d{1,2})?)\s*MM"
+    r"|(\d(?:\.\d{1,2})?)\s*MM\W{0,10}?THICK", re.IGNORECASE)
+_COPPER_OZ = re.compile(r"(\d(?:\.\d)?)\s*OZ", re.IGNORECASE)
+_INNER_OZ = re.compile(
+    r"(?:I/?L|INNER)\W{0,20}?(\d(?:\.\d)?)\s*OZ", re.IGNORECASE)
+_SCORING = re.compile(r"\bV[- ]?CUT\b|\bSCOR(?:E|ING)\b", re.IGNORECASE)
+_MASK_COLOR = re.compile(
+    r"(GREEN|BLUE|BLACK|WHITE|RED|YELLOW|PURPLE|MATT[E]?\s+GREEN)"
+    r"\W{0,20}(?:SOLDER\s*)?MASK"
+    r"|(?:SOLDER\s*)?MASK\W{0,20}"
+    r"(GREEN|BLUE|BLACK|WHITE|RED|YELLOW|PURPLE|MATT[E]?\s+GREEN)",
+    re.IGNORECASE)
+_UL_CODE = re.compile(r"\bUL\W{0,15}(E\s?\d{5,6})\b", re.IGNORECASE)
+
+
+def _report_text(job: dict, cap: int = 200_000) -> str:
+    """Every CAM report / stackup note in the job, as one searchable text."""
+    chunks = []
+    for f in job.get("files") or []:
+        name = (f.get("name") or "").lower()
+        if f.get("role") in ("report", "rules") or "stackup" in name:
+            try:
+                with open(f["path"], "r", errors="replace") as fh:
+                    chunks.append(fh.read(cap))
+            except Exception:                           # noqa: BLE001
+                pass
+    return "\n".join(chunks)
+
+
+def _sides_word(roles: set, top: str, bottom: str):
+    has_top, has_bottom = top in roles, bottom in roles
+    if has_top and has_bottom:
+        return "BOTH"
+    if has_top:
+        return "TOP"
+    if has_bottom:
+        return "BOTTOM"
+    return None
+
+
+def _job_extras(job: dict, notes: str = "") -> dict:
+    """`notes` is the user's own words about the job — the ask-box text.
+    A Gerber export rarely states material, colour or finish (the Argus
+    job's 14 report files contain none of them: those specs live in the
+    customer's email); the estimator DOES know them, so 'FR4 1.6mm 1oz
+    green mask HASL' typed once fills the same cells the reports would."""
+    files = job.get("files") or []
+    roles = {f.get("role") for f in files}
+    out = {
+        "sm_sides": _sides_word(roles, "mask_top", "mask_bottom"),
+        "legend_sides": _sides_word(roles, "silk_top", "silk_bottom"),
+    }
+
+    # Which side carries SMT pads — from the measured pad rows.
+    by_name = {f.get("name"): f.get("role") for f in files}
+    smt_roles = {by_name.get(r.get("name"))
+                 for r in job.get("smt") or [] if r.get("count")}
+    out["smt_side"] = _sides_word(smt_roles, "copper_top", "copper_bottom")
+
+    # Slots: the drill file says so itself — G85 slot commands, or a rout
+    # pass. No drill file at all means "don't know", not "no".
+    drills = job.get("drills") or {}
+    drill_files = [f for f in files if f.get("role") == "drill"]
+    if drill_files:
+        slot = bool(drills.get("is_rout"))
+        if not slot:
+            for f in drill_files:
+                try:
+                    with open(f["path"], "r", errors="replace") as fh:
+                        slot = "G85" in fh.read(2_000_000)
+                except Exception:                       # noqa: BLE001
+                    pass
+                if slot:
+                    break
+        out["slots"] = "YES" if slot else "NO"
+
+    # Stackup facts mined from the CAM tool's own text reports — taken only
+    # when the report (or the user's own note) states them.
+    text = (notes or "") + "\n" + _report_text(job)
+    text = text.strip()
+    if text:
+        m = _MATERIALS.search(text)
+        if m:
+            out["material_type"] = m.group(1).upper().replace("FR4", "FR-4")
+        m = _THICKNESS.search(text)
+        if m:
+            out["material_thickness"] = f"{m.group(1) or m.group(2)} mm"
+        m = _COPPER_OZ.search(text)
+        if m:
+            out["copper_weight"] = f"{m.group(1)} oz"
+        m = _INNER_OZ.search(text)
+        if m:
+            out["inner_copper_weight"] = f"{m.group(1)} oz"
+        m = _FINISHES.search(text)
+        if m:
+            out["final_finish"] = m.group(1).upper()
+        if _SCORING.search(text):
+            out["scoring"] = "YES"
+        m = _MASK_COLOR.search(text)
+        if m:
+            out["sm_color"] = (m.group(1) or m.group(2)).upper()
+        m = _UL_CODE.search(text)
+        if m:
+            out["ul_code"] = m.group(1).replace(" ", "")
+    return out
+
+
 # (label regex, getter(answers, meta) -> value or None, is_length). Matched
 # against the cell text lowercased with trailing ':'/'-' stripped, so
 # "CUSTOMER:-" and "Board X" both read naturally. First match wins; order
@@ -110,6 +230,27 @@ _LABELS = [
      if a.get("min_pitch_mm") else None, True),
     (r"^min\.?\s*smt\s*length$", lambda a, m: _smt_lw(a)[0], True),
     (r"^min\.?\s*smt\s*width$", lambda a, m: _smt_lw(a)[1], True),
+    (r"^min\.?\s*annular\s*ring$",
+     lambda a, m: _round2(a["min_annular_ring_mm"])
+     if a.get("min_annular_ring_mm") else None, True),
+    (r"^no\.?\s*of\s*tools$", lambda a, m: a.get("drill_tools"), False),
+    (r"^smt\s*sides?$", lambda a, m: a.get("smt_side"), False),
+    (r"^sm\s*sides?$", lambda a, m: a.get("sm_sides"), False),
+    (r"^legend\s*sides?$", lambda a, m: a.get("legend_sides"), False),
+    (r"^slots?$", lambda a, m: a.get("slots"), False),
+    # S&R is Step & Repeat — the measured array arrangement (e.g. "2 x 3").
+    (r"^s\s*&\s*r$", lambda a, m: a.get("array_grid"), False),
+    (r"^i/?l\s*wt\.?(\s*finish)?$",
+     lambda a, m: a.get("inner_copper_weight"), False),
+    (r"^sm\s*colou?r$", lambda a, m: a.get("sm_color"), False),
+    (r"^ul\s*code$", lambda a, m: a.get("ul_code"), False),
+    (r"^material\s*type$", lambda a, m: a.get("material_type"), False),
+    (r"^mat\.?\s*thickness$",
+     lambda a, m: a.get("material_thickness"), False),
+    (r"^cu\.?\s*wt\.?(\s*finish)?$",
+     lambda a, m: a.get("copper_weight"), False),
+    (r"^final\s*finish$", lambda a, m: a.get("final_finish"), False),
+    (r"^scoring$", lambda a, m: a.get("scoring"), False),
     (r"^customer$", lambda a, m: m.get("customer") or None, False),
     (r"^part\s*no\.?$", lambda a, m: m.get("part") or None, False),
     (r"^date$", lambda a, m: m.get("date")
@@ -316,7 +457,8 @@ def _patch_xlsx(template_path: str, out_path: str,
 
 
 def fill_form(job: dict, template_path: str, out_path: str,
-              meta: dict | None = None, units: str = "mm") -> dict:
+              meta: dict | None = None, units: str = "mm",
+              notes: str = "") -> dict:
     """Write a filled COPY of the client's form; the template is never
     touched, and neither is anything in the copy except the cells that
     got a measured value. Every length goes in as `units` (mm, inch or
@@ -334,7 +476,9 @@ def fill_form(job: dict, template_path: str, out_path: str,
     # drill table. It never saves: writing goes through _patch_xlsx so the
     # client's photos and layout survive.
     wb = openpyxl.load_workbook(template_path)
-    answers = job.get("answers") or {}
+    # The headline figures, plus everything else the job knows — file-role
+    # facts and CAM-report facts land in the same lookup the labels read.
+    answers = {**(job.get("answers") or {}), **_job_extras(job, notes)}
     meta = meta or {}
     filled: list = []
     drills = 0
@@ -370,3 +514,135 @@ def fill_form(job: dict, template_path: str, out_path: str,
     _patch_xlsx(template_path, out_path, writes_by_sheet)
     return {"out": out_path, "filled": filled, "drill_rows": drills,
             "units": units}
+
+
+# ── the AI fills the rest — from the email and pricing, never the design ────
+# The split IS the promise: Prism measures the Gerbers offline and fills
+# what it can; the fields left over (quantity, delivery, the customer's
+# terms) live in the inquiry email and the price list — files the owner
+# would forward to a colleague anyway. Those, and ONLY those, are shown to
+# an agent, which answers with field:value JSON. Prism validates the
+# answer and patches the cells itself — the AI never touches the file, and
+# an AI-read value can never overwrite a measured one, because only cells
+# that are STILL BLANK are ever offered.
+
+def blank_fields(path: str) -> list[str]:
+    """Labels on the form whose value cell is still empty — the fields
+    measurement could not fill. A label is any short text cell (a caption,
+    not a sentence) whose right-hand neighbour holds neither a value nor a
+    formula."""
+    if not HAVE_XLSX:
+        raise FormError("Reading an Excel form needs the openpyxl package.")
+    wb = openpyxl.load_workbook(path)
+    out, seen = [], set()
+    for ws in wb.worksheets:
+        for row in ws.iter_rows():
+            for cell in row:
+                if not isinstance(cell.value, str):
+                    continue
+                text = cell.value.strip()
+                if not text or len(text) > 40 or text.startswith("="):
+                    continue
+                target = ws.cell(row=cell.row, column=cell.column + 1)
+                if target.value is not None:
+                    continue
+                key = _label_text(text)
+                if key and key not in seen:
+                    seen.add(key)
+                    out.append(text.rstrip(":-").strip())
+    return out
+
+
+def ai_fill_prompt(filled: list, blanks: list[str], note: str = "") -> str:
+    """What the agent is asked. The design's absence is stated up front so
+    the agent neither asks for it nor pretends to have seen it."""
+    done = "\n".join(f"  {label}: {value}" for _c, label, value in filled
+                     if label != "drill")
+    todo = "\n".join(f"  - {b}" for b in blanks)
+    return (
+        "You are completing a PCB fabrication quotation form. The measured "
+        "half is DONE — Prism measured the Gerber files offline, and the "
+        "design itself is confidential and not shared with you.\n\n"
+        f"ALREADY FILLED (context only — never restate or change):\n{done}\n\n"
+        f"STILL BLANK fields:\n{todo}\n\n"
+        + (f"The owner's note: {note}\n\n" if note else "")
+        + "The attached documents are the customer's inquiry email, pricing "
+        "or spec sheets. Read them and answer with ONE JSON object and "
+        "nothing else:\n"
+        '{"fills": {"<field exactly as listed above>": "<value>", ...}}\n\n'
+        "Rules: every value must come from the attached documents (or plain "
+        "arithmetic on them). OMIT any field the documents do not answer — "
+        "an omitted field beats a guess. Keep values short: a number, a "
+        "word, a short phrase. Never invent a rate, a quantity or a spec.")
+
+
+def parse_fills(texts: list[str], blanks: list[str]) -> tuple[dict, str]:
+    """Newest capture that parses; only fields that were actually offered
+    survive, and values are clipped to cell size."""
+    import json
+    allowed = {_label_text(b): b for b in blanks}
+    for t in reversed([t for t in texts if t and t.strip()]):
+        s, e = t.find("{"), t.rfind("}") + 1
+        if s == -1 or e <= s:
+            continue
+        try:
+            raw = json.loads(t[s:e])
+        except ValueError:
+            continue
+        if not isinstance(raw, dict):
+            continue
+        fills = raw.get("fills") if isinstance(raw.get("fills"), dict) else (
+            raw if all(isinstance(v, (str, int, float))
+                       for v in raw.values()) else None)
+        if fills is None:
+            continue
+        out = {}
+        for key, value in fills.items():
+            label = allowed.get(_label_text(str(key)))
+            if label is None or value is None:
+                continue
+            if isinstance(value, (int, float)):
+                out[label] = value
+            else:
+                v = str(value).strip()
+                if v:
+                    out[label] = v[:120]
+        if out:
+            return out, ""
+        return {}, "The agent answered, but named no field that was blank."
+    return {}, "No JSON came back that Prism could read."
+
+
+def fill_by_label(path: str, out_path: str, fills: dict) -> dict:
+    """Patch {label: value} into the form the same way fill_form does —
+    value in the cell to the label's right, formulas never touched, every
+    other byte kept. Works on the already-filled copy, so the AI's fields
+    join the measured ones in one file."""
+    if not HAVE_XLSX:
+        raise FormError("Filling an Excel form needs the openpyxl package.")
+    wanted = {_label_text(k): v for k, v in fills.items()}
+    wb = openpyxl.load_workbook(path)
+    writes_by_sheet: dict = {}
+    filled: list = []
+    for ws in wb.worksheets:
+        writes = writes_by_sheet.setdefault(ws.title, {})
+        for row in ws.iter_rows():
+            for cell in row:
+                key = _label_text(cell.value)
+                if key not in wanted:
+                    continue
+                target = ws.cell(row=cell.row, column=cell.column + 1)
+                if _is_formula(target.value) or target.value is not None:
+                    continue        # measured or their arithmetic — never
+                writes[target.coordinate] = wanted[key]
+                filled.append((target.coordinate, cell.value.strip(),
+                               wanted[key]))
+    if os.path.abspath(out_path) == os.path.abspath(path):
+        # Patching a file into itself: zipfile would truncate the source
+        # mid-read. Stage next to it, then swap atomically.
+        tmp = out_path + ".patching"
+        _patch_xlsx(path, tmp, writes_by_sheet)
+        os.replace(tmp, out_path)
+    else:
+        _patch_xlsx(path, out_path, writes_by_sheet)
+    return {"out": out_path, "filled": filled}
