@@ -339,8 +339,17 @@ def _clear_profile_locks():
             pass
 
 
-def _chrome_pids_using_profile() -> list[int]:
+def _chrome_pids_using_profile() -> list[int] | None:
     """PIDs of every Chrome process currently holding Prism's OWN profile.
+
+    None — not [] — when the probe itself could not run. "I looked and found
+    nothing" and "I could not look" lead to opposite next steps, and
+    collapsing them is how a fix becomes a silent no-op: on Windows this
+    shells out to PowerShell, and if that fails for any reason (execution
+    policy, WMI disabled, no powershell.exe on PATH) an empty list would
+    read as "the profile is free", _release_profile would do nothing, and
+    the customer would get the original "cannot connect to chrome" back with
+    no clue why. The caller says so out loud instead.
 
     Two conditions, and BOTH are load-bearing, because the result of this is
     fed to a kill:
@@ -361,15 +370,23 @@ def _chrome_pids_using_profile() -> list[int]:
     try:
         if platform.system() == "Windows":
             # Win32_Process, not tasklist: the command line is the only place
-            # the profile appears, and tasklist does not report it. Passed
-            # through the environment rather than interpolated into the
-            # script, so a path with a quote or a bracket in it can neither
-            # break the command nor be read as a wildcard. Name='chrome.exe'
-            # is the "is it Chrome" half.
+            # the profile appears, and tasklist does not report it. The
+            # profile path goes through the ENVIRONMENT rather than into the
+            # script text, so a path containing a quote or a bracket can
+            # neither break the command nor be read as a wildcard.
+            #
+            # NOT ONE DOUBLE QUOTE in the script, which is why the obvious
+            # `-Filter "Name='chrome.exe'"` is a Where-Object test instead.
+            # Python builds a Windows command line with list2cmdline, which
+            # escapes an embedded " as \" — and powershell's -Command does
+            # not unescape it the way a C program's argv would, so the filter
+            # arrives as a parse error. That fails the whole probe, and a
+            # failed probe on Windows is precisely the case this function
+            # exists to handle. Verified by printing list2cmdline's output.
             out = subprocess.check_output(
                 ["powershell", "-NoProfile", "-NonInteractive", "-Command",
-                 "Get-CimInstance Win32_Process -Filter \"Name='chrome.exe'\" "
-                 "| Where-Object { $_.CommandLine -and "
+                 "Get-CimInstance Win32_Process | Where-Object { "
+                 "$_.Name -eq 'chrome.exe' -and $_.CommandLine -and "
                  "$_.CommandLine.Contains($env:PRISM_PROFILE_ARG) } "
                  "| ForEach-Object { $_.ProcessId }"],
                 text=True, stderr=subprocess.DEVNULL, timeout=30,
@@ -381,7 +398,7 @@ def _chrome_pids_using_profile() -> list[int]:
                                           timeout=15)
             out = "\n".join(_posix_chrome_pids(raw, marker))
     except Exception:
-        return []                      # no ps/powershell, or it timed out
+        return None                    # could not look — not "nothing there"
     pids = []
     for token in out.split():
         try:
@@ -432,6 +449,14 @@ def _release_profile() -> int:
     costs nothing and is the only way to get a browser at all.
     """
     pids = _chrome_pids_using_profile()
+    if pids is None:
+        # Said out loud, because the next thing the customer may see is the
+        # "cannot connect to chrome" this exists to prevent — and then the
+        # question is whether the guard ran and found nothing, or never ran.
+        ui.warn("   couldn't check for a leftover Chrome on Prism's profile. "
+                "If the browser fails to start, close every Chrome window and "
+                "try again.")
+        return 0
     if not pids:
         return 0
     ui.info(f"   🧹  closing {len(pids)} leftover Chrome process(es) still "
