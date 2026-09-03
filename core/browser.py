@@ -36,6 +36,7 @@ than four copies that drift.
 from __future__ import annotations
 
 import os
+import sys
 
 # Resolved once per process: starting Playwright's Node driver just to ask
 # where Chromium is costs the better part of a second, and `available()` is
@@ -152,7 +153,37 @@ def launch_chromium(pw, args=None, **kwargs):
     renders instead of being told it cannot.
     """
     args = list(args or [])
+    kwargs.setdefault("env", _child_env())
     try:
         return pw.chromium.launch(channel="chromium", args=args, **kwargs)
     except Exception:
         return pw.chromium.launch(args=args, **kwargs)
+
+
+def _child_env() -> dict:
+    """The environment Chromium should start in, not the one Prism is in.
+
+    PyInstaller points LD_LIBRARY_PATH at its own bundle so the frozen app
+    finds the libraries it ships, and stashes the real one in
+    LD_LIBRARY_PATH_ORIG. Every child process inherits that — so a browser
+    launched from inside a frozen Prism loads Qt's bundled libstdc++/glib
+    instead of the system's, and dies on the spot.
+
+    What that looks like is NOT a missing-library error, which is why it
+    took two goes to find: the browser starts, exits immediately, and
+    Playwright reports "Target page, context or browser has been closed".
+    Adding the system dependencies (playwright install --with-deps) did not
+    change it, because they were never missing.
+
+    Only ever a Linux question — Windows and macOS resolve libraries by
+    other means and both were green throughout.
+    """
+    env = dict(os.environ)
+    if not sys.platform.startswith("linux"):
+        return env
+    original = env.pop("LD_LIBRARY_PATH_ORIG", None)
+    if original is not None:            # frozen: put the real one back
+        env["LD_LIBRARY_PATH"] = original
+    elif getattr(sys, "frozen", False):  # frozen with nothing stashed: drop it
+        env.pop("LD_LIBRARY_PATH", None)
+    return env
