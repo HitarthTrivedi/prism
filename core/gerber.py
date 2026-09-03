@@ -1818,6 +1818,61 @@ def analyse(paths: list[str], snap_mm: float = SNAP_MM, on_progress=None) -> dic
                 "carries the board rectangle. Worth confirming with the "
                 "customer.")
     board = board_outline(outline_layers)
+
+    # The board must CONTAIN the copper — every pad and track lives inside
+    # the edge. Altium puts internal CUTOUTS on .GM1, the same extension
+    # other tools use for the outline itself; measured as the board, a
+    # 67 x 50 mm cutout stood in for a 290 x 162 mm keyboard on a real job
+    # while the true edge sat unread on a mechanical layer. When the
+    # "outline" comes up smaller than the artwork, every outline-ish and
+    # mechanical layer is searched for a closed shape that CONTAINS the
+    # copper; the smallest such shape is the edge.
+    if board["width_mm"] is not None:
+        _cop = [parsed[e["path"]] for e in files
+                if e["role"] in _COPPER_ROLES and e["path"] in parsed]
+        _pts = [p for l in _cop for _, a, b in l.draws for p in (a, b)]
+        _pts += [p for l in _cop for _, p in l.flashes]
+        if _pts:
+            _xs, _ys = [p[0] for p in _pts], [p[1] for p in _pts]
+            cw, ch = max(_xs) - min(_xs), max(_ys) - min(_ys)
+            if (cw > board["width_mm"] * 1.05
+                    or ch > board["height_mm"] * 1.05):
+                old_w, old_h = board["width_mm"], board["height_mm"]
+                best = None
+                for e in files:
+                    if e["role"] not in ("outline", "mechanical",
+                                         "drill_guide", "drill_drawing") \
+                            or e["path"] not in parsed:
+                        continue
+                    try:
+                        alt = board_outline([parsed[e["path"]]])
+                    except Exception:                   # noqa: BLE001
+                        continue
+                    if (alt["width_mm"]
+                            and alt["width_mm"] >= cw * 0.98
+                            and alt["height_mm"] >= ch * 0.98):
+                        # Rank by how much the layer is TRUSTED to carry an
+                        # edge, then closedness, then size. On the real
+                        # keyboard job the mechanical layer's frame is the
+                        # doc-exact 290 x 162 while the drill guide's
+                        # extents stop at the outermost hole — smaller, and
+                        # wrong.
+                        trust = {"outline": 0, "mechanical": 1}.get(
+                            e["role"], 2)
+                        closed = 0 if "closed" in alt["method"] else 1
+                        area = alt["width_mm"] * alt["height_mm"]
+                        if best is None or (trust, closed, area) < best[0]:
+                            best = ((trust, closed, area), alt, e["name"])
+                if best:
+                    board = best[1]
+                    warnings.append(
+                        f"The outline layer's closed shape ({old_w:.1f} x "
+                        f"{old_h:.1f} mm) is SMALLER than the copper "
+                        f"({cw:.1f} x {ch:.1f} mm) — that shape is a cutout, "
+                        f"not the board edge. The size was taken from "
+                        f"{best[2]}, whose closed shape contains the "
+                        "artwork.")
+
     if board["width_mm"] is None:
         copper_layers = [parsed[e["path"]] for e in files
                          if e["role"] in _COPPER_ROLES and e["path"] in parsed]
