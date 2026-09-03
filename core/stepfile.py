@@ -722,8 +722,13 @@ def review_html(report: dict, plan: dict, out_dir: str,
 
     advice = "".join(f"<li>{_html.escape(a)}</li>"
                      for a in plan.get("advice") or [])
-    img = ("<h2>The part as measured</h2><img src='drawing.png'>"
-           if os.path.exists(os.path.join(out_dir, "drawing.png")) else "")
+    imgs = []
+    if os.path.exists(os.path.join(out_dir, "drawing.png")):
+        imgs.append(("The part as received", "drawing.png"))
+    if after and os.path.exists(os.path.join(out_dir, "drawing_after.png")):
+        imgs.append(("The modified model — drawn from the BUILT file",
+                     "drawing_after.png"))
+    img = "".join(f"<h2>{t}</h2><img src='{f}'>" for t, f in imgs)
 
     page = (
         "<!doctype html><meta charset='utf-8'>"

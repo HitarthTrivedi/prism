@@ -1512,9 +1512,20 @@ def cmd_step_ask(cfg, arg: str, attachments: list):
         SF.write_xlsx(after, os.path.join(out_dir, "dimensions_after.xlsx"))
     except SF.StepError:
         pass
+    # The visual half of the proof: the modified model drawn FROM THE
+    # BUILT FILE, so the review page shows before and after side by side.
+    try:
+        drawn_after = SF.render_sheet(after, os.path.join(out_dir, "after"))
+        if drawn_after.get("png"):
+            shutil.copyfile(drawn_after["png"],
+                            os.path.join(out_dir, "drawing_after.png"))
+    except Exception:                                   # noqa: BLE001
+        pass
     # Same page, rewritten: the After column now holds the RE-MEASURED
     # figures from the built file, and the banner says so.
-    SF.review_html(report, plan, out_dir, question=question, after=after)
+    review = SF.review_html(report, plan, out_dir, question=question,
+                            after=after)
+    ui.ok(f"before/after page → {review}")
     ui.ok(f"modified model → {out_path}")
     record["step_ask"]["modified"] = out_path
     record["step_ask"]["log"] = done["log"]
