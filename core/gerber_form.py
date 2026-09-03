@@ -97,7 +97,16 @@ _MATERIALS = re.compile(
 _THICKNESS = re.compile(
     r"THICK\w*\W{0,15}?(\d(?:\.\d{1,2})?)\s*MM", re.IGNORECASE)
 _COPPER_OZ = re.compile(r"(\d(?:\.\d)?)\s*OZ", re.IGNORECASE)
+_INNER_OZ = re.compile(
+    r"(?:I/?L|INNER)\W{0,20}?(\d(?:\.\d)?)\s*OZ", re.IGNORECASE)
 _SCORING = re.compile(r"\bV[- ]?CUT\b|\bSCOR(?:E|ING)\b", re.IGNORECASE)
+_MASK_COLOR = re.compile(
+    r"(GREEN|BLUE|BLACK|WHITE|RED|YELLOW|PURPLE|MATT[E]?\s+GREEN)"
+    r"\W{0,20}(?:SOLDER\s*)?MASK"
+    r"|(?:SOLDER\s*)?MASK\W{0,20}"
+    r"(GREEN|BLUE|BLACK|WHITE|RED|YELLOW|PURPLE|MATT[E]?\s+GREEN)",
+    re.IGNORECASE)
+_UL_CODE = re.compile(r"\bUL\W{0,15}(E\s?\d{5,6})\b", re.IGNORECASE)
 
 
 def _report_text(job: dict, cap: int = 200_000) -> str:
@@ -169,11 +178,20 @@ def _job_extras(job: dict) -> dict:
         m = _COPPER_OZ.search(text)
         if m:
             out["copper_weight"] = f"{m.group(1)} oz"
+        m = _INNER_OZ.search(text)
+        if m:
+            out["inner_copper_weight"] = f"{m.group(1)} oz"
         m = _FINISHES.search(text)
         if m:
             out["final_finish"] = m.group(1).upper()
         if _SCORING.search(text):
             out["scoring"] = "YES"
+        m = _MASK_COLOR.search(text)
+        if m:
+            out["sm_color"] = (m.group(1) or m.group(2)).upper()
+        m = _UL_CODE.search(text)
+        if m:
+            out["ul_code"] = m.group(1).replace(" ", "")
     return out
 
 
@@ -213,6 +231,12 @@ _LABELS = [
     (r"^sm\s*sides?$", lambda a, m: a.get("sm_sides"), False),
     (r"^legend\s*sides?$", lambda a, m: a.get("legend_sides"), False),
     (r"^slots?$", lambda a, m: a.get("slots"), False),
+    # S&R is Step & Repeat — the measured array arrangement (e.g. "2 x 3").
+    (r"^s\s*&\s*r$", lambda a, m: a.get("array_grid"), False),
+    (r"^i/?l\s*wt\.?(\s*finish)?$",
+     lambda a, m: a.get("inner_copper_weight"), False),
+    (r"^sm\s*colou?r$", lambda a, m: a.get("sm_color"), False),
+    (r"^ul\s*code$", lambda a, m: a.get("ul_code"), False),
     (r"^material\s*type$", lambda a, m: a.get("material_type"), False),
     (r"^mat\.?\s*thickness$",
      lambda a, m: a.get("material_thickness"), False),
