@@ -390,6 +390,18 @@ AGENT_REGISTRY = {
     # The selectors below are still used, but only for the results grid and
     # for the typed-search fallback when the previous stage gave us nothing
     # parseable.
+    #
+    # Apollo does have ONE place that takes prose: the "Use Apollo AI to find
+    # the right prospects" box on an empty People page. Text entered there is
+    # handed to Apollo's AI Assistant, which turns it into filters and applies
+    # them to the table (verified with Playwright, Sep 2026: a 74-character
+    # prompt became Titles + Company keywords + Location and 8 rows, and the
+    # box kept a 4,000-character paste with no maxlength). It is NOT the
+    # toolbar "Search people" box beside the filter button — that one is a
+    # plain keyword search and matches nobody when given a sentence, which is
+    # where the fallback used to type. Each prompt spends one assistant chat
+    # (the free plan shows "N CHATS LEFT" in the panel), so the URL route
+    # stays first whenever the previous stage handed over a filter block.
     "Apollo": _agent(
         "https://app.apollo.io/#/people",
         "B2B lead database — real companies and named decision-makers with "
@@ -406,8 +418,22 @@ AGENT_REGISTRY = {
         # given comfortably inside the limit its API enforces.
         max_query_chars=180,
         handoff_spec=_APOLLO_HANDOFF,
-        textarea_selector=("input[placeholder*='Search'], input[type='search'], "
-                           "input[type='text'], textarea"),
+        # The prose box. Attribute-based on purpose: Apollo's zp_* class
+        # names are hashed per deploy, the role and the rotating
+        # "Example: …" placeholder are not. It only renders while no search
+        # is on screen; the "Reset filters" button (or the bare People
+        # route) brings it back. NOT "Search with AI" — that button opens a
+        # chat about the current search and spends a chat doing it.
+        ai_prompt_selector="input[role='combobox'][placeholder^='Example:']",
+        ai_prompt_reset="Reset filters",
+        # Measured capacity, not a guess — see the comment above the entry.
+        ai_prompt_max_chars=4000,
+        # The assistant "brews" for 30–60s before the filters land.
+        ai_prompt_wait=150,
+        # Keyword box — last resort only, and only ever given a few words.
+        textarea_selector=("input[data-element='finder-toolbar-search-input'], "
+                           "input[placeholder*='Search people'], "
+                           "input[type='search'], input[type='text']"),
         response_selector=("[data-cy='people-table'], [role='table'], table, "
                            "[data-cy-loaded='true'], .zp_tFLCQ"),
         submit_selector=("button[type='submit'], button[aria-label*='Search'], "

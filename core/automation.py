@@ -2164,13 +2164,189 @@ def _apollo_fallback_query(brief: str, limit: int = 60) -> str:
     return " ".join(terms[:6])[:limit] or line[:limit]
 
 
+def _apollo_ai_text(brief: str, cap: int = 4000) -> str:
+    """What goes into Apollo's AI box: the brief's words, on one line, trimmed
+    to what the box was measured to keep.
+
+    One line because the box is an <input>, not a textarea: a newline typed
+    into it is either dropped (the JS path) or pressed as Enter (send_keys),
+    and Enter submits — the second half of a two-line brief would arrive as
+    a separate, chat-spending prompt. Prose is otherwise left alone; this is
+    the one surface in Apollo that reads sentences. The cut lands on a word
+    boundary so the assistant never reads half a word as the request."""
+    text = " ".join((brief or "").split())
+    if len(text) <= cap:
+        return text
+    head = text[:cap]
+    sp = head.rfind(" ")
+    return (head[:sp] if sp > cap // 2 else head).rstrip()
+
+
+# The People page shows its match count as a "Total" tile. It is the earliest
+# reliable sign that the assistant has applied filters: the number drops from
+# the whole database (hundreds of millions) to the matched few, seconds before
+# the grid finishes drawing. Read as text, so a redesign of the tile only
+# costs the early exit, not the search.
+_APOLLO_TOTAL_JS = """
+const m = document.body.innerText.match(/Total\\s*\\n?\\s*([0-9][0-9.,]*[KM]?)/);
+return m ? m[1] : '';
+"""
+
+# Anything under this is a filtered search; the unfiltered tile reads in the
+# hundreds of millions, and a tile still loading reads 0.
+_APOLLO_FILTERED_BELOW = 5_000_000
+
+
+def _apollo_total_count(text: str):
+    """'246.4M' -> 246400000, '1.2K' -> 1200, '8' -> 8, '' -> None."""
+    t = (text or "").strip().replace(",", "")
+    if not t:
+        return None
+    mult = {"K": 1_000, "M": 1_000_000}.get(t[-1].upper(), 1)
+    if mult != 1:
+        t = t[:-1]
+    try:
+        return int(float(t) * mult)
+    except ValueError:
+        return None
+_APOLLO_CHATS_JS = """
+const m = document.body.innerText.match(/(\\d+)\\s+CHATS?\\s+LEFT/i);
+return m ? m[1] : '';
+"""
+
+
+def _apollo_ai_box(driver, agent_cfg: dict):
+    """The "Use Apollo AI to find the right prospects" field, or None.
+
+    Apollo only draws it while NO search is on screen — and a Prism session
+    restores its last tab, so the People page usually comes back with the
+    previous run's keywords still applied and the box gone. Two things bring
+    it back, both checked on the live app: the "Reset filters" button in the
+    empty-results area, and the bare People route. Tried in that order.
+
+    Not the "Search with AI" button. Despite the name it does not reveal the
+    box: it opens an assistant chat ABOUT the current search ("My search
+    returns 0 results…") and spends one of the account's chats doing so.
+    """
+    from selenium.webdriver.common.by import By
+    from selenium.webdriver.support.ui import WebDriverWait
+
+    sel = agent_cfg.get("ai_prompt_selector", "")
+    if not sel:
+        return None
+
+    def _find():
+        return [e for e in driver.find_elements(By.CSS_SELECTOR, sel)
+                if e.is_displayed()]
+
+    boxes = _find()
+    if boxes:
+        return boxes[0]
+
+    reset = agent_cfg.get("ai_prompt_reset", "")
+    if reset:
+        try:
+            btn = driver.find_element(
+                By.XPATH, f"//button[contains(normalize-space(.), '{reset}')]")
+            if btn.is_displayed() and btn.is_enabled():
+                btn.click()
+                WebDriverWait(driver, 10).until(lambda d: _find())
+                return _find()[0]
+        except Exception:
+            pass
+
+    # No reset button (nothing was filtered, or the page is mid-load). A
+    # hash change to the bare route clears the search state without a
+    # reload; a full get of the same URL is the heavier second try.
+    root = (agent_cfg.get("url") or "https://app.apollo.io/#/people").split("?")[0]
+    frag = "#" + root.split("#", 1)[1] if "#" in root else "#/people"
+    for step in ("hash", "get"):
+        try:
+            if step == "hash":
+                driver.execute_script("location.hash = arguments[0]", frag)
+            else:
+                driver.get(root)
+            WebDriverWait(driver, 12).until(lambda d: _find())
+            return _find()[0]
+        except Exception:
+            continue
+    return None
+
+
+def _apollo_ai_prompt(driver, agent_cfg: dict, prompt: str) -> bool:
+    """Put a prose prompt where Apollo actually reads prose, and wait for the
+    filters it produces to land on the table.
+
+    The box is the "Use Apollo AI to find the right prospects" field in the
+    empty state of the People page. Enter hands the text to Apollo's AI
+    Assistant, which opens as a side panel, thinks for half a minute or more,
+    then applies Titles / keywords / Location to the grid — the same grid
+    _capture() already reads. Returns False if the box could not be found or
+    the text did not go in, so the caller can drop to the keyword search.
+    """
+    from selenium.webdriver.common.by import By
+    from selenium.webdriver.common.keys import Keys
+
+    box = _apollo_ai_box(driver, agent_cfg)
+    if box is None:
+        ui.warn("   Apollo's AI prompt box isn't on this page")
+        return False
+
+    try:
+        chats = driver.execute_script(_APOLLO_CHATS_JS)
+    except Exception:
+        chats = ""
+    if chats == "0":
+        ui.warn("   this Apollo account has no AI chats left this month — "
+                "the prompt box would be ignored")
+        return False
+
+    try:
+        box.click()
+        if not _fast_type(driver, box, prompt):
+            box.clear()
+            box.send_keys(prompt)
+        box.send_keys(Keys.ENTER)
+    except Exception as e:
+        ui.warn(f"   couldn't hand the prompt to Apollo's AI box ({e})")
+        return False
+    ui.info(f"   🤖  prompt handed to Apollo AI ({len(prompt)} chars"
+            + (f", {chats} chats left" if chats else "") + ") — it takes a "
+            "minute to turn that into filters")
+
+    # Done when the Total tile reads a filtered count or rows appear. The
+    # box only exists on the empty People page, which shows no grid at all,
+    # so either is a real signal; a tile that still says 0 is one that has
+    # not loaded yet, not a filter that matched nobody.
+    deadline = time.time() + int(agent_cfg.get("ai_prompt_wait", 150))
+    rows_sel = agent_cfg.get("response_selector", "")
+    while time.time() < deadline:
+        time.sleep(3)
+        try:
+            n = _apollo_total_count(driver.execute_script(_APOLLO_TOTAL_JS))
+            if n is not None and 0 < n < _APOLLO_FILTERED_BELOW:
+                break
+            if rows_sel and any(
+                    e.is_displayed() and len(e.text) > 50
+                    for e in driver.find_elements(By.CSS_SELECTOR, rows_sel)):
+                break
+        except Exception:
+            continue
+    else:
+        ui.warn("   Apollo AI hadn't applied any filters when the wait ran "
+                "out — reading whatever the table shows")
+    return True
+
+
 def _run_apollo(driver, agent_cfg: dict, stage: str, brief: str) -> list[str]:
     """Drive Apollo by URL from the filter block the previous stage wrote.
 
-    Falls back to typing a short query into the search box when there is no
-    parseable block — an Apollo search on rough keywords still beats failing
-    the stage, and the truncation keeps it inside the 200-character limit that
-    caused the original error either way.
+    With no parseable block, the brief goes into Apollo's AI prompt box —
+    the one field on the page that reads prose — and the filters the
+    assistant builds from it are what get captured. Only if that box cannot
+    be used does the run drop to a few plain words in the keyword search,
+    which still beats failing the stage and stays inside the 200-character
+    limit that caused the original error either way.
     """
     from selenium.webdriver.common.by import By
     from selenium.webdriver.common.keys import Keys
@@ -2179,6 +2355,7 @@ def _run_apollo(driver, agent_cfg: dict, stage: str, brief: str) -> list[str]:
 
     cap = int(agent_cfg.get("max_query_chars", 180))
     filters = _apollo_filters(brief, cap)
+    prompted = False
 
     if filters:
         shown = "; ".join(f"{k.lower()}: {', '.join(v)}"
@@ -2190,35 +2367,52 @@ def _run_apollo(driver, agent_cfg: dict, stage: str, brief: str) -> list[str]:
         except Exception as e:
             ui.warn(f"   couldn't open the filtered search ({e})")
     else:
-        # Nothing structured came back. Apollo's keyword box is not a chat
-        # prompt: a sentence typed into it matches nobody, while a handful
-        # of plain words returns a wide but real table — so the fallback is
-        # a few words, never a line of prose.
-        ui.warn("   the previous stage sent no APOLLO filter block — falling "
-                "back to a short keyword search")
-        query = _bmp_safe(_apollo_fallback_query(brief))
-        try:
-            box = WebDriverWait(driver, agent_cfg.get("input_wait", 30)).until(
-                EC.presence_of_element_located(
-                    (By.CSS_SELECTOR, agent_cfg["textarea_selector"])))
-            box.clear()
-            if not _fast_type(driver, box, query):
-                box.send_keys(query)
-            box.send_keys(Keys.ENTER)
-        except Exception as e:
-            ui.err(f"   couldn't run the Apollo search: {e}")
-            return []
+        ui.info("   the previous stage sent no APOLLO filter block — handing "
+                "the brief to Apollo's AI search instead")
+        prompt = _apollo_ai_text(brief, int(agent_cfg.get("ai_prompt_max_chars",
+                                                           4000)))
+        prompted = _apollo_ai_prompt(driver, agent_cfg, prompt)
+        if not prompted:
+            # The AI box is gone or spent. Apollo's keyword box is not a chat
+            # prompt: a sentence typed into it matches nobody, while a
+            # handful of plain words returns a wide but real table — so this
+            # last resort is a few words, never a line of prose.
+            ui.warn("   falling back to a short keyword search")
+            query = _bmp_safe(_apollo_fallback_query(brief))
+            try:
+                box = WebDriverWait(driver, agent_cfg.get("input_wait", 30)).until(
+                    EC.presence_of_element_located(
+                        (By.CSS_SELECTOR, agent_cfg["textarea_selector"])))
+                box.clear()
+                if not _fast_type(driver, box, query):
+                    box.send_keys(query)
+                box.send_keys(Keys.ENTER)
+            except Exception as e:
+                ui.err(f"   couldn't run the Apollo search: {e}")
+                return []
 
-    # The grid loads asynchronously well after the URL settles.
-    try:
-        WebDriverWait(driver, agent_cfg.get("input_wait", 45)).until(
-            EC.presence_of_element_located(
-                (By.CSS_SELECTOR, agent_cfg["response_selector"])))
-    except Exception:
-        pass
+    # The grid loads asynchronously well after the URL settles. The AI path
+    # has already waited for the filters to land.
+    if not prompted:
+        try:
+            WebDriverWait(driver, agent_cfg.get("input_wait", 45)).until(
+                EC.presence_of_element_located(
+                    (By.CSS_SELECTOR, agent_cfg["response_selector"])))
+        except Exception:
+            pass
     time.sleep(4)
 
     rows = _capture(driver, agent_cfg)
+    if not rows and filters and not prompted:
+        # The block parsed but matched nobody. One assistant chat is a fair
+        # price for a second opinion from something that reads the brief.
+        ui.warn("   the filtered search matched nobody — trying the brief in "
+                "Apollo's AI search")
+        prompt = _apollo_ai_text(brief, int(agent_cfg.get("ai_prompt_max_chars",
+                                                           4000)))
+        if _apollo_ai_prompt(driver, agent_cfg, prompt):
+            time.sleep(4)
+            rows = _capture(driver, agent_cfg)
     if not rows:
         ui.warn("   Apollo returned no rows. Three things do this: the "
                 "filters matched nobody, this Apollo account is signed out, "
