@@ -26,21 +26,30 @@ What comes out, per part and for the assembly:
   · volume, surface area, and weight at common material densities —
     CRC steel for metal moulding, ABS/PP/PC/Nylon for plastic.
 
-Deliverables written beside the terminal output:
+Deliverables written beside the terminal output, every one of them named
+after the customer's own file — for Assem1.STEP:
 
-  · dimensions.xlsx     — one row per part in the drawing's own style
-                          ("101.00 x 93.00 x 71.00 mm — 1 nos") plus a
-                          hole table, readable by the estimator's Excel;
-  · drawing.html/.png   — a drawing sheet: an isometric view of every
-                          part with its caption and holes, like the
-                          hand-made sheet this replaces;
-  · <part>.svg          — the individual views.
+  · Assem1 - dimensions.xlsx      — one row per part in the drawing's own
+                                    style ("101.00 x 93.00 x 71.00 mm — 1
+                                    nos") plus a hole table, readable by
+                                    the estimator's Excel;
+  · Assem1 - drawing sheet.html   — a drawing sheet: an isometric view of
+    Assem1 - drawing sheet.png      every part with its caption and holes,
+                                    like the hand-made sheet this replaces;
+  · Assem1 - view <part>.svg      — the individual views.
+
+The name is the whole point of the prefix: an estimator keeps ten jobs'
+sheets in one folder, and "dimensions.xlsx" ten times over is ten files
+nobody can tell apart. See names() and output_dir() — where the files go
+is the caller's choice (the GUI asks the person), the default is a folder
+per model under ~/Desktop/Prism Step.
 """
 from __future__ import annotations
 
 import datetime as _dt
 import os
 import re
+from urllib.parse import quote as _quote
 
 try:
     import cadquery as _cq
@@ -80,12 +89,90 @@ _DENSITY = {
 
 _EXTS = (".step", ".stp")
 
+# Where a model's files go when nobody has said otherwise. The GUI asks the
+# person and passes their answer as `root` to output_dir(); the terminal
+# reads cfg["step_out_dir"] and falls back to this.
+DEFAULT_OUT_ROOT = os.path.join(os.path.expanduser("~/Desktop"), "Prism Step")
+
 
 def available() -> tuple[bool, str]:
     if not HAVE_CAD:
         return False, ("The STEP add-on needs the cadquery package "
                        "(pip install cadquery).")
     return True, ""
+
+
+# ── where the files go, and what they are called ────────────────────────────
+
+def stem_of(path_or_name: str) -> str:
+    """The customer's own file name without its extension, made safe to use
+    as part of a file name: 'Assem1.STEP' -> 'Assem1', '~/x/housing v2.stp'
+    -> 'housing v2'. Case and spaces are kept — this is the name the person
+    knows the job by, and 'assem1' is not what they called it."""
+    base = os.path.splitext(os.path.basename(path_or_name or ""))[0]
+    illegal = '<>:"/\\|?*'          # reserved on Windows; harmless elsewhere
+    clean = "".join(c for c in base.strip() if c not in illegal and c.isprintable())
+    clean = " ".join(clean.split())[:60].strip(" .")
+    return clean or "model"
+
+
+def _stem(report: dict) -> str:
+    return report.get("stem") or stem_of(report.get("file", ""))
+
+
+def names(report_or_stem) -> dict[str, str]:
+    """Every deliverable's file name, each carrying the model's own name.
+
+    One place, so the terminal, the GUI and the review page all agree on
+    what a file is called and none of them writes a bare "dimensions.xlsx"
+    again. Readable words with ' - ' between them, the same shape as the
+    Artifacts folder's names (core.config._artifact_stem)."""
+    stem = (report_or_stem if isinstance(report_or_stem, str)
+            else _stem(report_or_stem))
+    return {
+        "xlsx":       f"{stem} - dimensions.xlsx",
+        "html":       f"{stem} - drawing sheet.html",
+        "svg":        f"{stem} - drawing sheet.svg",
+        "png":        f"{stem} - drawing sheet.png",
+        "review":     f"{stem} - change review.html",
+        "modified":   f"{stem} - modified.step",
+        "xlsx_after": f"{stem} - dimensions after change.xlsx",
+        "png_after":  f"{stem} - drawing sheet after change.png",
+        "after_dir":  f"{stem} - after change",
+    }
+
+
+def view_name(stem: str, part_name: str, index: int) -> str:
+    """The SVG for one part: 'Assem1 - view top.svg'."""
+    safe = re.sub(r"[^\w.-]", "_", part_name or "") or f"part{index}"
+    return f"{stem} - view {safe}.svg"
+
+
+def ai_sheet_name(stem: str, n: int, ext: str = ".png") -> str:
+    """What /step-auto's returned drawing is saved as."""
+    return f"{stem} - AI drawing sheet {n}{ext or '.png'}"
+
+
+def output_dir(target: str, root: str = "") -> str:
+    """The folder one model's files go into: <root>/<stem>.
+
+    `root` is where the person said their STEP work should live (the GUI
+    asks; the terminal has /step-folder); empty means DEFAULT_OUT_ROOT. A
+    folder that already holds files gets a numbered sibling — 'Assem1 (2)',
+    'Assem1 (3)' — the way Finder and Explorer do it, so measuring the same
+    model twice never silently overwrites the first sheet. Nothing is
+    created here; the writers make the folder when they write."""
+    root = os.path.abspath(os.path.expanduser(root or DEFAULT_OUT_ROOT))
+    stem = stem_of(target)
+    first = os.path.join(root, stem)
+    if not os.path.isdir(first) or not os.listdir(first):
+        return first
+    n = 2
+    while True:
+        cand = os.path.join(root, f"{stem} ({n})")
+        if not os.path.isdir(cand) or not os.listdir(cand):
+            return cand
+        n += 1
 
 
 # ── reading the file, names kept ─────────────────────────────────────────────
@@ -200,6 +287,8 @@ def analyse(path: str, mode: str = "metal") -> dict:
     return {
         "file": os.path.basename(path),
         "path": path,
+        # The name every deliverable is prefixed with — see names().
+        "stem": stem_of(path),
         "mode": mode,
         "parts": parts,
         "overall_mm": overall,
@@ -324,52 +413,359 @@ def _svg_of(shape, path: str) -> bool:
         return False
 
 
-def render_sheet(report: dict, out_dir: str) -> dict:
-    """drawing.html (+ .png when a browser engine is present) — every part
-    as an isometric view with the caption and holes under it, in the shape
-    of the hand-made sheet this replaces."""
-    os.makedirs(out_dir, exist_ok=True)
-    cells = []
+# ── the dimensioned drawing sheet — drawn by Prism, no AI ──────────────────
+#
+# What the fab's estimator actually hands round is a dimension sheet: three
+# orthographic views of each part with the overall sizes on dimension lines,
+# a hole table, notes and a title block. /step-auto used to ask an image
+# model for that from the measured numbers, which took minutes and came back
+# looking right while quietly mis-stating a figure. Every line below is
+# projected from the real geometry (OpenCascade hidden-line removal), every
+# number is the measured one to two decimals, and it takes a second.
+
+# The three standard views. `n` is the direction the camera looks FROM (the
+# convention cadquery's exporter uses), `x` the axis that reads left-to-right
+# on paper — fixed explicitly so Z is always up in the front and side views
+# and Y is up in the top view, instead of whatever OpenCascade picks.
+_VIEWS = (
+    ("FRONT VIEW", (0, -1, 0), (1, 0, 0), ("x", "z")),
+    ("TOP VIEW",   (0, 0, 1),  (1, 0, 0), ("x", "y")),
+    ("SIDE VIEW",  (1, 0, 0),  (0, 1, 0), ("y", "z")),
+)
+
+
+def _project(shape, n, x=None) -> dict | None:
+    """One orthographic view of a shape: {"visible": [svg path d…],
+    "hidden": [...], "bb": (xmin, xmax, ymin, ymax)} in model millimetres,
+    hidden lines removed the way a drawing office does it. None when the
+    projection fails — a view that cannot be drawn must not sink the sheet."""
+    try:
+        from cadquery.occ_impl.exporters.svg import getPaths
+        from cadquery.occ_impl.shapes import TOLERANCE, Shape, Compound
+        from OCP.BRepLib import BRepLib
+        from OCP.gp import gp_Ax2, gp_Dir, gp_Pnt
+        from OCP.HLRAlgo import HLRAlgo_Projector
+        from OCP.HLRBRep import HLRBRep_Algo, HLRBRep_HLRToShape
+
+        hlr = HLRBRep_Algo()
+        hlr.Add(shape.wrapped)
+        cs = (gp_Ax2(gp_Pnt(), gp_Dir(*n), gp_Dir(*x)) if x
+              else gp_Ax2(gp_Pnt(), gp_Dir(*n)))
+        hlr.Projector(HLRAlgo_Projector(cs))
+        hlr.Update()
+        hlr.Hide()
+        hs = HLRBRep_HLRToShape(hlr)
+        visible = [c for c in (hs.VCompound(), hs.Rg1LineVCompound(),
+                               hs.OutLineVCompound()) if not c.IsNull()]
+        hidden = [c for c in (hs.HCompound(), hs.OutLineHCompound())
+                  if not c.IsNull()]
+        for el in visible + hidden:
+            BRepLib.BuildCurves3d_s(el, TOLERANCE)
+        visible = [Shape(c) for c in visible]
+        hidden = [Shape(c) for c in hidden]
+        hidden_paths, visible_paths = getPaths(visible, hidden)
+        if not visible_paths and not hidden_paths:
+            return None
+        bb = Compound.makeCompound(hidden + visible).BoundingBox()
+        return {"visible": visible_paths, "hidden": hidden_paths,
+                "bb": (bb.xmin, bb.xmax, bb.ymin, bb.ymax)}
+    except Exception:                               # noqa: BLE001
+        return None
+
+
+def _extents(shape) -> dict:
+    bb = shape.BoundingBox()
+    return {"x": bb.xlen, "y": bb.ylen, "z": bb.zlen}
+
+
+class _Sheet:
+    """An SVG page being drawn, in pixels. Small helpers so the layout code
+    reads as a drawing, not as string concatenation."""
+
+    W = 1240                    # A4 portrait at ~150 dpi; the height grows
+    M = 44                      # page margin
+    FONT = "-apple-system,'Segoe UI',Helvetica,Arial,sans-serif"
+
+    def __init__(self):
+        self.items: list[str] = []
+        self.y = self.M         # the next free row
+
+    def text(self, x, y, s, size=13, anchor="start", weight="normal",
+             fill="#111", rotate=None):
+        import html as _html
+        tr = f' transform="rotate({rotate} {x} {y})"' if rotate else ""
+        self.items.append(
+            f'<text x="{x:.1f}" y="{y:.1f}" font-size="{size}" '
+            f'text-anchor="{anchor}" font-weight="{weight}" fill="{fill}"'
+            f'{tr}>{_html.escape(str(s))}</text>')
+
+    def line(self, x1, y1, x2, y2, w=1, color="#111", dash=""):
+        d = f' stroke-dasharray="{dash}"' if dash else ""
+        self.items.append(
+            f'<line x1="{x1:.1f}" y1="{y1:.1f}" x2="{x2:.1f}" y2="{y2:.1f}" '
+            f'stroke="{color}" stroke-width="{w}"{d}/>')
+
+    def rect(self, x, y, w, h, stroke="#111", fill="none", sw=1):
+        self.items.append(
+            f'<rect x="{x:.1f}" y="{y:.1f}" width="{w:.1f}" height="{h:.1f}" '
+            f'stroke="{stroke}" fill="{fill}" stroke-width="{sw}"/>')
+
+    def arrow(self, x, y, dx, dy):
+        """A filled arrowhead at (x, y) pointing along (dx, dy)."""
+        import math
+        L, Wd = 9.0, 3.2
+        ang = math.atan2(dy, dx)
+        bx, by = x - L * math.cos(ang), y - L * math.sin(ang)
+        px, py = -math.sin(ang) * Wd, math.cos(ang) * Wd
+        self.items.append(
+            f'<polygon points="{x:.1f},{y:.1f} {bx + px:.1f},{by + py:.1f} '
+            f'{bx - px:.1f},{by - py:.1f}" fill="#111"/>')
+
+    def view(self, proj: dict, x0, y0, scale, w_px, h_px):
+        """Draw a projection into the box at (x0, y0) of w_px x h_px, model
+        units scaled by `scale`, centred. Returns the drawn extents
+        (left, top, right, bottom) in px for the dimension lines."""
+        xmin, xmax, ymin, ymax = proj["bb"]
+        dw, dh = (xmax - xmin) * scale, (ymax - ymin) * scale
+        left = x0 + (w_px - dw) / 2
+        top = y0 + (h_px - dh) / 2
+        # SVG y runs down the page; model y runs up. Flip about the box.
+        tx = left - xmin * scale
+        ty = top + ymax * scale
+        g = (f'<g transform="translate({tx:.2f},{ty:.2f}) '
+             f'scale({scale:.4f},{-scale:.4f})" fill="none" '
+             f'vector-effect="non-scaling-stroke">')
+        sw = 1.1 / scale
+        g += (f'<g stroke="#8a8f94" stroke-width="{sw:.3f}" '
+              f'stroke-dasharray="{3 / scale:.3f},{2 / scale:.3f}">'
+              + "".join(f'<path d="{d}"/>' for d in proj["hidden"]) + "</g>")
+        g += (f'<g stroke="#111" stroke-width="{sw:.3f}">'
+              + "".join(f'<path d="{d}"/>' for d in proj["visible"]) + "</g>")
+        g += "</g>"
+        self.items.append(g)
+        return left, top, left + dw, top + dh
+
+    # Below this many pixels a figure no longer fits between its own
+    # arrowheads; the arrows go outside and the figure beside them, the way
+    # a draughtsman dimensions a sheet edge.
+    NARROW = 46
+
+    def dim_h(self, left, right, y, value):
+        """A horizontal dimension under a view: extension ticks, a line with
+        arrowheads, the figure above it. `value` in mm, two decimals."""
+        self.line(left, y - 12, left, y + 4, w=0.8)
+        self.line(right, y - 12, right, y + 4, w=0.8)
+        label = f"{value:.2f}"
+        if right - left >= self.NARROW:
+            self.line(left, y, right, y, w=0.9)
+            self.arrow(left, y, -1, 0)
+            self.arrow(right, y, 1, 0)
+            self.text((left + right) / 2, y - 5, label, size=13,
+                      anchor="middle")
+        else:
+            self.line(left - 16, y, right + 16, y, w=0.9)
+            self.arrow(left, y, 1, 0)
+            self.arrow(right, y, -1, 0)
+            self.text(right + 22, y + 4, label, size=13, anchor="start")
+
+    def dim_v(self, top, bottom, x, value):
+        """A vertical dimension beside a view, the figure reading upward."""
+        self.line(x - 12, top, x + 4, top, w=0.8)
+        self.line(x - 12, bottom, x + 4, bottom, w=0.8)
+        label = f"{value:.2f}"
+        if bottom - top >= self.NARROW:
+            self.line(x, top, x, bottom, w=0.9)
+            self.arrow(x, top, 0, -1)
+            self.arrow(x, bottom, 0, 1)
+            self.text(x + 14, (top + bottom) / 2 + 4, label, size=13,
+                      anchor="middle", rotate=-90)
+        else:
+            self.line(x, top - 16, x, bottom + 16, w=0.9)
+            self.arrow(x, top, 0, 1)
+            self.arrow(x, bottom, 0, -1)
+            self.text(x, bottom + 32, label, size=13, anchor="middle")
+
+    def svg(self, height) -> str:
+        return (f'<svg xmlns="http://www.w3.org/2000/svg" width="{self.W}" '
+                f'height="{height:.0f}" viewBox="0 0 {self.W} {height:.0f}" '
+                f'font-family="{self.FONT}"><rect width="100%" height="100%" '
+                'fill="#fff"/>' + "".join(self.items) + "</svg>")
+
+
+def _draw_part(sh: _Sheet, index: int, part: dict, shape, mode: str) -> None:
+    """One part's band: caption and isometric on the left, front over top in
+    the middle, side over the hole table on the right — the layout of the
+    hand-made sheet, and of the sheet the image model used to draw."""
+    M, W = sh.M, sh.W
+    y0 = sh.y
+    ext = _extents(shape)
+    col1, col2, col3 = M, 400, 830
+    vw, vh = 350, 230                 # each view's box
+    # One scale for all three views of a part, so the front's width and the
+    # top's width are the same line — and never larger than the box allows.
+    pad = 1.0
+    scale = min(vw / (ext["x"] + pad), vw / (ext["y"] + pad),
+                vh / (ext["y"] + pad), vh / (ext["z"] + pad),
+                6.0)                  # never blow a tiny part up past 6 px/mm
+    scale = max(scale, 0.05)
+
+    # ── caption + isometric ───────────────────────────────────────────
+    sh.text(col1, y0 + 22, f"{index}) {part['name'].upper()} — 1 NOS",
+            size=19, weight="bold")
+    stock = (f"t≈{part['thickness_mm']:.2f} mm SHEET" if mode == "metal"
+             else f"wall≈{part['thickness_mm']:.2f} mm")
+    sh.text(col1 + 10, y0 + 44, stock, size=13, fill="#333")
+    iso = _project(shape, (1, -1.2, 1))
+    if iso:
+        xmin, xmax, ymin, ymax = iso["bb"]
+        s_iso = min(300 / max(xmax - xmin, 1e-6), 240 / max(ymax - ymin, 1e-6),
+                    scale * 0.85)
+        sh.view(iso, col1, y0 + 60, s_iso, 320, 250)
+
+    # ── front over top ────────────────────────────────────────────────
+    y_front = y0 + 30
+    y_top = y_front + vh + 70
+    y_side = y_front
+    boxes = {"FRONT VIEW": (col2, y_front), "TOP VIEW": (col2, y_top),
+             "SIDE VIEW": (col3, y_side)}
+    bottom_used = y_top + vh + 40
+    for title, n, xdir, (ax_w, ax_h) in _VIEWS:
+        bx, by = boxes[title]
+        sh.text(bx + vw / 2, by - 8, title, size=13, anchor="middle",
+                weight="bold", fill="#222")
+        proj = _project(shape, n, xdir)
+        if not proj:
+            sh.text(bx + vw / 2, by + vh / 2, "(view could not be drawn)",
+                    size=12, anchor="middle", fill="#8a9098")
+            continue
+        left, top, right, bottom = sh.view(proj, bx, by, scale, vw, vh)
+        sh.dim_h(left, right, bottom + 24, ext[ax_w])
+        sh.dim_v(top, bottom, right + 26, ext[ax_h])
+
+    # ── hole table under the side view ────────────────────────────────
+    ty = y_side + vh + 70
+    tx = col3 + 40
+    rows = part["holes"]
+    sh.text(tx, ty, f"HOLES ({part['name'].upper()})", size=13, weight="bold")
+    if rows:
+        for k, h in enumerate(rows):
+            sh.text(tx, ty + 22 + k * 19, f"Ø{h['dia_mm']:g} x {h['count']}",
+                    size=13)
+        table_h = 30 + len(rows) * 19
+    else:
+        sh.text(tx, ty + 22, "no holes", size=13, fill="#555")
+        table_h = 50
+    sh.rect(tx - 12, ty - 18, 220, table_h, stroke="#777")
+    # weight line, under the caption side
+    sh.text(col1 + 10, y0 + 330, f"volume {part['volume_cm3']:.2f} cm3 · "
+            f"{_weights(part['volume_cm3'], mode)}", size=11.5, fill="#444")
+
+    band_bottom = max(bottom_used, ty + table_h + 10, y0 + 345)
+    sh.line(M, band_bottom, W - M, band_bottom, w=1.2, color="#222")
+    sh.y = band_bottom + 22
+
+
+def _title_block(sh: _Sheet, report: dict) -> None:
+    M, W = sh.M, sh.W
+    y = sh.y
+    sh.text(M, y + 16, "NOTES:", size=12.5, weight="bold")
+    notes = ["All dimensions are in millimetres (mm), to two decimals.",
+             "Sizes are of the FORMED part as modelled; a bent sheet's flat "
+             "pattern is not shown.",
+             "Thickness is an estimate (2 x volume / surface area).",
+             "Hole counts are distinct hole positions; a slot reads as two."]
+    for k, n in enumerate(notes):
+        sh.text(M + 14, y + 36 + k * 18, f"{k + 1}. {n}", size=12, fill="#222")
+    y += 36 + len(notes) * 18 + 16
+    rows = [("JOB NAME:", report["file"], "DRAWN BY:", "Prism"),
+            ("MATERIAL:", "CRC SHEET" if report["mode"] == "metal"
+             else "MOULDED PLASTIC", "DATE:",
+             _dt.date.today().strftime("%d-%m-%Y")),
+            ("SCALE:", "NTS", "REMARKS:", "Measured offline by Prism — the "
+                                         "STEP file never left this machine")]
+    rh = 34
+    sh.rect(M, y, W - 2 * M, rh * len(rows), sw=1.4)
+    mid = (W + M) / 2 - 60
+    for k, (a, b, c, d) in enumerate(rows):
+        yy = y + k * rh
+        if k:
+            sh.line(M, yy, W - M, yy, w=0.8)
+        sh.line(mid, yy, mid, yy + rh, w=0.8)
+        sh.text(M + 12, yy + 22, a, size=11.5, fill="#444")
+        sh.text(M + 140, yy + 22, b, size=15)
+        sh.text(mid + 12, yy + 22, c, size=11.5, fill="#444")
+        sh.text(mid + 120, yy + 22, d, size=14)
+    sh.y = y + rh * len(rows) + sh.M
+
+
+def sheet_svg(report: dict) -> str:
+    """The whole dimensioned sheet as one SVG string — every part's three
+    views with its overall sizes on dimension lines, hole table, notes and
+    title block. Pure geometry and the measured figures; no AI."""
+    sh = _Sheet()
+    o = report["overall_mm"]
+    sh.text(sh.M, sh.y + 8, f"{report['file']} — measured drawing sheet",
+            size=20, weight="bold")
+    sh.text(sh.M, sh.y + 30,
+            f"{report['mode']} moulding · assembly overall {o[0]:.2f} x "
+            f"{o[1]:.2f} x {o[2]:.2f} mm · {len(report['parts'])} part(s) · "
+            f"measured offline by Prism, "
+            f"{_dt.date.today().strftime('%d-%m-%Y')}",
+            size=13, fill="#555")
+    sh.y += 56
+    sh.line(sh.M, sh.y, sh.W - sh.M, sh.y, w=1.2, color="#222")
+    sh.y += 22
     shapes = dict((name, s) for name, s in report.get("_shapes") or [])
     for i, part in enumerate(report["parts"], 1):
-        safe = re.sub(r"[^\w.-]", "_", part["name"]) or f"part{i}"
-        svg_name = f"{safe}.svg"
-        drawn = False
+        shape = shapes.get(part["name"])
+        if shape is None:
+            sh.text(sh.M, sh.y + 22, f"{i}) {part['name'].upper()} — "
+                    f"{_caption(part, report['mode'])}", size=16, weight="bold")
+            sh.text(sh.M + 10, sh.y + 44, "(no geometry to draw)", size=12,
+                    fill="#8a9098")
+            sh.y += 70
+            continue
+        _draw_part(sh, i, part, shape, report["mode"])
+    _title_block(sh, report)
+    return sh.svg(sh.y)
+
+
+def render_sheet(report: dict, out_dir: str) -> dict:
+    """'<model> - drawing sheet.html' / '.svg' (+ '.png' when a browser
+    engine is present): the dimensioned sheet, drawn here from the
+    geometry. The per-part isometric views also land beside it as
+    '<model> - view <part>.svg', for anyone who wants one part on its own."""
+    os.makedirs(out_dir, exist_ok=True)
+    stem = _stem(report)
+    out = names(stem)
+    shapes = dict((name, s) for name, s in report.get("_shapes") or [])
+    for i, part in enumerate(report["parts"], 1):
         shape = shapes.get(part["name"])
         if shape is not None:
-            drawn = _svg_of(shape, os.path.join(out_dir, svg_name))
-        holes = " · ".join(f"Ø{h['dia_mm']:g} × {h['count']}"
-                           for h in part["holes"]) or "no holes"
-        img = (f'<img src="{svg_name}" alt="">' if drawn
-               else '<p class="nodraw">(view could not be drawn)</p>')
-        cells.append(
-            f'<figure>{img}<figcaption><b>{i}) {part["name"]}</b> — '
-            f'{_caption(part, report["mode"])}<br>'
-            f'<span class="holes">{holes}</span></figcaption></figure>')
+            _svg_of(shape, os.path.join(out_dir, view_name(stem, part["name"], i)))
 
-    o = report["overall_mm"]
+    svg = sheet_svg(report)
+    svg_path = os.path.join(out_dir, out["svg"])
+    with open(svg_path, "w", encoding="utf-8") as f:
+        f.write(svg)
+    # The captions the older sheet carried, kept as plain text under the
+    # drawing so the page still READS without the picture (and so a search
+    # for "101.00 x 93.00 x 71.00" finds the sheet).
+    captions = "".join(
+        f"<li><b>{i}) {p['name']}</b> — {_caption(p, report['mode'])}</li>"
+        for i, p in enumerate(report["parts"], 1))
     html = (
         "<!doctype html><meta charset='utf-8'>"
         f"<title>{report['file']}</title>"
-        "<style>body{font:14px/1.45 -apple-system,'Segoe UI',sans-serif;"
-        "margin:28px;color:#16181a}h1{font-size:21px;margin:0}"
-        ".sub{color:#5a6067;margin:2px 0 18px}"
-        ".grid{display:grid;grid-template-columns:repeat(auto-fill,"
-        "minmax(430px,1fr));gap:20px}"
-        "figure{margin:0;border:1px solid #d7dade;border-radius:8px;"
-        "padding:12px;background:#fff}"
-        "img{width:100%;height:auto}figcaption{margin-top:8px}"
-        ".holes{color:#41586e;font-size:13px}"
-        ".nodraw{color:#8a9098}.note{color:#8a6d1f;font-size:12.5px;"
-        "margin-top:18px}</style>"
-        f"<h1>{report['file']} — measured drawing sheet</h1>"
-        f"<p class='sub'>{report['mode']} moulding · assembly "
-        f"{o[0]:.2f} x {o[1]:.2f} x {o[2]:.2f} mm · "
-        f"{len(report['parts'])} part(s) · measured offline by Prism, "
-        f"{_dt.date.today().strftime('%d-%m-%Y')}</p>"
-        f"<div class='grid'>{''.join(cells)}</div>"
-        + "".join(f"<p class='note'>! {w}</p>" for w in report["warnings"]))
-    html_path = os.path.join(out_dir, "drawing.html")
+        "<style>body{margin:0;background:#fff;font:13px/1.4 -apple-system,"
+        "'Segoe UI',sans-serif;color:#16181a}svg{display:block}"
+        ".text{max-width:1240px;padding:18px 44px 30px}"
+        ".text li{margin:2px 0}.note{color:#8a6d1f;font-size:12.5px}</style>"
+        + svg
+        + f"<div class='text'><ul>{captions}</ul>"
+        + "".join(f"<p class='note'>! {w}</p>" for w in report["warnings"])
+        + "</div>")
+    html_path = os.path.join(out_dir, out["html"])
     with open(html_path, "w", encoding="utf-8") as f:
         f.write(html)
 
@@ -378,14 +774,14 @@ def render_sheet(report: dict, out_dir: str) -> dict:
         from playwright.sync_api import sync_playwright
         with sync_playwright() as p:
             browser = p.chromium.launch()
-            page = browser.new_page(viewport={"width": 1360, "height": 900})
-            page.goto("file://" + html_path, wait_until="load")
-            png_path = os.path.join(out_dir, "drawing.png")
+            page = browser.new_page(viewport={"width": _Sheet.W, "height": 900})
+            page.goto("file://" + _quote(html_path), wait_until="load")
+            png_path = os.path.join(out_dir, out["png"])
             page.screenshot(path=png_path, full_page=True)
             browser.close()
     except Exception:                               # noqa: BLE001
-        png_path = ""   # the HTML stands on its own
-    return {"html": html_path, "png": png_path}
+        png_path = ""   # the HTML and SVG stand on their own
+    return {"html": html_path, "svg": svg_path, "png": png_path}
 
 
 def auto_brief(report: dict) -> str:
@@ -683,13 +1079,14 @@ def review_html(report: dict, plan: dict, out_dir: str,
     by_after = {p["name"]: p for p in shown}
 
     if after:
-        banner = ("<div class='banner built'>modified.step is BUILT — the "
-                  "After column is re-measured from the new file, not "
-                  "predicted.</div>")
+        banner = (f"<div class='banner'>{_html.escape(names(report)['modified'])}"
+                  " is BUILT — the After column is re-measured from the new "
+                  "file, not predicted.</div>")
     else:
         banner = ("<div class='banner'>Nothing is built yet. This page is "
-                  "the plan — go back to the terminal and answer Y to "
-                  "write modified.step, or N to stop here.</div>")
+                  "the plan — go back to the terminal and answer Y to write "
+                  f"{_html.escape(names(report)['modified'])}, or N to stop "
+                  "here.</div>")
 
     def fmt(size):
         return f"{size[0]:.2f} x {size[1]:.2f} x {size[2]:.2f}"
@@ -722,13 +1119,14 @@ def review_html(report: dict, plan: dict, out_dir: str,
 
     advice = "".join(f"<li>{_html.escape(a)}</li>"
                      for a in plan.get("advice") or [])
+    out = names(report)
     imgs = []
-    if os.path.exists(os.path.join(out_dir, "drawing.png")):
-        imgs.append(("The part as received", "drawing.png"))
-    if after and os.path.exists(os.path.join(out_dir, "drawing_after.png")):
+    if os.path.exists(os.path.join(out_dir, out["png"])):
+        imgs.append(("The part as received", out["png"]))
+    if after and os.path.exists(os.path.join(out_dir, out["png_after"])):
         imgs.append(("The modified model — drawn from the BUILT file",
-                     "drawing_after.png"))
-    img = "".join(f"<h2>{t}</h2><img src='{f}'>" for t, f in imgs)
+                     out["png_after"]))
+    img = "".join(f"<h2>{t}</h2><img src='{_quote(f)}'>" for t, f in imgs)
 
     page = (
         "<!doctype html><meta charset='utf-8'>"
@@ -765,7 +1163,7 @@ def review_html(report: dict, plan: dict, out_dir: str,
           "left this machine; the edits run locally on a copy.</p>")
 
     os.makedirs(out_dir, exist_ok=True)
-    path = os.path.join(out_dir, "review.html")
+    path = os.path.join(out_dir, out["review"])
     with open(path, "w", encoding="utf-8") as f:
         f.write(page)
     return path

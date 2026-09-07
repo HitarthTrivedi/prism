@@ -1190,15 +1190,19 @@ def spec_instructions() -> str:
         "repeat any of them. There is no required running order.\n"
         '  statement  {"type":"statement","seconds":4,'
         '"lines":["Up to 3 short lines"],"tail":"one quieter line"}\n'
-        '  figure     {"type":"figure","seconds":5,"value":"₹10–50 Cr",'
-        '"label":"Estimated turnover, FY2023–24",'
-        '"note":"Based on publicly available filings."}\n'
-        '  trend      {"type":"trend","seconds":6,"heading":"India seed market",'
-        '"subheading":"optional second line","value_prefix":"₹",'
-        '"value_suffix":" Cr","points":[{"label":"2021","value":61000},'
-        '{"label":"2024","value":81000}],"note":"optional small print"}\n'
-        '  list       {"type":"list","seconds":5,"heading":"Grown with",'
-        '"items":["Farmers","Dealers","Employees"],"tail":"optional closing line"}\n'
+        # Placeholders, not a realistic sample: a named market with real-
+        # looking figures reads to a careful model as a second brief
+        # smuggled in at the bottom, and it refuses (see reel_web's script
+        # prompt, where exactly that happened).
+        '  figure     {"type":"figure","seconds":5,"value":"<the number>",'
+        '"label":"<what the number is>",'
+        '"note":"<source or disclaimer, if any>"}\n'
+        '  trend      {"type":"trend","seconds":6,"heading":"<what is measured>",'
+        '"subheading":"optional second line","value_prefix":"",'
+        '"value_suffix":"","points":[{"label":"<year 1>","value":100},'
+        '{"label":"<year 2>","value":140}],"note":"optional small print"}\n'
+        '  list       {"type":"list","seconds":5,"heading":"<what these are>",'
+        '"items":["<item 1>","<item 2>","<item 3>"],"tail":"optional closing line"}\n'
         '  pillar     {"type":"pillar","seconds":4,"heading":"under 34 chars",'
         '"caption":"under 90 chars","icons":["exactly","three","icons"],'
         '"accent_index":1}\n'

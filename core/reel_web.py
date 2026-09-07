@@ -982,28 +982,37 @@ def script_instructions() -> str:
         "and running order only. You do not decide how it looks: a separate "
         "art-direction pass does that, and anything you say about colour, "
         "type, layout or motion will be thrown away.\n\n"
+        # The shape, shown with an obviously made-up company. This used to be
+        # a realistic sample (a named seed company, real-looking figures),
+        # and Claude read it as a smuggled instruction — "the tail end of your
+        # prompt demands a JSON schema about <that company>" — and refused,
+        # so no JSON came back and the renderer had nothing to build. A
+        # placeholder company with placeholder numbers cannot be mistaken
+        # for a second brief.
+        "SHAPE (an illustration only — the company, wording and numbers are "
+        "placeholders; every value must come from THIS task's material):\n"
         '{\n'
         '  "scenes": [\n'
         '    {"role": "hook",    "seconds": 4.5,\n'
-        '     "kicker": "FY 2026", "headline": "A season that held its promise.",\n'
+        '     "kicker": "<short label>", "headline": "<one-line hook>",\n'
         '     "support": ""},\n'
         '    {"role": "figure",  "seconds": 5,\n'
-        '     "kicker": "Q4 sales", "headline": "\\u20b966.43 Cr",\n'
-        '     "support": "Up 44.7% on last year.",\n'
-        '     "note": "Company-reported, unaudited."},\n'
+        '     "kicker": "<what the number is>", "headline": "<the number>",\n'
+        '     "support": "<one line of context>",\n'
+        '     "note": "<source or disclaimer, if any>"},\n'
         '    {"role": "list",    "seconds": 5.5,\n'
-        '     "kicker": "What moved it", "headline": "",\n'
-        '     "items": ["Rajkot expansion", "New bajra varieties"]},\n'
+        '     "kicker": "<what these are>", "headline": "",\n'
+        '     "items": ["<item 1>", "<item 2>"]},\n'
         '    {"role": "series",  "seconds": 6,\n'
-        '     "kicker": "India seed market", "headline": "",\n'
-        '     "points": [{"label": "2021", "value": 61000},\n'
-        '                {"label": "2025", "value": 88000}],\n'
-        '     "unit_prefix": "\\u20b9", "unit_suffix": " Cr",\n'
-        '     "note": "2025 is a published projection."},\n'
+        '     "kicker": "<what is measured>", "headline": "",\n'
+        '     "points": [{"label": "<year 1>", "value": 100},\n'
+        '                {"label": "<year 2>", "value": 140}],\n'
+        '     "unit_prefix": "", "unit_suffix": "",\n'
+        '     "note": ""},\n'
         '    {"role": "endcard", "seconds": 4,\n'
-        '     "headline": "Bombay Super Hybrid Seeds",\n'
-        '     "support": "Rooted in research. Growing for India.",\n'
-        '     "contact": "www.example.com"}\n'
+        '     "headline": "<Example Company Name>",\n'
+        '     "support": "<tagline>",\n'
+        '     "contact": "<website or phone>"}\n'
         '  ]\n'
         '}\n\n'
         "ROLES: hook · figure (one number) · series (numbers over time) · "

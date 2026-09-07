@@ -1740,15 +1740,27 @@ def _wait_for_images(driver, agent_cfg, want: int, cap: int = 240,
     # [data-message-author-role='assistant'] — the harvester was looking in
     # the one place they are not, and reported that none had appeared while
     # three sat on screen.
+    # Three readings, not one count. ChatGPT renders an image PROGRESSIVELY:
+    # a blurred preview <img> appears within seconds and is then replaced,
+    # in place, by the finished picture a minute or two later. Counting
+    # images alone saw "1, still 1, still 1" and called it done at 20s —
+    # which is how a /step-auto sheet came back as a smear. So the signature
+    # (sizes and sources) has to sit still too, and while the page itself
+    # says it is still creating the image, nothing is done regardless.
     js = """
-        let n = 0;
+        let n = 0, px = 0, sig = '';
         for (const img of document.querySelectorAll('img')) {
-          if ((img.naturalWidth || 0) >= 256 && (img.naturalHeight || 0) >= 256)
+          if ((img.naturalWidth || 0) >= 256 && (img.naturalHeight || 0) >= 256) {
             n++;
+            px += img.naturalWidth * img.naturalHeight;
+            sig += (img.currentSrc || img.src || '').slice(-48) + ';';
+          }
         }
-        return n;
+        const busy = /creating image|generating image|rendering image|image is being (?:created|generated)|creating your image/i
+                       .test(document.body.innerText || '');
+        return [n, px + ':' + sig, busy];
     """
-    start, last, steady = time.time(), 0, 0
+    start, last, last_sig, steady = time.time(), 0, "", 0
     while time.time() - start < cap:
         # Four seconds a poll, and stop/skip checked every poll: this loop
         # never polled should_stop at all, and a stage stuck "rendering" an
@@ -1757,20 +1769,22 @@ def _wait_for_images(driver, agent_cfg, want: int, cap: int = 240,
         if _sleep_interruptibly(4, should_stop):
             break
         try:
-            n = int(driver.execute_script(js, sel) or 0)
+            n, sig, busy = driver.execute_script(js, sel)
+            n = int(n or 0)
         except Exception:
             continue
         if n > last:
-            last, steady = n, 0
+            last, last_sig, steady = n, sig, 0
             ui.info(f"   🖼️   {n} image(s) so far…")
-            if n >= want:
-                steady = 0
+        elif last and sig != last_sig:
+            last_sig, steady = sig, 0      # a preview became the real thing
         elif last:
             steady += 4
-            # Two images that have been sitting there for 20s are all there is.
-            if steady >= 20:
+            # Images that have been sitting there unchanged for 20s — and
+            # the page is not saying it is still drawing — are all there is.
+            if steady >= 20 and not busy:
                 break
-        elif grace is not None and time.time() - start >= grace:
+        elif grace is not None and not busy and time.time() - start >= grace:
             break   # nothing ever appeared — not this turn's kind of reply
     return last
 
@@ -3283,8 +3297,14 @@ def run(routing: dict, cfg: dict, attachments=None, on_event=None,
         reel_design_stage: str = "", pipeline_files_out: list | None = None,
         motion_design_stage: str = "", resume_urls: dict | None = None,
         skip_signal=None, skip_stages: list | None = None,
-        min_wait: int = 0):
+        min_wait: int = 0, image_stages=None):
     """Execute the pipeline. Returns (responses, links).
+
+    image_stages: stage keys the caller PROMISES will produce a picture —
+                 /step-auto's "visual" stage, the STEP dialog's Draft. Such a
+                 stage gets the full image budget (minutes, like Reel's
+                 artwork) instead of the short look a generic visual turn
+                 gets, because on those a picture is possible, not certain.
 
     attachments: list of records from core.files.attach() — uploaded to each
                  tool and their extracted text prepended to the first prompt.
@@ -3691,6 +3711,53 @@ def run(routing: dict, cfg: dict, attachments=None, on_event=None,
     # a partial answer done.
     incomplete: dict[str, dict] = {}
 
+    # Local renderers (Prism Reel / Studio / Motion) held back because a
+    # stage BEFORE them produced nothing and is queued for the failover
+    # pass. Run after that pass — see the local branch in the loop below.
+    deferred_locals: list[tuple[str, str, dict]] = []
+
+    def _run_local_stage(stage: str, agent_name: str, agent_cfg: dict) -> None:
+        """One local renderer stage, start to finish: a Python call inside
+        Prism — no tab, no upload, no scrape. Consumes the earlier stages'
+        text and files, produces a real file here, and reports like any
+        other stage. Shared by the main loop and the deferred pass."""
+        emit("stage_start", {"stage": stage, "agent": agent_name})
+        ui.rule(f"{stage.upper()}  ·  {agent_name}",
+                style=A.CATEGORIES.get(stage, {}).get("color", "pink"))
+        # Newest stage first, each kept separate: the spec comes from the
+        # stage right before this one, and merging every stage into one
+        # blob only gives the parser more prose to trip over.
+        prior_text = [t for ts in reversed(list(all_responses.values()))
+                      for t in ts if t.strip()]
+        # Images an earlier stage GENERATED count as artwork too — that is
+        # the whole point of harvesting them. The client's own files come
+        # first so their real mark wins the 'logo' slot over anything a
+        # model drew.
+        out, note = _run_local(agent_cfg["local"], prior_text,
+                               (attachments or []) + pipeline_files,
+                               cfg, stage, brand=studio_brand,
+                               studio=_studio_conversation(
+                                   stages, stage, all_links))
+        if out:
+            # Keep the internal reel_<timestamp> working name, but make
+            # the customer-facing artifact describe the original request.
+            try:
+                from . import config as _config
+                saved = _config.save_artifact(out, query, kind="reel",
+                                             task=query)
+                ui.info(f"   💾  saved to {saved}")
+            except Exception:                           # noqa: BLE001
+                pass       # rendering succeeded; copying is best-effort
+            all_responses[stage] = [note]
+            all_links[stage] = out
+            ui.ok(note)
+            ui.info(f"   📁  {out}")
+            emit("stage_done", {"stage": stage, "count": 1, "texts": [note],
+                                "url": out, "timed_out": False})
+        else:
+            ui.err(note)
+            emit("stage_error", {"stage": stage, "error": note, "url": ""})
+
     for stage_idx, (stage, agent_name, questions) in enumerate(stages):
         if stopped():
             ui.warn("Stopped at your request — keeping everything finished so far.")
@@ -3738,46 +3805,27 @@ def run(routing: dict, cfg: dict, attachments=None, on_event=None,
                                    "reason": reason})
             continue
 
+        # A LOCAL agent runs inside Prism — no tab, no upload, no scrape. It
+        # consumes the previous stages' text and files and produces a real
+        # file here. If a stage before it produced NOTHING and failover is
+        # about to retry that stage with another tool, rendering now would
+        # build the video without the images it is waiting on and show the
+        # customer "Make the video — FAILED" while "Make the images" is still
+        # being retried underneath it. So it is held back and run after the
+        # retry pass, with whatever that pass recovered. (Its card stays
+        # queued meanwhile: no stage_start is emitted until it really runs.)
+        if agent_cfg.get("local"):
+            if failover and failures:
+                deferred_locals.append((stage, agent_name, agent_cfg))
+                ui.warn(f"   ⏸  {stage}: holding until "
+                        f"{', '.join(failures)} has been retried — it feeds "
+                        "this step")
+                continue
+            _run_local_stage(stage, agent_name, agent_cfg)
+            continue
+
         emit("stage_start", {"stage": stage, "agent": agent_name})
         ui.rule(f"{stage.upper()}  ·  {agent_name}", style=A.CATEGORIES.get(stage, {}).get("color", "pink"))
-
-        # A LOCAL agent runs inside Prism — no tab, no upload, no scrape. It
-        # consumes the previous stage's text and produces a real file here.
-        if agent_cfg.get("local"):
-            # Newest stage first, each kept separate: the spec comes from the
-            # stage right before this one, and merging every stage into one
-            # blob only gives the parser more prose to trip over.
-            prior_text = [t for ts in reversed(list(all_responses.values()))
-                          for t in ts if t.strip()]
-            # Images an earlier stage GENERATED count as artwork too — that is
-            # the whole point of harvesting them. The client's own files come
-            # first so their real mark wins the 'logo' slot over anything a
-            # model drew.
-            out, note = _run_local(agent_cfg["local"], prior_text,
-                                   (attachments or []) + pipeline_files,
-                                   cfg, stage, brand=studio_brand,
-                                   studio=_studio_conversation(
-                                       stages, stage, all_links))
-            if out:
-                # Keep the internal reel_<timestamp> working name, but make
-                # the customer-facing artifact describe the original request.
-                try:
-                    from . import config as _config
-                    saved = _config.save_artifact(out, query, kind="reel",
-                                                 task=query)
-                    ui.info(f"   💾  saved to {saved}")
-                except Exception:                       # noqa: BLE001
-                    pass       # rendering succeeded; copying is best-effort
-                all_responses[stage] = [note]
-                all_links[stage] = out
-                ui.ok(note)
-                ui.info(f"   📁  {out}")
-                emit("stage_done", {"stage": stage, "count": 1, "texts": [note],
-                                    "url": out, "timed_out": False})
-            else:
-                ui.err(note)
-                emit("stage_error", {"stage": stage, "error": note, "url": ""})
-            continue
 
         timed_out = False
         try:
@@ -4263,7 +4311,8 @@ def run(routing: dict, cfg: dict, attachments=None, on_event=None,
                     ui.warn(f"still generating after {took}s — scraping what "
                             f"is on the page and keeping the link")
 
-                if stage in ("artwork", "visual", "media"):
+                promised = set(image_stages or ())
+                if stage in ("artwork", "visual", "media") or stage in promised:
                     # The images are the deliverable here, not the text, so
                     # this stage gets its own budget ON TOP of the agent's —
                     # long only where it needs to be, rather than making every
@@ -4273,6 +4322,15 @@ def run(routing: dict, cfg: dict, attachments=None, on_event=None,
                         # Reel's dedicated image-batch stage: a picture is
                         # always the point, so it gets the full budget.
                         want, cap, grace = _rw.MAX_GENERATED, 300, None
+                    elif stage in promised:
+                        # The caller said a picture IS the deliverable (a
+                        # /step-auto drawing sheet). ChatGPT's image model
+                        # takes one to three minutes and shows a blurred
+                        # preview meanwhile; 60s with a 12s grace was giving
+                        # up on it every time. Seven minutes is the cap, not
+                        # the wait — the loop returns the moment the picture
+                        # settles.
+                        want, cap, grace = 1, 420, None
                     else:
                         # visual/media also cover plain non-image turns (a
                         # Studio design turn answers with a CSS/JSON spec,
@@ -4704,7 +4762,18 @@ def run(routing: dict, cfg: dict, attachments=None, on_event=None,
             failures, cfg, all_responses, all_links,
             attachments=attachments, query=query, emit=emit,
             should_stop=should_stop, stages=stages,
-            pipeline_files=pipeline_files, brand=studio_brand)
+            pipeline_files=pipeline_files, brand=studio_brand,
+            skip_signal=skip_signal, image_stages=image_stages)
+
+    # The renderers held back above, now that every retry has been tried.
+    # Recovered or not, the render happens: with the pictures if they came,
+    # honestly without them if they did not — but never before the retry
+    # that could have supplied them.
+    for stage, agent_name, agent_cfg in deferred_locals:
+        if stopped():
+            break
+        ui.info(f"   ▶  {stage}: the retries are done — rendering now")
+        _run_local_stage(stage, agent_name, agent_cfg)
 
     return all_responses, all_links
 
@@ -4714,7 +4783,7 @@ def run(routing: dict, cfg: dict, attachments=None, on_event=None,
 def _retry_failed_stages(failures: dict, cfg: dict, all_responses: dict,
                          all_links: dict, *, attachments, query, emit,
                          should_stop, stages=None, pipeline_files=None,
-                         brand=None) -> None:
+                         brand=None, skip_signal=None, image_stages=None) -> None:
     """Give each empty stage to a different tool.
 
     The failure this exists for: forty minutes into a run, the free tier on
@@ -4741,7 +4810,34 @@ def _retry_failed_stages(failures: dict, cfg: dict, all_responses: dict,
 
     Never raises: this is a rescue attempt, and a rescue that takes down the
     results it was rescuing would be worse than not trying.
+
+    "Skip this step" works in here too. It did not: the nested run() below
+    was started without the skip flag, so a press during a retry — the one
+    place a customer is most likely to press it, watching a second tool
+    grind on the same stuck stage — did nothing at all. Now the flag is what
+    the nested run's waits poll (as a stop, so it winds up quietly and keeps
+    what landed), and a press abandons the remaining alternatives for that
+    stage rather than trying the next tool anyway.
     """
+    def skipped() -> bool:
+        return bool(skip_signal is not None and skip_signal.is_set())
+
+    def halt() -> bool:
+        return bool(should_stop and should_stop()) or skipped()
+
+    def give_up(stage: str, info: dict, texts: list) -> None:
+        skip_signal.clear()
+        if texts:
+            all_responses[stage] = texts
+        ui.warn(f"   ⤼  {stage}: skipped at your request — "
+                + ("keeping what landed" if texts else "moving on"))
+        emit("stage_skipped", {
+            "stage": stage, "agent": info.get("agent"),
+            "reason": "You skipped this step while it was being retried. "
+                      + ("Whatever the tool had produced was kept; "
+                         if texts else "")
+                      + "the run moved on."})
+
     recovered: set[str] = set()
     for stage, info in list(failures.items()):
         if should_stop and should_stop():
@@ -4749,11 +4845,17 @@ def _retry_failed_stages(failures: dict, cfg: dict, all_responses: dict,
         # A later pass may already have filled this in.
         if all_responses.get(stage):
             continue
+        if skipped():
+            give_up(stage, info, [])
+            continue
 
         tried = [info.get("agent")]
         for alternative in A.alternatives_for(stage, tried, cfg):
             if should_stop and should_stop():
                 return
+            if skipped():
+                give_up(stage, info, [])
+                break
             ui.rule(f"{stage.upper()}  ·  retrying with {alternative}",
                     style="yellow")
             ui.warn(f"   {info.get('agent')} couldn't finish: {info['reason']}")
@@ -4774,16 +4876,23 @@ def _retry_failed_stages(failures: dict, cfg: dict, all_responses: dict,
                     # The file-analysis pre-stage would re-read every
                     # attachment before the one prompt we actually want.
                     chatgpt_analysis=False,
-                    should_stop=should_stop,
+                    # A skip reaches the nested run as a stop: its waits
+                    # break, it scrapes what landed and returns, and the
+                    # check just below decides what that means.
+                    should_stop=halt,
                     # One level only. Without this a category where every tool
                     # is having a bad afternoon retries itself forever.
                     failover=False,
-                    pipeline_files_out=recovered_files)
+                    pipeline_files_out=recovered_files,
+                    image_stages=image_stages)
             except Exception as e:                       # noqa: BLE001
                 ui.err(f"   {alternative} also failed: {e}")
                 continue
 
             texts = responses.get(stage) or []
+            if skipped():
+                give_up(stage, info, texts)
+                break
             if texts:
                 all_responses[stage] = texts
                 if links.get(stage):

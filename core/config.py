@@ -27,6 +27,10 @@ DEFAULT = {
     "chrome_version": "", # pinned Chrome major version; "" = auto-detect
     "onboarded": False,
     "model": "llama-3.3-70b-versatile",
+    # Where /step puts a model's files. "" = ~/Desktop/Prism Step. The GUI
+    # asks the person where their STEP work should live and stores it here;
+    # the terminal sets it with /step-folder. See core.stepfile.output_dir.
+    "step_out_dir": "",
 }
 
 

@@ -14,7 +14,6 @@ hands the output forward.
 """
 import json
 import os
-import re
 import shutil
 import time
 
@@ -269,12 +268,18 @@ HELP = """
   [teal]/step [metal|plastic] <file.step>[/teal]  measure a 3D CAD model:
                 every part's size, wall/sheet thickness, every hole, volume
                 and weight — from the real geometry, offline. Writes an Excel
-                dimension sheet and a drawing page with an isometric view of
-                each part. No AI ever sees the STEP file. /s works too.
+                dimension sheet and a DIMENSIONED DRAWING SHEET — front, top
+                and side views of every part with the sizes in mm, a hole
+                table, notes and a title block — drawn by Prism itself, no
+                AI. Every file named after the model, in a folder per model.
+                No AI ever sees the STEP file. /s works too.
+  [teal]/step-folder [path|default][/teal]  where those folders go
+                (~/Desktop/Prism Step unless you say otherwise).
   [teal]/step-auto [metal|plastic] <file.step>[/teal]  the same offline
-                measurement, then your image agent draws the professional
-                dimensioned sheet FROM THE MEASURED NUMBERS — the STEP file
-                still never leaves this machine.
+                measurement and sheet, then ChatGPT ALSO draws a
+                styled version FROM THE MEASURED NUMBERS — the STEP file
+                still never leaves this machine. Optional: Prism's own sheet
+                already carries every dimension.
   [teal]/step-ask [metal|plastic] <file.step> <question>[/teal]  ask about
                 the part: Groq suggests from the measured figures, an agent
                 reviews them into an exact change plan, and Prism applies
@@ -1202,7 +1207,7 @@ def _show_gerber(job, label: str = ""):
 
 
 
-def _step_measured(arg: str, attachments: list):
+def _step_measured(cfg, arg: str, attachments: list):
     """The offline half both /step and /step-auto share: find the model,
     measure it, save the Excel sheet and Prism's own plain drawing render.
     Returns (report, out_dir, drawn) or None after explaining itself."""
@@ -1248,13 +1253,15 @@ def _step_measured(arg: str, attachments: list):
     ui.panel(SF.report_text(report), title="What the model measures",
              style="teal")
 
-    stem = re.sub(r"[^\w.-]", "_",
-                  os.path.splitext(os.path.basename(target))[0])[:40]
-    out_dir = os.path.join(os.path.expanduser("~/Desktop"), "Prism Step",
-                           f"{stem}_{int(time.time())}")
+    # One folder per model, named after it, under wherever the person keeps
+    # their STEP work (cfg["step_out_dir"], set with /step-folder or by the
+    # GUI's own question) — and every file inside carries the model's name,
+    # so ten jobs' sheets in one place are ten files a person can tell apart.
+    out_dir = SF.output_dir(target, cfg.get("step_out_dir", ""))
+    ui.info(f"   files for this model → {out_dir}")
     try:
         xlsx = SF.write_xlsx(report,
-                             os.path.join(out_dir, "dimensions.xlsx"))
+                             os.path.join(out_dir, SF.names(report)["xlsx"]))
         ui.ok(f"dimension sheet → {xlsx}")
     except SF.StepError as e:
         ui.warn(str(e))
@@ -1272,7 +1279,43 @@ def cmd_step(cfg, arg: str, attachments: list):
     real geometry by core.stepfile. The customer's STEP file never leaves
     this machine and no AI ever sees it — same rule as /gerber.
     """
-    _step_measured(arg, attachments)
+    _step_measured(cfg, arg, attachments)
+
+
+def cmd_step_folder(cfg, arg: str):
+    """/step-folder [path] — where /step keeps a model's files.
+
+    The terminal's answer to the question the GUI asks in a dialog: one
+    place for all STEP work, with a folder per model inside it. No argument
+    shows the current choice; `default` puts it back to ~/Desktop/Prism Step.
+    """
+    from core import stepfile as SF
+
+    want = arg.strip().strip('"').strip("'")
+    if not want:
+        current = cfg.get("step_out_dir") or SF.DEFAULT_OUT_ROOT
+        ui.info(f"STEP files go to {current}\n"
+                "  /step-folder ~/Jobs/STEP     to change it\n"
+                "  /step-folder default         to go back to the Desktop")
+        return
+    if want.lower() == "default":
+        cfg["step_out_dir"] = ""
+        C.save(cfg)
+        ui.ok(f"STEP files go to {SF.DEFAULT_OUT_ROOT} again.")
+        return
+    path = os.path.abspath(os.path.expanduser(want))
+    if os.path.exists(path) and not os.path.isdir(path):
+        ui.err(f"{path} is a file, not a folder.")
+        return
+    try:
+        os.makedirs(path, exist_ok=True)
+    except OSError as e:
+        ui.err(f"Couldn't create {path}: {e}")
+        return
+    cfg["step_out_dir"] = path
+    C.save(cfg)
+    ui.ok(f"STEP files will go to {path} — one folder per model, every file "
+          "named after the model.")
 
 
 def cmd_step_auto(cfg, arg: str, attachments: list):
@@ -1287,17 +1330,18 @@ def cmd_step_auto(cfg, arg: str, attachments: list):
     """
     from core import stepfile as SF
 
-    measured = _step_measured(arg, attachments)
+    measured = _step_measured(cfg, arg, attachments)
     if measured is None:
         return
     report, out_dir, drawn = measured
 
-    agents = C.active_agents(cfg)
-    artist = agents.get("visual") or agents.get("media")
-    if not artist:
-        ui.err("No image tool is set up — the measured sheet above is done, "
-               "but drawing the AI version needs a visual agent. Run /agents.")
-        return
+    # ChatGPT, and only ChatGPT: its image model is the one that draws a
+    # dimension sheet well from a numbers-only brief, so the stage neither
+    # picks whatever visual tool is configured nor falls over to another
+    # tool if it stumbles (failover=False below) — a second, differently-
+    # wrong sheet is not a rescue. Prism's own dimensioned sheet is already
+    # on disk either way.
+    artist = "ChatGPT"
 
     try:
         from core import automation
@@ -1321,15 +1365,18 @@ def cmd_step_auto(cfg, arg: str, attachments: list):
         {}, cfg, attachments=files, chatgpt_analysis=False,
         custom_stages=[("visual", artist, [SF.auto_brief(report)])],
         query=f"draw a dimensioned fabrication sheet for {report['file']}",
-        pipeline_files_out=made)
+        pipeline_files_out=made,
+        # A picture IS the deliverable here — give the image model its full
+        # budget instead of the short look a generic visual turn gets.
+        image_stages={"visual"},
+        failover=False)
 
     kept = []
     for rec in made:
         src = rec.get("path", "") if isinstance(rec, dict) else str(rec)
         if src and os.path.exists(src):
-            dest = os.path.join(out_dir,
-                                f"ai-sheet-{len(kept) + 1}"
-                                f"{os.path.splitext(src)[1] or '.png'}")
+            dest = os.path.join(out_dir, SF.ai_sheet_name(
+                report["stem"], len(kept) + 1, os.path.splitext(src)[1]))
             try:
                 shutil.copyfile(src, dest)
                 kept.append(dest)
@@ -1400,10 +1447,11 @@ def cmd_step_ask(cfg, arg: str, attachments: list):
     question = question or ("Suggest improvements for reliable, economical "
                             f"{mode} moulding of this part.")
 
-    measured = _step_measured(f"{mode} {target}", attachments)
+    measured = _step_measured(cfg, f"{mode} {target}", attachments)
     if measured is None:
         return
     report, out_dir, drawn = measured
+    out = SF.names(report)
 
     api_key = cfg.get("api_key")
     if not api_key:
@@ -1489,12 +1537,12 @@ def cmd_step_ask(cfg, arg: str, attachments: list):
     except Exception:
         pass
 
-    if not _ask_yes_no("Reviewed the page — build modified.step now? (the "
-                       "original file is never touched)", default=True):
+    if not _ask_yes_no(f"Reviewed the page — build {out['modified']} now? "
+                       "(the original file is never touched)", default=True):
         ui.info("Not built. The review page stays as the record of the plan.")
         ui.ok(f"Run saved → {C.save_run(record)}")
         return
-    out_path = os.path.join(out_dir, "modified.step")
+    out_path = os.path.join(out_dir, out["modified"])
     try:
         done = SF.apply_plan(target, plan, out_path)
     except SF.StepError as e:
@@ -1509,16 +1557,20 @@ def cmd_step_ask(cfg, arg: str, attachments: list):
              title="After the changes (re-measured, not assumed)",
              style="pink")
     try:
-        SF.write_xlsx(after, os.path.join(out_dir, "dimensions_after.xlsx"))
+        SF.write_xlsx(after, os.path.join(out_dir, out["xlsx_after"]))
     except SF.StepError:
         pass
     # The visual half of the proof: the modified model drawn FROM THE
     # BUILT FILE, so the review page shows before and after side by side.
+    # Its sheet is rendered into its own subfolder (the modified model has
+    # the same stem, so its files would otherwise overwrite the originals),
+    # and the PNG is copied up beside the review page under its after-name.
     try:
-        drawn_after = SF.render_sheet(after, os.path.join(out_dir, "after"))
+        drawn_after = SF.render_sheet(after,
+                                      os.path.join(out_dir, out["after_dir"]))
         if drawn_after.get("png"):
             shutil.copyfile(drawn_after["png"],
-                            os.path.join(out_dir, "drawing_after.png"))
+                            os.path.join(out_dir, out["png_after"]))
     except Exception:                                   # noqa: BLE001
         pass
     # Same page, rewritten: the After column now holds the RE-MEASURED
@@ -2126,6 +2178,8 @@ def _dispatch(cfg: dict, line: str, attachments: list) -> tuple[dict, bool]:
         cmd_email(cfg, line[len("/email"):].strip(), attachments)
     elif line.startswith("/boq"):
         cmd_boq(cfg, line[len("/boq"):].strip(), attachments)
+    elif line.startswith("/step-folder") or line.startswith("/stepfolder"):
+        cmd_step_folder(cfg, line.split(" ", 1)[1] if " " in line else "")
     elif line.startswith("/step-ask") or line.startswith("/stepask"):
         cmd_step_ask(cfg, line.split(" ", 1)[1] if " " in line else "",
                      attachments)
