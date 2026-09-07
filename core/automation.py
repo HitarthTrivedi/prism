@@ -2836,6 +2836,166 @@ def _reask(driver, agent_cfg: dict, prompt: str, expect: str = "",
         return []
 
 
+# How long a follow-up may wait for a tool, at least. A follow-up redoes a
+# whole deliverable — a document, a set of scenes — and the tool's everyday
+# budget (ChatGPT's is 300s) was cutting those off mid-way. A ceiling, not a
+# duration: the wait ends the moment the answer settles.
+FOLLOWUP_MIN_WAIT = 480
+
+
+def followup_wait(agent_cfg: dict) -> int:
+    """The wait ceiling for a follow-up turn on this tool."""
+    return max(int(agent_cfg.get("wait_time", 60) or 60), FOLLOWUP_MIN_WAIT)
+
+
+def _adopt_assets(spec: dict, files, generated=None) -> str:
+    """Add pictures to a filmed reel's artwork under new names — `new1`,
+    `new2`… — so nothing already placed is renamed underneath it. Returns
+    the manifest of what was added, for the design chat."""
+    from . import assets as _assets
+    try:
+        table = _assets.collect(files, generated=generated)
+    except Exception as e:                               # noqa: BLE001
+        ui.warn(f"   couldn't prepare the new artwork ({e})")
+        return ""
+    if not table:
+        return ""
+    have = spec.setdefault("_assets", {})
+    fresh, n = {}, 1
+    for entry in table.values():
+        while f"new{n}" in have:
+            n += 1
+        have[f"new{n}"] = {**entry, "kind": "art"}
+        fresh[f"new{n}"] = have[f"new{n}"]
+        n += 1
+    ui.ok(f"✂️   {len(fresh)} new asset(s): " + ", ".join(fresh))
+    return _assets.manifest(fresh)
+
+
+def studio_followup(cfg: dict, spec: dict, agent_name: str, design_url: str,
+                    change: str, attachments=None, on_event=None,
+                    on_progress=None, images: str = "",
+                    context: str = "", task: str = "") -> tuple[str, str, str]:
+    """A change to a filmed Studio reel, made where the reel was designed.
+
+    Reopens the design conversation (its URL was saved with the run), asks
+    for only the scenes that change, and re-films locally. Returns (mp4,
+    spec path, note). The previous cut is left where it was; the new one
+    gets its own stamp beside it, so History keeps both.
+
+    A follow-up can need more than the design chat. `images` is a picture
+    the owner asked for — made first, in the image tool, and adopted as
+    `asset:new…` so the design chat can place it. `context` is what an
+    earlier step of the same follow-up produced (a rewritten script), so
+    the design chat changes the scenes it affects rather than guessing.
+
+    Before this, a follow-up on a reel went through the same classifier as
+    any other task and landed on the local renderer — a stage with a file
+    for a link and no chat to resume — or on the writer, in a fresh tab that
+    had never seen the design. Neither could change a scene.
+    """
+    import copy
+    import json as _json
+    import time as _time
+    from . import reel_web as _web, config as C
+
+    def emit(kind, payload):
+        if on_event:
+            on_event(kind, payload)
+
+    agent_cfg = (A.resolve_agent("design", agent_name)
+                 or A.resolve_agent("brains", agent_name))
+    if not agent_cfg:
+        raise RuntimeError(f"{agent_name} isn't in Prism's tool registry, so "
+                           "the design conversation can't be reopened.")
+    spec = copy.deepcopy(spec)
+    C.begin_run(task or change)             # this follow-up's own folder
+    listing = ""
+    if attachments:
+        listing = _adopt_assets(spec, attachments)
+
+    driver = None
+    if images.strip():
+        # The picture first, in the tool that can draw — a fresh tab, since
+        # this is a new job, not a continuation. Harvested off the page the
+        # way the imagery stage's are, then adopted into the reel's artwork.
+        maker = (cfg.get("agents") or {}).get("visual") or "ChatGPT"
+        maker_cfg = A.resolve_agent("visual", maker)
+        if not maker_cfg:
+            ui.warn(f"   {maker} can't make pictures here — going on without")
+        else:
+            emit("stage_start", {"stage": "artwork", "agent": maker})
+            ui.rule(f"ARTWORK  ·  {maker}  ·  follow-up",
+                    style=A.CATEGORIES.get("visual", {}).get("color", "pink"))
+            driver, _ = _get_driver(cfg)
+            _open_tab(driver, maker)
+            driver.get(maker_cfg["url"])
+            _time.sleep(maker_cfg.get("page_wait", 4))
+            emit("waiting", {"stage": "artwork", "seconds": 300})
+            _reask(driver, maker_cfg,
+                   _web.followup_imagery_instructions(images, spec),
+                   wait=90)
+            ui.info("   ⏳  waiting for the picture(s) to finish rendering…")
+            _wait_for_images(driver, maker_cfg, 1, cap=300)
+            files = _harvest_images(driver, maker_cfg, "artwork")
+            made = [f["path"] for f in files if f.get("path")]
+            if made:
+                listing = (listing + "\n" if listing else "") + \
+                    _adopt_assets(spec, made, generated=set(made))
+            else:
+                ui.warn("   no picture came back — the design chat will be "
+                        "told nothing new was made")
+            try:
+                url = driver.current_url
+            except Exception:                            # noqa: BLE001
+                url = maker_cfg["url"]
+            emit("stage_done", {"stage": "artwork", "count": len(made),
+                                "texts": [f"{len(made)} picture(s) made"]
+                                if made else [],
+                                "url": url, "timed_out": False})
+
+    emit("stage_start", {"stage": "design", "agent": agent_name})
+    ui.rule(f"DESIGN  ·  {agent_name}  ·  follow-up",
+            style=A.CATEGORIES.get("design", {}).get("color", "pink"))
+    if driver is None:
+        driver, _ = _get_driver(cfg)
+    _open_tab(driver, agent_name)
+    driver.get(design_url)
+    _time.sleep(agent_cfg.get("page_wait", 4))
+    wait = followup_wait(agent_cfg)
+
+    def ask(prompt, expect=_web.SCENE_EXPECT):
+        emit("waiting", {"stage": "design", "seconds": wait})
+        got = _reask(driver, agent_cfg, prompt, expect=expect, wait=wait)
+        return got[-1] if got else ""
+
+    new_spec, notes = _web.refine_spec(
+        spec, change, ask, check=_web.inspect,
+        log=lambda m: ui.info(f"   {m}"), new_assets=listing,
+        context=context)
+    try:
+        url = driver.current_url or design_url
+    except Exception:                                    # noqa: BLE001
+        url = design_url
+    ui.ok("   " + "; ".join(notes))
+    emit("stage_done", {"stage": "design", "count": 1, "texts": notes,
+                        "url": url, "timed_out": False})
+
+    emit("stage_start", {"stage": "media", "agent": "Prism Studio"})
+    os.makedirs(C.RUNS_DIR, exist_ok=True)
+    stamp = int(_time.time())
+    out = os.path.join(C.RUNS_DIR, f"reel_{stamp}.mp4")
+    spec_path = os.path.join(C.RUNS_DIR, f"reel_{stamp}.json")
+    with open(spec_path, "w", encoding="utf-8") as f:
+        _json.dump(new_spec, f, indent=2)
+    ui.info(f"   🎬  re-filming {len(new_spec['scenes'])} scenes…")
+    _web.render(new_spec, out, on_progress=on_progress, check=False)
+    note = f"reel re-filmed — {os.path.basename(out)} ({'; '.join(notes)})"
+    emit("stage_done", {"stage": "media", "count": 1, "texts": [note],
+                        "url": out, "timed_out": False})
+    return out, spec_path, note
+
+
 def _web_token() -> str:
     from . import reel_web
     return reel_web.ASSET_TOKEN
@@ -3065,7 +3225,8 @@ def run(routing: dict, cfg: dict, attachments=None, on_event=None,
         should_stop=None, failover: bool = True,
         reel_design_stage: str = "", pipeline_files_out: list | None = None,
         motion_design_stage: str = "", resume_urls: dict | None = None,
-        skip_signal=None):
+        skip_signal=None, skip_stages: list | None = None,
+        min_wait: int = 0):
     """Execute the pipeline. Returns (responses, links).
 
     attachments: list of records from core.files.attach() — uploaded to each
@@ -3269,7 +3430,20 @@ def run(routing: dict, cfg: dict, attachments=None, on_event=None,
             # few images, which are harvested off the page like any other
             # generated asset. Skipped only if the user turned it off.
             maker = agents.get("visual") or "ChatGPT"
-            if cfg.get("reel_imagery", True) and A.resolve_agent("visual", maker):
+            # `skip_stages` is what the plan screen left out. This stage is
+            # inserted here, not planned there, so unticking "Make the
+            # images" removed a row and changed nothing — the run still
+            # opened the image tool and made three pictures (2026-09-07).
+            # A step the owner switched off stays off.
+            left_out = "visual" in (skip_stages or ())
+            if left_out:
+                ui.info("🖼️   Make the images was left out of the plan — no "
+                        "pictures will be generated; the reel is built from "
+                        "type and colour"
+                        + (" and the artwork attached" if asset_list else "")
+                        + ".")
+            if (not left_out and cfg.get("reel_imagery", True)
+                    and A.resolve_agent("visual", maker)):
                 stages.insert(studio_at, ("artwork", maker, [
                     _web.imagery_instructions(query, bool(asset_list),
                                               attached=client_pics)]))
@@ -3417,6 +3591,9 @@ def run(routing: dict, cfg: dict, attachments=None, on_event=None,
         ui.warn("Stopped before anything ran.")
         return {}, {}
 
+    # One artifact folder per run — a "Use again" of the same words, or a
+    # follow-up, is a new run and gets a new folder. See config.begin_run.
+    C.begin_run(query)
     driver, fresh = _get_driver(cfg)
     all_responses: dict[str, list[str]] = {}
     all_links: dict[str, str] = {}
@@ -3475,6 +3652,30 @@ def run(routing: dict, cfg: dict, attachments=None, on_event=None,
                 "reason": f"{agent_name} isn't in Prism's tool registry, so "
                           "this step was left out. Pick a different tool for "
                           "it in the plan."})
+            continue
+
+        # A browser stage with no prompt is the run that uploads the files,
+        # asks nothing, and waits the whole cap for an answer to a question
+        # nobody put — 322 seconds on the 2026-09-07 reel run, and the next
+        # stage was doing the same when the owner pressed Stop.
+        #
+        # Only `custom_stages` can bring one here: _needed_stages() drops a
+        # stage with no questions, but the GUI's plan editor hands its
+        # ticked rows over as they are, and a row the router never planned
+        # has no prompt behind it. The "never received the prompt" guard
+        # further down cannot catch it either — it is set inside the
+        # per-prompt loop, which has nothing to loop over. Skipped, not
+        # failed: a failure is retried on another tool, and there is nothing
+        # to send that tool. Local renderers are exempt — they read the
+        # previous stage's output, not a prompt.
+        if not agent_cfg.get("local") and not any(
+                q and str(q).strip() for q in questions):
+            reason = (f"{stage} has no prompt behind it, so there is nothing "
+                      f"to ask {agent_name}. Open Prompt on that step and "
+                      "write one, or leave the step out.")
+            ui.warn(f"   {reason}")
+            emit("stage_skipped", {"stage": stage, "agent": agent_name,
+                                   "reason": reason})
             continue
 
         emit("stage_start", {"stage": stage, "agent": agent_name})
@@ -3914,7 +4115,12 @@ def run(routing: dict, cfg: dict, attachments=None, on_event=None,
                                        "reason": note, "exhausted": False}
                     continue
 
-                wait = agent_cfg.get("wait_time", 60)
+                # `min_wait` raises the ceiling for a run that redoes whole
+                # deliverables — a follow-up — where the tool's everyday
+                # budget cut the answer off mid-way. A ceiling only: the
+                # wait ends the moment the answer settles.
+                wait = max(int(agent_cfg.get("wait_time", 60) or 60),
+                           int(min_wait or 0))
                 # A caller that knows what a finished answer looks like says
                 # so (e.g. /email needs "SUBJECT:"), and a mid-answer pause
                 # can no longer end the wait early.

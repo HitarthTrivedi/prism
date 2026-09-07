@@ -791,6 +791,79 @@ def verify_key(api_key: str, model: str = "") -> str:
     return ""
 
 
+def _escape_inner_quotes(block: str) -> str:
+    """Escape a raw double quote a model left INSIDE a JSON string.
+
+    The plan's prompts are about writing, so they quote things — `Act as a
+    "senior" strategist` — and a model that has just been told to write
+    engaging copy does not always remember that the quote has to be `\\"`
+    once it is inside a JSON string. Walks the text tracking whether it is
+    inside a string; a quote there that is not followed (after whitespace)
+    by `,` `}` `]` or `:` cannot be the string's end, so it is escaped.
+    """
+    out, in_str, esc = [], False, False
+    n = len(block)
+    for i, ch in enumerate(block):
+        if in_str:
+            if esc:
+                esc = False
+                out.append(ch)
+                continue
+            if ch == "\\":
+                esc = True
+                out.append(ch)
+                continue
+            if ch == '"':
+                j = i + 1
+                while j < n and block[j] in " \t\r\n":
+                    j += 1
+                if j >= n or block[j] in ",}]:":
+                    in_str = False
+                    out.append(ch)
+                else:
+                    out.append('\\"')
+                continue
+            out.append(ch)
+            continue
+        if ch == '"':
+            in_str = True
+        out.append(ch)
+    return "".join(out)
+
+
+def _parse_plan(text: str):
+    """The routing dict out of a planner reply — (dict, None), or (None, why).
+
+    Tries the reply as written, then the repairs a scraped browser reply
+    already gets (comments, curly quotes, trailing commas, control
+    characters in strings — core.reel._loosen), then the one fault a
+    planner makes that those do not cover: a raw quote inside a string.
+    """
+    from . import reel as _reel
+    text = text or ""
+    blocks = _reel._blocks(text, "{", "}")
+    s, e = text.find("{"), text.rfind("}") + 1
+    if s != -1 and e > s and text[s:e] not in blocks:
+        # An unbalanced quote throws the string-aware brace scan off; the
+        # outermost slice is the plain-minded fallback.
+        blocks.append(text[s:e])
+    if not blocks:
+        return None, "no JSON object in the reply"
+    why = None
+    for block in blocks:
+        for candidate in (block, _reel._loosen(block),
+                          _escape_inner_quotes(block),
+                          _escape_inner_quotes(_reel._loosen(block))):
+            try:
+                got = json.loads(candidate)
+            except Exception as err:                       # noqa: BLE001
+                why = why or err
+                continue
+            if isinstance(got, dict):
+                return got, None
+    return None, why or "the reply was not a JSON object"
+
+
 def route(query: str, cfg: dict, attachments: list | None = None) -> dict:
     """Call Groq and return the routing dict (stage -> {questions, needed})."""
     agents = {k: v for k, v in (cfg.get("agents") or {}).items() if v}
@@ -817,10 +890,31 @@ def route(query: str, cfg: dict, attachments: list | None = None) -> dict:
     # The one call the whole plan depends on, so this is the one that gets a
     # retry and the full model chain.
     text = groq_chat(api_key, model, prompt, timeout=60)
-    s, e = text.find("{"), text.rfind("}") + 1
-    if s == -1 or e <= s:
-        raise RuntimeError(f"Groq returned no JSON:\n{text[:400]}")
-    routing = json.loads(text[s:e])
+    routing, why = _parse_plan(text)
+    if routing is None:
+        # "Expecting ',' delimiter: line 16 column 49" — twice in a row on
+        # 2026-09-07, a raw quote inside a prompt string, and each time the
+        # whole plan was thrown away behind a "Something went wrong" dialog
+        # with the parser's words in it. The repairs in _parse_plan catch
+        # most of that; what they cannot, one more ask with the error quoted
+        # back does — in JSON mode, where Groq itself refuses to hand back
+        # anything that does not parse.
+        ui.warn(f"the plan came back as JSON that would not parse ({why}) "
+                "— asking once more")
+        again = (prompt + "\n\nYOUR PREVIOUS REPLY WAS NOT VALID JSON — the "
+                 f"parser said: {why}. Reply again with ONLY the JSON "
+                 "object: every double quote inside a string escaped as "
+                 "\\\", no comments, no trailing commas, nothing before or "
+                 "after it.")
+        try:
+            text = groq_chat(api_key, model, again, timeout=60, json_mode=True)
+        except RuntimeError:
+            text = groq_chat(api_key, model, again, timeout=60)
+        routing, why = _parse_plan(text)
+    if routing is None:
+        raise RuntimeError(
+            "Prism's planner wrote a plan it could not read back "
+            f"({why}). This is usually momentary — press Make a plan again.")
 
     # Deterministic safety net: force make-stages the user clearly asked for.
     forced = apply_make_guardrail(query, routing, agents)

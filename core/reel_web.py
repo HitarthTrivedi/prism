@@ -265,6 +265,7 @@ window.__check = function () {
   const seen = new Set();
   const scenes = document.querySelectorAll('.scene.on');
   for (const scene of scenes) {
+    const texts = [];
     for (const el of scene.querySelectorAll('*')) {
       const txt = (el.textContent || '').trim();
       if (!txt || el.children.length) continue;      // leaf text nodes only
@@ -272,8 +273,18 @@ window.__check = function () {
       if (r.width < 1 || r.height < 1) continue;
       const cs = getComputedStyle(el);
       if (cs.visibility === 'hidden' || parseFloat(cs.opacity) < 0.05) continue;
+      // Faded out by an ancestor is faded out: a label inside a panel that
+      // has not arrived yet is not on screen, whatever its own opacity says.
+      let faded = false;
+      for (let p = el.parentElement; p && p !== scene; p = p.parentElement) {
+        const pc = getComputedStyle(p);
+        if (pc.display === 'none' || pc.visibility === 'hidden' ||
+            parseFloat(pc.opacity) < 0.05) { faded = true; break; }
+      }
+      if (faded) continue;
       const label = txt.slice(0, 34);
       const key = label + '|';
+      texts.push({ el: el, r: r, label: label });
       if (r.left < 20 || r.right > %d - 20 || r.top < 20 || r.bottom > %d - 20) {
         if (!seen.has(key + 'box')) {
           seen.add(key + 'box');
@@ -289,32 +300,57 @@ window.__check = function () {
 
       // A box can be inside the frame and still be unusable: a later opaque
       // panel, image or decorative layer may be painted on top of it. Sample
-      // the centre and inset corners. If every sample resolves to a sibling
-      // above the text, report the occlusion before the scene is filmed.
-      const pts = [
-        [r.left + r.width * .50, r.top + r.height * .50],
-        [r.left + r.width * .18, r.top + r.height * .35],
-        [r.left + r.width * .82, r.top + r.height * .35],
-        [r.left + r.width * .18, r.top + r.height * .70],
-        [r.left + r.width * .82, r.top + r.height * .70]
-      ];
-      let covered = 0;
-      for (const [x, y] of pts) {
-        const top = document.elementFromPoint(x, y);
-        if (top && top !== el && !el.contains(top) && !top.contains(el)) {
-          const tc = getComputedStyle(top);
-          if (tc.visibility !== 'hidden' && parseFloat(tc.opacity) >= .08) {
-            covered++;
-          }
+      // a 3x3 grid; two samples landing on a sibling painted above the text
+      // is a panel across it, not a hairline. Five samples and "all five"
+      // was the old rule — the two white blocks that hid half a page
+      // counter on the 2026-09-07 reel covered two of five and passed.
+      // Text over text is left to the overlap pass below, which names both.
+      const pts = [];
+      for (const fx of [.15, .5, .85]) {
+        for (const fy of [.25, .5, .75]) {
+          pts.push([r.left + r.width * fx, r.top + r.height * fy]);
         }
       }
-      if (covered === pts.length && !seen.has(key + 'occluded')) {
+      let covered = 0, by = null;
+      for (const [x, y] of pts) {
+        const top = document.elementFromPoint(x, y);
+        if (!top || top === el || el.contains(top) || top.contains(el)) continue;
+        if (!top.children.length && (top.textContent || '').trim()) continue;
+        const tc = getComputedStyle(top);
+        if (tc.visibility !== 'hidden' && parseFloat(tc.opacity) >= .08) {
+          covered++;
+          by = by || top;
+        }
+      }
+      if (covered >= 2 && !seen.has(key + 'occluded')) {
         seen.add(key + 'occluded');
-        const by = document.elementFromPoint(r.left + r.width / 2,
-                                              r.top + r.height / 2);
-        out.push('"' + label + '" is covered by a higher layer (' +
-                 ((by && by.tagName) || 'element').toLowerCase() +
-                 ') — raise the text z-index or move the covering layer');
+        const cls = (by.className && typeof by.className === 'string')
+          ? ' class="' + by.className.split(' ')[0] + '"' : '';
+        out.push('"' + label + '" is ' +
+                 (covered === pts.length ? 'covered' : 'partly covered') +
+                 ' by a higher layer (<' + by.tagName.toLowerCase() + cls +
+                 '>) — nothing may sit across copy; move it, or raise the text z-index');
+      }
+    }
+
+    // Two texts printed over each other. The commonest fault on a real reel
+    // and, until now, the one this check could not see at all: each text
+    // was inside the frame, large enough, and (mostly) on top of whatever
+    // was under it. A running header colliding with a date, a footer under
+    // a caption, a vertical label through a headline — every one passed.
+    for (let i = 0; i < texts.length; i++) {
+      for (let j = i + 1; j < texts.length; j++) {
+        const a = texts[i].r, b = texts[j].r;
+        const ix = Math.min(a.right, b.right) - Math.max(a.left, b.left);
+        const iy = Math.min(a.bottom, b.bottom) - Math.max(a.top, b.top);
+        if (ix <= 3 || iy <= 3) continue;
+        const small = Math.min(a.width * a.height, b.width * b.height);
+        if (ix * iy < 0.06 * small) continue;     // a kiss between neighbours
+        const k2 = 'ovl|' + texts[i].label + '|' + texts[j].label;
+        if (seen.has(k2)) continue;
+        seen.add(k2);
+        out.push('"' + texts[i].label + '" and "' + texts[j].label +
+                 '" overlap — two texts printed over each other; give each its own space');
       }
     }
 
@@ -439,6 +475,50 @@ def missing_assets(spec: dict) -> list[str]:
     for blob in blobs:
         used.update(re.findall(r"asset:([A-Za-z0-9_-]+)", str(blob)))
     return sorted(used - have)
+
+
+def _asset_names(listing: str) -> list[str]:
+    """The names on an asset list, in order. Only lines that START with a
+    name count, so the NO_ARTWORK instruction — which mentions
+    `asset:anything` mid-sentence to forbid it — yields none."""
+    return list(dict.fromkeys(
+        re.findall(r"^\s*asset:([A-Za-z0-9_-]+)", listing or "", re.M)))
+
+
+def planned_assets(row: dict, listing: str) -> list[str]:
+    """The artwork a storyboard row assigned to its scene — by name, and only
+    names that actually exist on the list. A row may write `assets`,
+    `artwork` or `asset`, as a list or a string; a model is not a schema."""
+    have = set(_asset_names(listing))
+    if not have:
+        return []
+    raw = None
+    for key in ("assets", "artwork", "asset", "images", "image"):
+        if key in (row or {}):
+            raw = row[key]
+            break
+    if raw is None:
+        return []
+    if isinstance(raw, str):
+        raw = re.findall(r"[A-Za-z0-9_-]+", raw)
+    out = []
+    for name in raw if isinstance(raw, (list, tuple)) else []:
+        name = str(name).strip()
+        if name.lower().startswith("asset:"):
+            name = name[6:]
+        if name in have and name not in out:
+            out.append(name)
+    return out
+
+
+def missing_planned(scene: dict, planned: list[str]) -> list[str]:
+    """Planned artwork the scene did not place, as faults the writer can act
+    on — phrased like the layout faults so the two travel in one list."""
+    blob = str((scene or {}).get("html", "")) + str((scene or {}).get("css", ""))
+    return [f"asset:{n} was planned for this scene in your storyboard and "
+            f"does not appear in it — place it (<img src='asset:{n}' alt=''> "
+            f"or background-image: url(asset:{n}))"
+            for n in planned if f"asset:{n}" not in blob]
 
 
 def brand_faults(spec: dict) -> list[str]:
@@ -738,14 +818,20 @@ def render(spec: dict, out_path: str, on_progress=None,
     from playwright.sync_api import sync_playwright
 
     fps = int(spec.get("fps", DEFAULT_FPS))
-    plan, total = _plan(spec, fps)
-    html = build_html(spec, fps)
     # The owner's own hand fixes, made in the browser editor. Applied by the
     # SAME script the editor runs, so the film cannot differ from what they
-    # saw when they pressed Save & render.
+    # saw when they pressed Save & render. A scene length set there is a
+    # plan-time fact and goes into the spec before the windows are cut.
+    edits = []
+    filmed = spec
     if spec.get("edits"):
         from . import reel_edit
-        html = reel_edit.apply_edits(html, reel_edit.clean_edits(spec["edits"]))
+        edits = reel_edit.clean_edits(spec["edits"])
+        filmed = reel_edit.with_timing(spec, edits)
+    plan, total = _plan(filmed, fps)
+    html = build_html(filmed, fps)
+    if edits:
+        html = reel_edit.apply_edits(html, edits)
     exe = ffmpeg_path()
 
     os.makedirs(os.path.dirname(os.path.abspath(out_path)) or ".", exist_ok=True)
@@ -1248,7 +1334,8 @@ def design_instructions(brand: dict | None = None, request: str = "",
         'a field of colour",\n'
         '     "motion": "what moves, in what order, from where — and what '
         'stays still so the moving thing reads",\n'
-        '     "cut": "push"}\n'
+        '     "cut": "push",\n'
+        '     "assets": ["logo"]}\n'
         '  ]\n'
         '}\n\n'
         "ONE STORYBOARD ROW PER SCENE IN THE SCRIPT, in the script's order. "
@@ -1256,7 +1343,19 @@ def design_instructions(brand: dict | None = None, request: str = "",
         "scenes that are all a centred headline over the same background is "
         "the failure this stage exists to prevent — vary the scale, the "
         "alignment, the crop, what the frame is mostly made of.\n\n"
-        "HOW MOTION WORKS — read this, it is the one unusual part:\n"
+        # The pictures are planned here, by name, because a scene written on
+        # its own turn cannot see what the others did with them: on the
+        # 2026-09-07 reel one generated image reached the film as a strip of
+        # confetti and nobody — not the model, not the check — knew a
+        # picture had gone missing, because nothing had said where it went.
+        + (("THE ASSET PLAN: `assets` on a row names the artwork that scene "
+            "carries, by the names on the list above and nothing else. Every "
+            "name on that list must be on at least one row — a picture that "
+            "was made and never placed is a scene that could have been "
+            "stronger — and the logo is on the last row at the very least. "
+            "The scene prompts that follow hold you to this, row by row.\n\n")
+           if _asset_names(assets) else "")
+        + "HOW MOTION WORKS — read this, it is the one unusual part:\n"
         "· Write ordinary CSS @keyframes and animation declarations. The "
         "renderer PAUSES the page and sets each animation's time by hand for "
         "every frame, so the result is identical on every render.\n"
@@ -1316,6 +1415,9 @@ def design_instructions(brand: dict | None = None, request: str = "",
         "frame: animation must never leave copy behind an opaque sibling.\n\n"
         "WHAT WILL BE REJECTED — the page is measured before it is filmed:\n"
         "· any text whose box falls outside the 1080x1920 frame\n"
+        "· any two texts whose boxes overlap, and any text with a panel, "
+        "rule, shape or picture painted across it — a running header must "
+        "leave room for its own date, a footer for its own caption\n"
         f"· any text rendered under {T_LABEL}px; headlines want "
         f"{T_HEADLINE}px+, supporting text {T_SUPPORT}px+. A phone is watched "
         "at arm's length for under a second a scene.\n"
@@ -1486,12 +1588,30 @@ def scene_instructions(idx: int, total: int, line: dict, script_scene: dict,
         val = str(line.get(key, "")).strip()
         if val:
             plan.append(f"  {key.upper()}: {val}")
+    planned = planned_assets(line, assets)
 
     return (
         f"SCENE {idx + 1} OF {total}"
         + (f" — role: {role}" if role else "") + f", {seconds:g} seconds.\n\n"
         + ("YOUR OWN STORYBOARD FOR IT:\n" + "\n".join(plan) + "\n\n"
            if plan else "")
+        + (("ARTWORK THIS SCENE CARRIES — from your own storyboard: "
+            + ", ".join(f"asset:{n}" for n in planned)
+            + ". Each one must appear in this scene's markup or CSS; the "
+            "page is checked for it and the scene comes back without it.\n\n")
+           if planned else "")
+
+        # Written one turn at a time, a scene cannot see the others, and on
+        # the 2026-09-07 reel that showed: scenes 1-4 were numbered "/ 10"
+        # (the source document's page count) and 5-6 "/ 06", and the last
+        # two switched typeface family. The reel has one count and one look.
+        + f"THIS IS SCENE {idx + 1} OF {total}. If it shows a page or scene "
+          f"counter, it reads {idx + 1} / {total} — never a total taken from "
+          "the source material. Same reel, not a new one: use the typefaces, "
+          "the running header and footer, and the label scheme the shared "
+          "stylesheet and the earlier scenes established. A scene that "
+          "switches typeface family or renames the header reads as a "
+          "different film.\n\n"
         + ("THE WORDS, EXACTLY AS THE SCRIPT WROTE THEM — every one of these "
            "has to appear on screen:\n" + "\n".join(words) + "\n\n"
            if words else
@@ -1606,7 +1726,10 @@ def scene_instructions(idx: int, total: int, line: dict, script_scene: dict,
         "step fails.\n\n"
         "Keep every box inside 1080x1920 with 90px/130px margins, and no "
         f"text under {T_LABEL}px — headlines want {T_HEADLINE}px+, supporting "
-        f"text {T_SUPPORT}px+. The page is measured before it is filmed."
+        f"text {T_SUPPORT}px+. No two texts may overlap, and nothing may be "
+        "painted across copy — a header must leave room for its own date, a "
+        "footer for its own caption. The page is measured for all of this, "
+        "at the settled frame, before it is filmed."
     )
 
 
@@ -1752,13 +1875,23 @@ def build_spec(first_reply: str, ask, script: str = "", assets: str = "",
         # old stage checked all seven at the end, so a fault came back as
         # "scene 3's headline is off the frame" against a reply the model had
         # long since moved on from. Asked here, it is simply "this one".
-        if check:
-            try:
-                faults = check({"design": design, "scenes": [scene],
-                                "_assets": assets_table or {}})
-            except Exception as e:
-                say(f"couldn't lay scene {i + 1} out ({e})")
-                faults = []
+        #
+        # The storyboard's asset plan is checked in the same breath, without
+        # a browser: a picture the plan put in this scene has to be in it.
+        planned = planned_assets(board[i], assets)
+
+        def _faults(sc, _i=i):
+            found = []
+            if check:
+                try:
+                    found = list(check({"design": design, "scenes": [sc],
+                                        "_assets": assets_table or {}}) or [])
+                except Exception as e:
+                    say(f"couldn't lay scene {_i + 1} out ({e})")
+            return missing_planned(sc, planned) + found
+
+        if check or planned:
+            faults = _faults(scene)
             if faults:
                 say(f"scene {i + 1} has {len(faults)} layout problem(s) — "
                     "sending them back")
@@ -1773,11 +1906,7 @@ def build_spec(first_reply: str, ask, script: str = "", assets: str = "",
                     fixed.setdefault("seconds", scene["seconds"])
                     fixed.setdefault("cut", scene.get("cut", ""))
                     fixed.setdefault("type", scene.get("type", ""))
-                    try:
-                        left = check({"design": design, "scenes": [fixed],
-                                      "_assets": assets_table or {}})
-                    except Exception:
-                        left = []
+                    left = _faults(fixed)
                     # Kept only if genuinely cleaner. A "fix" that trades four
                     # faults for five is not a fix, and the first attempt at
                     # least had the composition the storyboard asked for.
@@ -1835,6 +1964,286 @@ def script_drift(spec: dict, script_text: str) -> list[str]:
             if hits < max(1, len(words) // 2):
                 lost.append(line[:60])
     return lost
+
+
+# ── the follow-up: a change to a filmed reel, in the chat that designed it ──
+# The design conversation holds everything: the look, the storyboard, every
+# scene as written. A change asked THERE costs one turn and comes back in the
+# reel's own idiom; the same change asked in a fresh chat starts from nothing.
+# So a follow-up reopens that tab (its URL is saved with the run) and asks for
+# only the scenes that change — each complete, so it replaces its scene
+# outright — then re-films locally. No AI touches the scenes it did not name.
+
+def _scene_index_lines(spec: dict) -> str:
+    """One line per scene, so the art director and the owner mean the same
+    thing by "scene 3": the number, the role, and the words on it."""
+    out = []
+    for i, sc in enumerate(spec.get("scenes") or [], 1):
+        words = re.sub(r"<[^>]+>", " ", str(sc.get("html", "")))
+        words = " ".join(words.split())[:90]
+        role = str(sc.get("type") or "").strip()
+        out.append(f"  {i}. {(role + ' — ') if role else ''}{words}")
+    return "\n".join(out)
+
+
+_IMAGE_RULES = (
+    "EVERY IMAGE MUST:\n"
+    "  · have a TRANSPARENT background — a PNG with alpha, the subject cut "
+    "out and nothing behind it. No white card, no scene, no desk, no drop "
+    "shadow, no rounded panel. If transparency is genuinely not possible, "
+    "use ONE flat solid colour and nothing else.\n"
+    "  · contain one clear subject, with generous empty space around it.\n"
+    "  · contain no people and no faces, and no baked-in words.\n"
+    "  · be square or portrait, high-resolution, the subject uncropped.\n")
+
+
+def followup_imagery_instructions(what: str, spec: dict) -> str:
+    """The image tool's turn in a follow-up: the picture(s) the owner asked
+    for, made as reel assets — the same rules the imagery stage works to,
+    so what comes back drops into a scene like any other artwork."""
+    have = ", ".join(f"asset:{n}" for n in (spec.get("_assets") or {}))
+    return (
+        "You are making ARTWORK for a short vertical brand reel that already "
+        "exists and has been filmed. The owner watched it and asked for this "
+        f"picture:\n\n  “{what.strip()}”\n\n"
+        "Make it as SEPARATE image file(s) — one per picture asked for, at "
+        "most 3 — calling the image tool once per picture. They will be "
+        "placed INSIDE a scene by a later step: raw ingredients, not finished "
+        "frames. No storyboard, no collage, no caption, no headline.\n\n"
+        + _IMAGE_RULES
+        + (f"\nThe reel already carries: {have}. Make what was asked for, "
+           "not another version of those.\n" if have else "")
+        + "\nWhen the images are done, reply with one short line per image "
+        "saying what it is — nothing else. The images are collected from "
+        "this page automatically."
+    )
+
+
+def followup_instructions(change: str, spec: dict, new_assets: str = "",
+                          context: str = "") -> str:
+    """What the design conversation is asked when the owner wants a change.
+
+    `context` is what an earlier step of the same follow-up produced — a
+    rewritten script, notes on the pictures just made — so the design chat
+    changes the scenes it affects rather than guessing what moved."""
+    total = len(spec.get("scenes") or [])
+    have = ", ".join(f"asset:{n}" for n in (spec.get("_assets") or {}))
+    return (
+        "The reel you designed in this conversation has been filmed and the "
+        "owner has watched it. They want this change:\n\n"
+        f"  “{change.strip()}”\n\n"
+        f"THE REEL AS FILMED — {total} scene(s):\n{_scene_index_lines(spec)}\n\n"
+        + ((f"WHAT CHANGED UPSTREAM — a step before this one was redone for "
+            f"this change, and this is its new output. Update the scenes "
+            f"whose words or facts it changes; leave the rest as filmed:\n\n"
+            f"{context.strip()[:6000]}\n\n")
+           if context.strip() else "")
+        + ((f"NEW ARTWORK made or attached for this change — use it by "
+            f"name, exactly like the rest:\n{new_assets}\n\n")
+           if new_assets.strip() else "")
+        + (f"Artwork already in the reel: {have}.\n\n" if have else "")
+        + "REPLY WITH ONLY THIS JSON OBJECT, in a ```json fenced block:\n"
+        "{\n"
+        '  "scenes": [\n'
+        '    {"scene": 3, "seconds": 4, "cut": "push",\n'
+        '     "css": "…this scene\'s COMPLETE rules and @keyframes…",\n'
+        '     "html": "…this scene\'s COMPLETE markup…"}\n'
+        "  ],\n"
+        '  "design_css": "…only if the SHARED stylesheet changes — palette, '
+        'type — and then the whole stylesheet, not a diff…",\n'
+        '  "remove": []\n'
+        "}\n\n"
+        "RULES\n"
+        "· Send only the scenes the change touches, but send each one "
+        "COMPLETE — its full css and html — because it replaces the scene "
+        "outright. Everything you do not send stays exactly as filmed.\n"
+        "· A change to the whole reel (colours, typeface, the running "
+        "header) is a change to `design_css`; send scenes as well only where "
+        "their own markup must change.\n"
+        f"· `scene` is the number from the list above, 1 to {total}. A number "
+        f"past {total} appends a new scene at the end. `remove` lists scene "
+        "numbers to drop.\n"
+        f"· Same reel: the typefaces, header, footer and label scheme stay; a "
+        f"counter reads n / {total}.\n"
+        "· Artwork by name only — the names listed here and nothing else; a "
+        "name that does not exist leaves a hole.\n"
+        f"· No two texts may overlap and nothing may sit across copy; every "
+        f"box inside 1080x1920 with 90px/130px margins; no text under "
+        f"{T_LABEL}px. The page is measured before it is filmed.\n"
+        "· HTML attributes in single quotes — the markup lives inside a JSON "
+        "string.\n"
+        "· No explanation, no description of the change — the JSON is the "
+        "whole reply."
+    )
+
+
+def parse_followup(text: str, total: int) -> dict | None:
+    """The change out of the reply: {"scenes": {index0: scene}, "remove":
+    [index0…], "design_css": str|None}, or None if nothing usable came."""
+    for got in _json_objects(text or ""):
+        scenes, remove, design_css = {}, [], None
+        rows = got.get("scenes")
+        if isinstance(rows, list):
+            for r in rows:
+                if not isinstance(r, dict) or not str(r.get("html", "")).strip():
+                    continue
+                try:
+                    n = int(r.get("scene") if r.get("scene") is not None
+                            else r.get("index", 0))
+                except (TypeError, ValueError):
+                    continue
+                if n < 1:
+                    continue
+                sc = {"html": str(r["html"])}
+                if str(r.get("css", "")).strip():
+                    sc["css"] = str(r["css"])
+                for key in ("cut", "type"):
+                    if str(r.get(key, "")).strip():
+                        sc[key] = str(r[key]).strip()
+                try:
+                    sc["seconds"] = float(r["seconds"])
+                except (KeyError, TypeError, ValueError):
+                    pass
+                scenes[n - 1] = sc
+        rm = got.get("remove")
+        if isinstance(rm, list):
+            for x in rm:
+                try:
+                    n = int(x)
+                except (TypeError, ValueError):
+                    continue
+                if 1 <= n <= total and n - 1 not in remove:
+                    remove.append(n - 1)
+            remove.sort()
+        dc = got.get("design_css")
+        if dc is None and isinstance(got.get("design"), dict):
+            dc = got["design"].get("css")
+        if isinstance(dc, str) and dc.strip():
+            design_css = dc
+        if scenes or remove or design_css:
+            return {"scenes": scenes, "remove": remove, "design_css": design_css}
+    return None
+
+
+def apply_followup(spec: dict, patch: dict) -> dict:
+    """The filmed spec with the change applied. A new dict; `spec` untouched.
+
+    A hand edit (spec["edits"]) addresses an element by its position inside
+    its scene, so it means nothing once that scene is rewritten — those are
+    dropped. A removed scene shifts every later index, so edits from the
+    first removal onward go too. Edits on untouched scenes stay.
+    """
+    import copy
+    new = copy.deepcopy(spec)
+    scenes = list(new.get("scenes") or [])
+    changed = set()
+    for idx in sorted(patch.get("scenes") or {}):
+        sc = dict(patch["scenes"][idx])
+        if idx < len(scenes):
+            old = scenes[idx] if isinstance(scenes[idx], dict) else {}
+            sc.setdefault("seconds", old.get("seconds", 4))
+            sc.setdefault("cut", old.get("cut", ""))
+            sc.setdefault("type", old.get("type", ""))
+            scenes[idx] = sc
+            changed.add(idx)
+        else:
+            sc.setdefault("seconds", 4.0)
+            sc.setdefault("cut", "push")
+            scenes.append(sc)
+            changed.add(len(scenes) - 1)
+    removed = sorted(i for i in (patch.get("remove") or []) if 0 <= i < len(scenes))
+    for i in reversed(removed):
+        del scenes[i]
+    new["scenes"] = scenes
+    if patch.get("design_css"):
+        new.setdefault("design", {})["css"] = patch["design_css"]
+    first_removed = removed[0] if removed else None
+    kept = []
+    for e in new.get("edits") or []:
+        s = e.get("scene") if isinstance(e, dict) else None
+        if not isinstance(s, int) or s in changed:
+            continue
+        if first_removed is not None and s >= first_removed:
+            continue
+        kept.append(e)
+    if kept:
+        new["edits"] = kept
+    else:
+        new.pop("edits", None)
+    new.pop("_faults", None)
+    return new
+
+
+def refine_spec(spec: dict, change: str, ask, check=None, log=None,
+                new_assets: str = "", context: str = "") -> tuple[dict, list[str]]:
+    """Run the change through the design conversation and return (new spec,
+    notes). `ask(prompt, expect) -> str` sends a turn in that tab; `check`
+    is the same layout check build_spec uses. Raises ReelError when the
+    reply holds nothing to film — nothing is changed in that case."""
+    def say(msg):
+        if log:
+            log(msg)
+
+    total = len(spec.get("scenes") or [])
+    if not total:
+        raise ReelError("There is no reel to change.")
+    raw = ask(followup_instructions(change, spec, new_assets, context),
+              SCENE_EXPECT) or ""
+    patch = parse_followup(raw, total)
+    if patch is None:
+        raw = ask("Send the change again as JSON only — first character '{', "
+                  'last \'}\', keys "scenes" (each with "scene", "seconds", '
+                  '"cut", "css", "html"), optional "design_css" and "remove", '
+                  "in a ```json fenced block. Nothing before or after.",
+                  SCENE_EXPECT) or ""
+        patch = parse_followup(raw, total)
+    if patch is None:
+        raise ReelError("The art director did not answer with a change that "
+                        "can be filmed — the reel was left as it was.")
+
+    design = dict(spec.get("design") or {})
+    if patch.get("design_css"):
+        design["css"] = patch["design_css"]
+
+    def faults_in(scene):
+        if not check:
+            return []
+        try:
+            return list(check({"design": design, "scenes": [scene],
+                               "_assets": spec.get("_assets") or {}}) or [])
+        except Exception as e:                           # noqa: BLE001
+            say(f"couldn't lay the scene out ({e})")
+            return []
+
+    for idx in sorted(patch["scenes"]):
+        faults = faults_in(patch["scenes"][idx])
+        if not faults:
+            continue
+        say(f"scene {idx + 1} has {len(faults)} layout problem(s) — sending "
+            "them back")
+        fixed = parse_followup(ask(
+            f"Scene {idx + 1} was laid out at 1080x1920 and these are wrong:"
+            "\n\n" + "\n".join(f"{n}. {x}" for n, x in enumerate(faults[:8], 1))
+            + f'\n\nSend the corrected scene {idx + 1}: ONLY the JSON object '
+              '{"scenes": [{"scene": ' + str(idx + 1) + ', …}]}, same keys, '
+              "in a ```json fenced block.",
+            SCENE_EXPECT) or "", total)
+        cand = ((fixed or {}).get("scenes") or {}).get(idx)
+        if cand and len(faults_in(cand)) < len(faults):
+            patch["scenes"][idx] = cand
+            say("   fixed")
+        else:
+            say("   the correction was no better — keeping the first")
+
+    what = []
+    if patch["scenes"]:
+        nums = ", ".join(str(i + 1) for i in sorted(patch["scenes"]))
+        what.append(("scenes " if len(patch["scenes"]) > 1 else "scene ") + nums)
+    if patch["remove"]:
+        what.append("removed " + ", ".join(str(i + 1) for i in patch["remove"]))
+    if patch.get("design_css"):
+        what.append("the shared stylesheet")
+    return apply_followup(spec, patch), ["changed " + "; ".join(what)]
 
 
 def _fix_markup_quotes(block: str) -> str:
