@@ -19,6 +19,7 @@ import subprocess
 import platform
 import webbrowser
 from . import agents as A
+from . import config as C
 from . import ui
 
 def _chrome_binaries() -> list[str]:
@@ -1921,6 +1922,32 @@ def _browser_is_gone(error: object) -> bool:
     return any(marker in str(error).lower() for marker in _BROWSER_GONE)
 
 
+# What a step is called to a person — the plan screen's words, so the chat a
+# step opens is titled the way the timeline names it.
+STEP_NAMES = {
+    "brains": "Think it through", "research": "Look things up",
+    "leads": "Find the people", "content": "Write it up",
+    "visual": "Make the images", "media": "Make the video",
+    "audio": "Record the voice", "development": "Build the tool",
+    "presentation": "Build the slides", "design": "Design the reel",
+    "artwork": "Make the artwork", "script": "Write the script",
+    "analysis": "Read the files", "summary": "Sum it up",
+    "motion_plan": "Plan the motion", "format": "Format it",
+}
+
+
+def _chat_header(title: str, stage: str) -> str:
+    """The first line of the first message a stage sends: `Prism · <job> ·
+    <step>`. ChatGPT and Claude name a conversation after its opening, and
+    every Prism chat used to open with "Your ONLY task is: Act as a senior
+    …" — so a customer's sidebar read "Senior Creative Director Task" forty
+    times, and nothing said which job or which step any of them was."""
+    step = STEP_NAMES.get(stage) or STEP_NAMES.get(stage.split(" ")[0]) \
+        or stage.replace("_", " ").capitalize()
+    title = (title or "").strip()
+    return f"Prism · {title} · {step}\n\n" if title else f"Prism · {step}\n\n"
+
+
 def _intent_block(query: str) -> str:
     """The user's own words, verbatim, at the top of every stage prompt.
 
@@ -2875,7 +2902,8 @@ def _adopt_assets(spec: dict, files, generated=None) -> str:
 def studio_followup(cfg: dict, spec: dict, agent_name: str, design_url: str,
                     change: str, attachments=None, on_event=None,
                     on_progress=None, images: str = "",
-                    context: str = "", task: str = "") -> tuple[str, str, str]:
+                    context: str = "", task: str = "",
+                    title: str = "") -> tuple[str, str, str]:
     """A change to a filmed Studio reel, made where the reel was designed.
 
     Reopens the design conversation (its URL was saved with the run), asks
@@ -2909,7 +2937,8 @@ def studio_followup(cfg: dict, spec: dict, agent_name: str, design_url: str,
         raise RuntimeError(f"{agent_name} isn't in Prism's tool registry, so "
                            "the design conversation can't be reopened.")
     spec = copy.deepcopy(spec)
-    C.begin_run(task or change)             # this follow-up's own folder
+    C.begin_run(task or change,             # this follow-up's own folder
+                title=title or C.fallback_title(task or change))
     listing = ""
     if attachments:
         listing = _adopt_assets(spec, attachments)
@@ -3592,8 +3621,11 @@ def run(routing: dict, cfg: dict, attachments=None, on_event=None,
         return {}, {}
 
     # One artifact folder per run — a "Use again" of the same words, or a
-    # follow-up, is a new run and gets a new folder. See config.begin_run.
-    C.begin_run(query)
+    # follow-up, is a new run and gets a new folder — named by the job's
+    # title, which the planner wrote (or the request's first words when it
+    # did not). See config.begin_run.
+    run_title = ((routing or {}).get("_title") or C.fallback_title(query))
+    C.begin_run(query, title=run_title)
     driver, fresh = _get_driver(cfg)
     all_responses: dict[str, list[str]] = {}
     all_links: dict[str, str] = {}
@@ -4016,6 +4048,9 @@ def run(routing: dict, cfg: dict, attachments=None, on_event=None,
                             pass
 
                         full_prompt = ((context + prompt) if (idx == 1 and context) else prompt) + handoff
+                        if idx == 1:
+                            # The chat's name — see _chat_header.
+                            full_prompt = _chat_header(run_title, stage) + full_prompt
                         full_prompt = _bmp_safe(full_prompt)  # strip emoji ChromeDriver can't type
                         if not _fast_type(driver, textarea, full_prompt):
                             # JS insertion didn't take on this site — fall back

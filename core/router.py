@@ -14,6 +14,7 @@ import re
 import requests
 
 from . import agents as A
+from . import config as C
 from . import ui
 
 GROQ_URL = "https://api.groq.com/openai/v1/chat/completions"
@@ -864,6 +865,32 @@ def _parse_plan(text: str):
     return None, why or "the reply was not a JSON object"
 
 
+def title_for(query: str, brief: str, api_key: str, model: str) -> str:
+    """A short name for the job — what a folder, a History row and a chat
+    should be called. Six words at most, no verb, no quotes: "Instagram
+    reel · brand guide" for "make a reel for instgram for this brand".
+    Until now every one of those surfaces carried the request verbatim,
+    typos and all, and every chat Prism opened was titled by its own
+    opening line — "Senior Creative Director Task", forty times over.
+    Never raises: a planner that cannot name the job gets the request's
+    first words instead."""
+    prompt = (
+        "Name this job in at most six words, the way a folder or a chat "
+        "thread would be named: what is being made, and for whom or about "
+        "what. No verbs like 'create' or 'make', no quotes, no trailing "
+        "punctuation, spell names correctly even if the request does not.\n\n"
+        f"The request: {query}\n"
+        + (f"\nThe brief: {brief[:600]}\n" if brief else "")
+        + '\nReply with ONLY a JSON object: {"title": "..."}')
+    try:
+        out = groq_chat(api_key, model, prompt, temperature=0, timeout=20,
+                        retries=0, json_mode=True)
+        title = C.tidy_title(str(json.loads(out).get("title", "")))
+    except Exception:                                    # noqa: BLE001
+        title = ""
+    return title or C.fallback_title(query)
+
+
 def route(query: str, cfg: dict, attachments: list | None = None) -> dict:
     """Call Groq and return the routing dict (stage -> {questions, needed})."""
     agents = {k: v for k, v in (cfg.get("agents") or {}).items() if v}
@@ -931,6 +958,12 @@ def route(query: str, cfg: dict, attachments: list | None = None) -> dict:
     # chain (raw words → brief → stage prompts). Consumers iterate
     # PIPELINE_ORDER, so this extra key is invisible to them.
     routing["_brief"] = brief
+    # The job's name, for the run folder, History, Home and every chat's
+    # title. Same "invisible to consumers" convention as _brief.
+    try:
+        routing["_title"] = title_for(query, brief, api_key, model)
+    except Exception:                                    # noqa: BLE001
+        routing["_title"] = C.fallback_title(query)
     try:
         routing["_named_tools"] = detect_named_tools(query)
     except Exception:
