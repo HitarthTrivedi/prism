@@ -128,7 +128,17 @@ def selftest() -> tuple[bool, str]:
                 page = browser.new_page(viewport={"width": 200, "height": 120})
                 page.set_content(
                     "<div style='width:200px;height:120px;background:#123'></div>")
-                frame = page.screenshot(type="jpeg", quality=60)
+                try:
+                    frame = page.screenshot(type="jpeg", quality=60)
+                except Exception:
+                    # Chromium can acknowledge set_content just before its
+                    # first off-screen surface is paintable (seen once during
+                    # a clean frozen-build smoke test as
+                    # Page.captureScreenshot: Unable to capture screenshot).
+                    # A real render owns the page for much longer; give this
+                    # intentionally tiny liveness probe one bounded retry.
+                    page.wait_for_timeout(100)
+                    frame = page.screenshot(type="jpeg", quality=60)
             finally:
                 browser.close()
     except Exception as e:
