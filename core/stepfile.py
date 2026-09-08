@@ -92,7 +92,11 @@ _EXTS = (".step", ".stp")
 # Where a model's files go when nobody has said otherwise. The GUI asks the
 # person and passes their answer as `root` to output_dir(); the terminal
 # reads cfg["step_out_dir"] and falls back to this.
-DEFAULT_OUT_ROOT = os.path.join(os.path.expanduser("~/Desktop"), "Prism Step")
+# expanduser("~") then join, not expanduser("~/Desktop"): the latter keeps the
+# forward slash on Windows (C:\\Users\\x/Desktop), which is a different string
+# from the normalised path output_dir() hands back — the one red test on the
+# Windows CI lane for the STEP round.
+DEFAULT_OUT_ROOT = os.path.join(os.path.expanduser("~"), "Desktop", "Prism Step")
 
 
 def available() -> tuple[bool, str]:
