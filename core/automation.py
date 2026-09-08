@@ -3101,6 +3101,28 @@ def _run_studio(prior_text, attachments, cfg: dict, brand: dict | None = None,
         if sampled:
             spec["brand"] = sampled
 
+    # The design pass may have inspected the attached references and marked a
+    # file as limited/unusable. Keep that decision visible in the run log and
+    # in the saved spec; never silently substitute an invented asset name.
+    flags = spec.get("asset_flags")
+    if isinstance(flags, list):
+        clean_flags = []
+        for flag in flags[:32]:
+            if not isinstance(flag, dict):
+                continue
+            name = str(flag.get("asset", flag.get("name", ""))).strip()[:32]
+            state = str(flag.get("status", "limited")).strip().lower()
+            reason = str(flag.get("reason", "")).strip()[:240]
+            if name and state in ("limited", "unusable"):
+                clean_flags.append({"asset": name, "status": state,
+                                    "reason": reason})
+                ui.warn(f"   ⚑  {name} flagged {state}"
+                        + (f" — {reason}" if reason else ""))
+        if clean_flags:
+            spec["asset_flags"] = clean_flags
+        else:
+            spec.pop("asset_flags", None)
+
     # Rebuilt, not passed along: collect() names assets from the files in a
     # fixed order, so the table the design stage was shown and the table the
     # renderer resolves are the same one without either holding a reference.

@@ -373,6 +373,76 @@ def _ink_ratio(path: str) -> float:
     return float((a > 24).mean())
 
 
+def looks_like_contact_sheet(path: str) -> bool:
+    """Detect a generated multi-panel board masquerading as one asset.
+
+    Image models sometimes return a 2xN storyboard/contact sheet when asked
+    for separate artwork. Long, high-contrast separator rules are a reliable
+    signal and are intentionally conservative: a single decorative rule is
+    not enough to reject a photograph.
+    """
+    try:
+        import numpy as np
+        from PIL import Image
+        with Image.open(path) as im:
+            im = im.convert("RGB")
+            im.thumbnail((320, 320))
+            arr = np.asarray(im).astype("int16")
+        gray = arr.mean(axis=2)
+        def separators(axis: int) -> int:
+            # Contrast on both sides of a column/row is what a panel rule has;
+            # texture alone rarely spans 70% of the perpendicular dimension.
+            d = np.abs(np.diff(gray, axis=axis))
+            score = (d > 85).mean(axis=1-axis)
+            runs = 0; in_run = False
+            for value in score > 0.70:
+                if value and not in_run: runs += 1
+                in_run = bool(value)
+            return runs
+        return separators(0) >= 2 or separators(1) >= 2
+    except Exception:
+        return False
+
+
+def split_contact_sheet(path: str, out_dir: str | None = None) -> list[str]:
+    """Turn the common generated 4+3 storyboard board into usable panels.
+
+    This is deliberately conservative and only runs after
+    :func:`looks_like_contact_sheet` has identified a board.  The image
+    generator's portrait boards use four tiles on the upper row and three on
+    the lower row; trimming a small gutter keeps separator rules out of the
+    actual scene art.  Returning an empty list leaves unusual composites
+    rejected instead of guessing.
+    """
+    if not looks_like_contact_sheet(path):
+        return []
+    try:
+        from PIL import Image
+        out_dir = out_dir or os.path.dirname(path)
+        os.makedirs(out_dir, exist_ok=True)
+        with Image.open(path) as src:
+            im = src.convert("RGBA")
+            w, h = im.size
+            # The 4+3 layout is recognisable by its near-square board shape.
+            if not (0.72 <= w / max(h, 1) <= 1.25):
+                return []
+            split = h // 2
+            panels = []
+            for row, (y0, y1, cols) in enumerate(((0, split, 4), (split, h, 3))):
+                row_h = y1 - y0
+                for col in range(cols):
+                    x0, x1 = round(col * w / cols), round((col + 1) * w / cols)
+                    gx, gy = max(2, round((x1 - x0) * .012)), max(2, round(row_h * .012))
+                    box = (x0 + gx, y0 + gy, x1 - gx, y1 - gy)
+                    tile = im.crop(box)
+                    target = os.path.join(out_dir, f"{os.path.basename(path)}.panel{len(panels)+1}.png")
+                    tile.save(target, "PNG", optimize=True)
+                    panels.append(target)
+            return panels
+    except Exception:
+        return []
+
+
 def collect(images: list, out_dir: str | None = None,
             generated: set | None = None) -> dict:
     """Build the asset table the design stage is allowed to reference.
@@ -432,9 +502,12 @@ def collect(images: list, out_dir: str | None = None,
                 w, h = im.size
         except Exception:
             continue
+        composite = looks_like_contact_sheet(use)
+        panels = split_contact_sheet(use, out_dir) if composite else []
         prepared.append({"path": use, "w": w, "h": h, "alpha": prep["alpha"],
                          "how": prep["how"],
                          "ink": _ink_ratio(use) if prep["alpha"] else 1.0,
+                         "composite": composite, "panels": panels,
                          "source": p, "made": p in (generated or ())})
 
     if not prepared:
@@ -526,6 +599,8 @@ def manifest(table: dict) -> str:
         else:
             cut = "OPAQUE — a photograph with its own background"
             opaque.append(f"asset:{name}")
+        if a.get("composite"):
+            cut += "; REJECTED CONTACT SHEET — not a single usable image"
         lines.append(f'  asset:{name} — {a["w"]}x{a["h"]}, {cut} — {what}')
         # A LANDSCAPE picture in a PORTRAIT frame. Made to be flagged because
         # the customer types "make a reel, here are two screenshots" and

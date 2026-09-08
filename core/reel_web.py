@@ -429,7 +429,7 @@ def _plan(spec: dict, fps: int):
     return out, int(round(total_ms / 1000.0 * fps))
 
 
-def _asset_uris(table: dict) -> dict:
+def _asset_uris(table: dict, scene_index: int | None = None) -> dict:
     """Every asset as a data: URI.
 
     Inlined rather than linked because the page is loaded with set_content and
@@ -441,7 +441,36 @@ def _asset_uris(table: dict) -> dict:
     import base64
     out = {}
     for name, a in (table or {}).items():
-        path = a.get("path") if isinstance(a, dict) else a
+        # A model occasionally returns a storyboard/contact sheet when asked
+        # for separate artwork. Never let that composite become a full-frame
+        # image in the final video; the design prompt receives the rejection
+        # and can fall back to type/CSS or request individual art.
+        if isinstance(a, dict) and a.get("composite"):
+            # Storyboard boards are useful only as individual tiles.  Asset
+            # collection records the deterministic 4+3 panel crops; choose a
+            # tile per scene so a board can never appear as a giant card.
+            panels = a.get("panels") or []
+            if not panels and a.get("path"):
+                try:
+                    from .assets import split_contact_sheet
+                    panels = split_contact_sheet(a["path"])
+                except Exception:
+                    panels = []
+            if panels and scene_index is not None:
+                path = panels[scene_index % len(panels)]
+            else:
+                continue
+        else:
+            path = a.get("path") if isinstance(a, dict) else a
+        # Specs written before the contact-sheet metadata existed are still
+        # safe: inspect the source file lazily when they are re-rendered.
+        if isinstance(a, dict) and path:
+            try:
+                from .assets import looks_like_contact_sheet
+                if looks_like_contact_sheet(path) and scene_index is None:
+                    continue
+            except Exception:
+                pass
         try:
             if not path or os.path.getsize(path) > 6_000_000:
                 continue
@@ -467,7 +496,8 @@ def _place_assets(text: str, uris: dict) -> str:
 def missing_assets(spec: dict) -> list[str]:
     """Asset names the design asks for that were never made."""
     import re
-    have = set((spec.get("_assets") or {}).keys())
+    have = {name for name, asset in (spec.get("_assets") or {}).items()
+            if not (isinstance(asset, dict) and asset.get("composite"))}
     used = set()
     blobs = [(spec.get("design") or {}).get("css", "")]
     for sc in (spec.get("scenes") or []):
@@ -772,9 +802,12 @@ def build_html(spec: dict, fps: int = DEFAULT_FPS) -> str:
     root_vars = ";".join(f"--{k}:{v}" for k, v in brand.items()
                          if isinstance(v, str) and v.strip())
 
-    uris = _asset_uris(spec.get("_assets") or {})
     body, scene_css = [], []
     for i, sc in enumerate(scenes):
+        # Resolve generated storyboard panels against the scene that uses
+        # them.  A single global URI table was the source of full-board
+        # images and, after rejection, blank image slots.
+        uris = _asset_uris(spec.get("_assets") or {}, scene_index=i)
         html = _drop_missing(_place_assets(sc.get("html") or "", uris))
         # A scene may name the cut it wants ("push", "squeeze", "zoom") and
         # get it from the library in the harness. Sanitised rather than
@@ -794,12 +827,13 @@ def build_html(spec: dict, fps: int = DEFAULT_FPS) -> str:
         if own:
             scene_css.append(own)
 
+    design_uris = _asset_uris(spec.get("_assets") or {})
     return (
         "<!doctype html><html><head><meta charset='utf-8'>"
         f"{fonts}"
         f"<style>{_HARNESS_CSS}</style>"
         f"<style>:root{{{root_vars}}}</style>"
-        f"<style>{_drop_missing(_place_assets(design.get('css', ''), uris))}</style>"
+        f"<style>{_drop_missing(_place_assets(design.get('css', ''), design_uris))}</style>"
         f"<style>{''.join(scene_css)}</style>"
         "</head><body>"
         f"<div id='stage'>{''.join(body)}</div>"
@@ -883,6 +917,17 @@ def render(spec: dict, out_path: str, on_progress=None,
                     for fault in page.evaluate("() => window.__check()") or []:
                         if fault not in faults:
                             faults.append(fault)
+
+                # Never publish an MP4 that the browser has already proved
+                # malformed. Previously faults were only attached to the
+                # JSON after encoding, so clipped copy or images still looked
+                # like a successful render in Studio.
+                if faults:
+                    preview = "; ".join(faults[:8])
+                    more = f" (+{len(faults) - 8} more)" if len(faults) > 8 else ""
+                    raise ReelError(
+                        "Render preflight failed; no MP4 was written: "
+                        + preview + more)
 
             proc = subprocess.Popen(cmd, stdin=subprocess.PIPE,
                                     stderr=subprocess.PIPE)
@@ -1316,6 +1361,21 @@ def design_instructions(brand: dict | None = None, request: str = "",
             "\n\nUse them by name, exactly like a URL: "
             '<img src="asset:logo" alt=""> or '
             "background-image: url(asset:logo).\n"
+            "· VISUAL REFERENCE REVIEW: inspect each attached image in the "
+            "conversation before choosing a scene. For every listed asset, "
+            "decide which scene uses it and record that name in the storyboard "
+            "row's `assets` list. If an image is unreadable, irrelevant, the "
+            "wrong orientation, or cannot be used safely, do not force it into "
+            "a frame: add an `asset_flags` entry with its asset name, status "
+            "(`limited` or `unusable`) and a short reason. Never invent a "
+            "replacement filename.\n"
+            "· VISUAL REFERENCE REVIEW: inspect every attached image in the "
+            "conversation before choosing a scene. Map each usable asset to "
+            "the storyboard row's `assets` list. If an image is unreadable, "
+            "irrelevant, the wrong orientation, or unsafe to use, do not "
+            "force it into a frame: add an `asset_flags` entry with its name, "
+            "status (`limited` or `unusable`) and a short reason. Never invent "
+            "a replacement filename.\n"
             "· THOSE NAMES ARE THE ONLY ONES THAT EXIST. Referring to any "
             "other — asset:art2 when only asset:art1 is listed, asset:photo, "
             "asset:bg — leaves a hole in the frame. Count the list above and "
