@@ -64,18 +64,11 @@ def _playwright_available() -> bool:
     return browser.chromium_path() is not None
 
 
-# Temporary kill-switch, 2026-08-30: the render pipeline has a known bug
-# (image nodes resolving to asset paths that don't exist at render time —
-# a broken-image icon and a blank frame, baked into the actual output, not
-# a log-only glitch) that makes Motion unsafe to show a client today. This
-# is the single chokepoint BOTH ways Motion gets reached funnel through —
-# main_window._open_motion_dialog() (core_bridge.motion_available()) and
-# the AI-router's own pipeline execution (automation._run_motion()) both
-# call this function and already degrade gracefully on a (False, message)
-# result, exactly like Reel does when FFmpeg is missing. Flip this back to
-# False once the asset-path bug is fixed and re-verified with a real
-# attached-image render — do not just delete this without confirming that.
-_DISABLED_PENDING_ASSET_FIX = True
+# Asset references are resolved by resolver.resolve_motion_spec() into data
+# URIs before the browser receives the scene graph. This is intentionally a
+# rendering-time operation (rather than a file URL) so attached artwork works
+# from source, frozen Windows/macOS/Linux bundles, and saved re-renders.
+_DISABLED_PENDING_ASSET_FIX = False
 
 
 def is_available() -> tuple[bool, str]:

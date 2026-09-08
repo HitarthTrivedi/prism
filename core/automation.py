@@ -3030,8 +3030,15 @@ def _web_token() -> str:
     return reel_web.ASSET_TOKEN
 
 
-def _run_studio(prior_text, attachments, cfg: dict, brand: dict | None = None):
+def _run_studio(prior_text, attachments, cfg: dict, brand: dict | None = None,
+                studio: dict | None = None):
     """Film the page the art-direction stage wrote.
+
+    `studio` is the conversation the design came from — {"design_url",
+    "agent"} — saved into the spec as `_studio` so Studio's Refine box can
+    reopen that exact chat later. ReelDialog writes the same key for its own
+    reels; without it here, every reel made by the router opened in Studio
+    with Refine dead ("This older reel has no saved Studio conversation").
 
     The design is not trusted, it is measured: the page is laid out in the
     browser and every piece of text checked for being inside the frame and
@@ -3100,6 +3107,9 @@ def _run_studio(prior_text, attachments, cfg: dict, brand: dict | None = None):
     os.makedirs(C.RUNS_DIR, exist_ok=True)
     stamp = int(_time.time())
     out = os.path.join(C.RUNS_DIR, f"reel_{stamp}.mp4")
+    if studio and studio.get("design_url"):
+        spec["_studio"] = {"design_url": str(studio.get("design_url", "")),
+                           "agent": str(studio.get("agent", ""))}
     _json.dump(spec, open(os.path.join(C.RUNS_DIR, f"reel_{stamp}.json"), "w"),
                indent=2)
 
@@ -3175,8 +3185,23 @@ def _run_motion(prior_text, attachments, cfg: dict, brand: dict | None = None):
     return out, f"motion graphic rendered — {os.path.basename(out)}"
 
 
+def _studio_conversation(stages, stage: str, all_links: dict) -> dict:
+    """The chat a local renderer's spec came from: the nearest earlier stage
+    that left a real URL behind. That is the conversation Studio's Refine
+    box reopens, so it is stored with the reel (see _run_studio)."""
+    names = [s[0] for s in stages]
+    if stage not in names:
+        return {}
+    for earlier in reversed(names[:names.index(stage)]):
+        url = str(all_links.get(earlier) or "")
+        if url.startswith("http"):
+            agent = next((s[1] for s in stages if s[0] == earlier), "")
+            return {"design_url": url, "agent": agent}
+    return {}
+
+
 def _run_local(kind: str, prior_text, attachments, cfg: dict, stage: str,
-               brand: dict | None = None):
+               brand: dict | None = None, studio: dict | None = None):
     """Execute an agent that lives in Prism rather than in a browser.
 
     prior_text is either a single string or the earlier stages' outputs,
@@ -3188,7 +3213,7 @@ def _run_local(kind: str, prior_text, attachments, cfg: dict, stage: str,
     way a scraped one does, never take the run down with it.
     """
     if kind == "reel_web":
-        return _run_studio(prior_text, attachments, cfg, brand)
+        return _run_studio(prior_text, attachments, cfg, brand, studio=studio)
     if kind == "motion":
         return _run_motion(prior_text, attachments, cfg, brand)
     if kind != "reel":
@@ -3233,6 +3258,9 @@ def _run_local(kind: str, prior_text, attachments, cfg: dict, stage: str,
     os.makedirs(C.RUNS_DIR, exist_ok=True)
     stamp = int(_time.time())
     out = os.path.join(C.RUNS_DIR, f"reel_{stamp}.mp4")
+    if studio and studio.get("design_url"):
+        spec["_studio"] = {"design_url": str(studio.get("design_url", "")),
+                           "agent": str(studio.get("agent", ""))}
     _json.dump(spec, open(os.path.join(C.RUNS_DIR, f"reel_{stamp}.json"), "w"),
                indent=2)
     secs = sum(float(sc.get("seconds", 4)) for sc in spec["scenes"])
@@ -3727,7 +3755,9 @@ def run(routing: dict, cfg: dict, attachments=None, on_event=None,
             # model drew.
             out, note = _run_local(agent_cfg["local"], prior_text,
                                    (attachments or []) + pipeline_files,
-                                   cfg, stage, brand=studio_brand)
+                                   cfg, stage, brand=studio_brand,
+                                   studio=_studio_conversation(
+                                       stages, stage, all_links))
             if out:
                 # Keep the internal reel_<timestamp> working name, but make
                 # the customer-facing artifact describe the original request.
@@ -4822,7 +4852,9 @@ def _rerender_local_after_recovery(recovered: set, stages, cfg: dict,
         try:
             out, note = _run_local(agent_cfg["local"], prior_text,
                                    (attachments or []) + (pipeline_files or []),
-                                   cfg, stage, brand=brand)
+                                   cfg, stage, brand=brand,
+                                   studio=_studio_conversation(
+                                       stages, stage, all_links))
         except Exception as e:                            # noqa: BLE001
             ui.err(f"   re-render failed: {e}")
             continue

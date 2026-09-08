@@ -751,6 +751,12 @@ def build_html(spec: dict, fps: int = DEFAULT_FPS) -> str:
     anything except the frame itself, and the scene markup is inserted as
     written — this is the part that is meant to differ from client to client.
     """
+    # Every page built from a spec carries the same durable element ids, so
+    # a Studio edit saved against the editor page finds its layer on the
+    # render page too — including a spec that predates parse_spec() stamping
+    # them, or one built by hand in a test. Idempotent, so this is cheap.
+    from . import reel_edit
+    reel_edit.ensure_stable_ids(spec)
     design = spec.get("design") or {}
     scenes = spec.get("scenes") or []
     plan, _ = _plan(spec, fps)
@@ -776,8 +782,11 @@ def build_html(spec: dict, fps: int = DEFAULT_FPS) -> str:
         # written by a language model reading a customer's own words.
         cut = re.sub(r"[^a-z0-9-]", "", str(sc.get("cut", "")).strip().lower())
         klass = f"scene cut-{cut}" if cut else "scene"
+        studio_id = re.sub(r"[^A-Za-z0-9_-]", "", str(
+            sc.get("studio_id", f"scene-{i + 1}"))) or f"scene-{i + 1}"
         body.append(f'<section class="{klass}" id="s{i}" '
-                    f'data-type="{sc.get("type", "")}">{html}</section>')
+                    f'data-type="{sc.get("type", "")}" '
+                    f'data-prism-scene="{studio_id}">{html}</section>')
         # A scene written on its own turn brings its own stylesheet. Scoped
         # here rather than trusted to be careful — see scope_css.
         own = scope_css(_drop_missing(_place_assets(sc.get("css") or "", uris)),
@@ -890,7 +899,9 @@ def render(spec: dict, out_path: str, on_progress=None,
             code = proc.wait()
             if code != 0:
                 err = proc.stderr.read().decode("utf-8", "ignore")
+                proc.stderr.close()
                 raise ReelError(f"FFmpeg failed (exit {code}): {err[:400]}")
+            proc.stderr.close()
         finally:
             browser.close()
 
@@ -2328,6 +2339,10 @@ def parse_spec(text: str) -> dict:
     if not keep:
         raise ReelError("The scenes carry no markup — nothing to render.")
     spec["scenes"] = keep
+    # Do this at authoring time, not only when the owner later opens Studio:
+    # the JSON next to an MP4 is the permanent editable project source.
+    from . import reel_edit
+    reel_edit.ensure_stable_ids(spec)
     return spec
 
 
